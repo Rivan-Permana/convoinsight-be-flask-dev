@@ -1,0 +1,9 @@
+2025-09-07 03:52:08 [INFO] 127.0.0.1 - - [07/Sep/2025 03:52:08] "[35m[1mPOST /api/insight-dataset HTTP/1.1[0m" 500 -
+2025-09-07 03:52:09 [INFO] 127.0.0.1 - - [07/Sep/2025 03:52:09] "[35m[1mPOST /api/insight-dataset HTTP/1.1[0m" 500 -
+2025-09-07 03:52:10 [INFO] 127.0.0.1 - - [07/Sep/2025 03:52:10] "[35m[1mPOST /api/insight-dataset HTTP/1.1[0m" 500 -
+2025-09-07 03:52:14 [INFO] 127.0.0.1 - - [07/Sep/2025 03:52:14] "[35m[1mPOST /api/insight-dataset HTTP/1.1[0m" 500 -
+2025-09-07 03:52:15 [INFO] 127.0.0.1 - - [07/Sep/2025 03:52:15] "[35m[1mPOST /api/insight-dataset HTTP/1.1[0m" 500 -
+2025-09-07 03:56:00 [INFO]  * Detected change in 'D:\\DataInsight\\backend\\main.py', reloading
+2025-09-07 04:18:59 [INFO] 127.0.0.1 - - [07/Sep/2025 04:18:59] "[35m[1mPOST /api/insight-dataset HTTP/1.1[0m" 500 -
+2025-09-07 04:21:33 [INFO] 127.0.0.1 - - [07/Sep/2025 04:21:33] "[35m[1mPOST /api/insight-dataset HTTP/1.1[0m" 500 -
+2025-09-07 04:22:17 [INFO]  * Detected change in 'D:\\DataInsight\\backend\\main.py', reloading

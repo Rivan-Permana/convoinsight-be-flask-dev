@@ -1,0 +1,34 @@
+sort_order|product_group|product|target|taker_m0|taker_m1|trx_m0|trx_m1|rev_m0|rev_m1|deliv_m0|deliv_m1|deliv_taker_m0|deliv_taker_m1
+1|OTT Video|Catchplay|0|0|0|0|0|0.0|0.0|0|0|0|0
+2|OTT Video|Disney|0|0|0|0|0|0.0|0.0|0|0|0|0
+3|OTT Video|Fita|0|0|0|0|0|0.0|0.0|0|0|0|0
+4|OTT Video|Genflix|0|0|0|0|0|0.0|0.0|0|0|0|0
+5|OTT Video|HBO|0|0|0|0|0|0.0|0.0|0|0|0|0
+6|OTT Video|Iflix (WeTV)|0|0|0|0|0|0.0|0.0|0|0|0|0
+7|OTT Video|Indihome TV|0|0|0|0|0|0.0|0.0|0|0|0|0
+8|OTT Video|Iqiyi|0|0|4|0|4|0.0|40.0|0|0|0|0
+9|OTT Video|Karaoke|0|0|0|0|0|0.0|0.0|0|0|0|0
+10|OTT Video|Kuncie|0|0|0|0|0|0.0|0.0|0|0|0|0
+11|OTT Video|Lionsgate|0|0|0|0|0|0.0|0.0|0|0|0|0
+12|OTT Video|Mola|0|0|0|0|0|0.0|0.0|0|0|0|0
+13|OTT Video|Netflix|0|0|0|0|0|0.0|0.0|0|0|0|0
+14|OTT Video|Nomo|0|0|0|0|0|0.0|0.0|0|0|0|0
+15|OTT Video|Prime Video|1|1|52|1|52|53153.0|2763956.0|0|0|0|0
+16|OTT Video|Sushiroll|0|0|0|0|0|0.0|0.0|0|0|0|0
+17|OTT Video|Vidio|3|3|13|3|13|395000.0|935000.0|2|11|2|11
+18|OTT Video|Vision Plus|0|0|0|0|0|0.0|0.0|0|0|0|0
+19|OTT Video|Viu|0|0|0|0|0|0.0|0.0|0|0|0|0
+20|OTT Video|Youtube Premium|0|0|0|0|0|0.0|0.0|0|0|0|0
+21|IPTV|Minipack|1|1|1|1|1|70000.0|70000.0|1|0|1|0
+22|IPTV|VOD|0|0|0|0|0|0.0|0.0|0|0|0|0
+23|FBB VAS|IH Prepaid|0|0|0|0|0|0.0|0.0|0|0|0|0
+24|FBB VAS|Indihome Passive|0|0|0|0|0|0.0|0.0|0|0|0|0
+25|FBB VAS|Smooa|0|0|0|0|0|0.0|0.0|0|0|0|0
+26|FBB VAS|Speed on Demand|0|0|0|0|0|0.0|0.0|0|0|0|0
+27|FBB VAS|Speed Refreshment|0|0|0|0|0|0.0|0.0|0|0|0|0
+28|FBB VAS|Upload Booster|0|0|0|0|0|0.0|0.0|0|0|0|0
+29|Scale Up|Smarthome (IP Cam)|1|1|7|1|7|50000.0|350000.0|0|0|0|0
+30|Scale Up|Mesh Wifi|0|0|2|0|2|0.0|70000.0|0|0|0|0
+31|Scale Up|FTTR|0|0|1|0|1|0.0|160000.0|0|0|0|0
+32|Convergence|Kuota Keluarga|11|11|69|11|69|790000.0|5215000.0|0|0|0|0
+33|Convergence|Kuota Personal|0|0|0|0|0|0.0|0.0|0|0|0|0

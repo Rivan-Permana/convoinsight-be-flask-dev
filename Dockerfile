@@ -31,4 +31,4 @@ EXPOSE 8080
 # Gunicorn entrypoint (Flask app = app:app di app.py)
 # Tini membantu menangani signal (graceful shutdown)
 ENTRYPOINT ["/usr/bin/tini", "--"]
-CMD ["gunicorn", "--bind", "0.0.0.0:8080", "--workers", "2", "--threads", "8", "--timeout", "300", "app:app"]
+CMD ["gunicorn", "--bind", "0.0.0.0:8080", "--workers", "2", "--threads", "8", "--timeout", "240", "app:app"]

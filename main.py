@@ -1,4 +1,4 @@
-# app.py — Flask API for "ML BI Pipeline" (LOCAL DEV)
+# main.py — Flask API for "ML BI Pipeline" (Cloud Run friendly, no GCS)
 import os, io, json, time, uuid
 from datetime import datetime
 from typing import Dict
@@ -61,6 +61,10 @@ def ensure_dir(p: str):
     os.makedirs(p, exist_ok=True)
     return p
 
+def slug(s: str) -> str:
+    # Normalisasi domain agar konsisten FE/BE (case/space safe)
+    return "-".join(s.strip().split()).lower()
+
 # serve generated charts locally
 @app.route("/charts/<path:relpath>")
 def serve_chart(relpath):
@@ -74,10 +78,25 @@ def serve_chart(relpath):
 def health():
     return jsonify({"status": "healthy", "ts": datetime.utcnow().isoformat()})
 
+@app.get("/domains")
+def list_domains():
+    """List domain folders & CSV yang tersedia di instance ini (ephemeral)."""
+    result = {}
+    try:
+        for d in sorted(os.listdir(DATASETS_ROOT)):
+            p = os.path.join(DATASETS_ROOT, d)
+            if os.path.isdir(p):
+                csvs = [f for f in sorted(os.listdir(p)) if f.lower().endswith(".csv")]
+                result[d] = csvs
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"detail": str(e)}), 500
+
 @app.post("/upload_datasets/<domain>")
 def upload_datasets(domain: str):
-    """Accept CSV(s); save under ./datasets/<domain>/ for LOCAL dev."""
+    """Accept CSV(s); save under ./datasets/<slug(domain)>/ for LOCAL/Cloud Run (ephemeral)."""
     try:
+        domain = slug(domain)
         files = request.files.getlist("files")
         if not files:
             return jsonify({"detail": "No files uploaded. Field name should be 'files'."}), 400
@@ -96,28 +115,28 @@ def upload_datasets(domain: str):
 
 @app.post("/query")
 def query():
-    """Run the orchestrated 3-agent pipeline on LOCAL datasets."""
+    """Run the orchestrated 3-agent pipeline on LOCAL datasets (ephemeral disk)."""
     t0 = time.time()
     try:
         body = request.get_json(force=True)
-        domain     = body.get("domain")
+        domain_in  = body.get("domain")
         prompt     = body.get("prompt")
         session_id = body.get("session_id") or str(uuid.uuid4())
 
-        if not domain or not prompt:
+        if not domain_in or not prompt:
             return jsonify({"detail": "Missing 'domain' or 'prompt'"}), 400
         if not GEMINI_API_KEY:
             return jsonify({"detail": "No API key configured"}), 500
 
-        # load datasets from ./datasets/<domain>
-        domain_dir = os.path.join(DATASETS_ROOT, domain)
-        if not os.path.isdir(domain_dir):
-            return jsonify({"detail": f"No datasets folder for domain '{domain}'"}), 404
+        # normalize domain & ensure folder exists
+        domain = slug(domain_in)
+        domain_dir = ensure_dir(os.path.join(DATASETS_ROOT, domain))
 
         dfs: Dict[str, pd.DataFrame] = {}
         data_info: Dict[str, str] = {}
         data_describe: Dict[str, str] = {}
 
+        # load CSVs if any
         for name in sorted(os.listdir(domain_dir)):
             if name.lower().endswith(".csv"):
                 path = os.path.join(domain_dir, name)
@@ -135,7 +154,12 @@ def query():
                     data_describe[name] = "{}"
 
         if not dfs:
-            return jsonify({"detail": f"No CSV files found in domain '{domain}'"}), 404
+            # Instance baru / belum upload -> minta FE upload dulu
+            return jsonify({
+                "code": "NEED_UPLOAD",
+                "detail": f"No CSV files found in domain '{domain}'",
+                "domain": domain
+            }), 409
 
         # ===== Orchestrator (DO NOT CHANGE THIS SYSTEM PROMPT) =====
         orchestrator_response = completion(
@@ -334,7 +358,7 @@ def query():
 
 
 if __name__ == "__main__":
-    # Run: python app.py
+    # Run: python main.py (local dev)
     host = os.getenv("HOST", "127.0.0.1")
     port = int(os.getenv("PORT", "8000"))
     app.run(host=host, port=port, debug=True)

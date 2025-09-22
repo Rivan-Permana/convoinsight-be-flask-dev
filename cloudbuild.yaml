@@ -1,0 +1,61 @@
+# Cloud Build config
+# Buat trigger di GitHub/Cloud Source; tiap push ke main akan build & deploy.
+# Pastikan Artifact Registry & Cloud Run API sudah enabled.
+
+substitutions:
+  # Ganti sesuai kebutuhanmu
+  _REGION: asia-southeast2
+  _SERVICE: ml-bi-pipeline # Nama Cloud Run service
+  _REPO: convoinsight # Nama Artifact Registry repo (format: Docker repo)
+  # Jika ingin region lain, ubah juga hostname IMAGE di langkah build/push.
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+
+steps:
+  # 1) Build image
+  - name: gcr.io/cloud-builders/docker
+    id: Build
+    args:
+      - build
+      - -t
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:$COMMIT_SHA
+      - .
+
+  # 2) Push image
+  - name: gcr.io/cloud-builders/docker
+    id: Push
+    args:
+      - push
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:$COMMIT_SHA
+
+  # 3) Deploy ke Cloud Run (managed)
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    id: Deploy
+    entrypoint: gcloud
+    args:
+      - run
+      - deploy
+      - ${_SERVICE}
+      - --image=${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:$COMMIT_SHA
+      - --region=${_REGION}
+      - --platform=managed
+      - --allow-unauthenticated
+      # CPU & mem bisa di-tune sesuai beban LLM+pandas
+      - --cpu=2
+      - --memory=2Gi
+      # Concurrency & autoscaling
+      - --concurrency=80
+      - --max-instances=5
+      # Env vars:
+      - --set-env-vars=CORS_ORIGINS=http://localhost:5173,http://127.0.0.1:5173
+      - --set-env-vars=DATASETS_ROOT=/tmp/datasets
+      - --set-env-vars=CHARTS_ROOT=/tmp/charts
+      # Kalau kamu simpan dataset lokal saat runtime via endpoint upload:
+      # Cloud Run hanya ephemerally writable; ini OK selama tidak butuh persistensi jangka panjang.
+      # SECRET (disarankan) - gunakan Secret Manager:
+      # Pastikan sudah buat secret bernama "gemini-api-key".
+      - --set-secrets=GEMINI_API_KEY=gemini-api-key:latest
+
+images:
+  - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:$COMMIT_SHA

@@ -20820,3 +20820,4 @@ result = {'type': 'string', 'value': final_summary}
 2025-09-22 14:12:39 [INFO] 127.0.0.1 - - [22/Sep/2025 14:12:39] "POST /query HTTP/1.1" 200 -
 2025-09-22 14:12:40 [INFO] 127.0.0.1 - - [22/Sep/2025 14:12:40] "GET /charts/Campaign/1758524939816_20250922071028879841.html HTTP/1.1" 200 -
 2025-09-22 14:18:35 [INFO] 127.0.0.1 - - [22/Sep/2025 14:18:35] "OPTIONS /query HTTP/1.1" 200 -
+2025-09-22 14:53:52 [INFO]  * Detected change in 'D:\\convoinsight-be-flask\\main.py', reloading

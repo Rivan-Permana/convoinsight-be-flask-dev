@@ -1,0 +1,33 @@
+# syntax=docker/dockerfile:1
+
+FROM python:3.11-slim
+
+# Pastikan log tampil di stdout/stderr (baik untuk Cloud Run)
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+# System deps yang ringan (wheel pandas/numpy biasanya cukup)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl ca-certificates build-essential \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Cache-friendly: copy requirements dulu
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy source
+COPY app.py ./
+
+# Non-root user demi keamanan
+RUN useradd -m appuser
+USER appuser
+
+# Cloud Run listen di PORT (default 8080)
+ENV PORT=8080
+
+# Jalankan lewat gunicorn (production-grade)
+# -w 2: 2 workers, -k gthread dengan threads 8 untuk IO-bound
+# --timeout 0: biar nggak auto-kill long running (opsional)
+CMD exec gunicorn --bind :$PORT --workers 2 --threads 8 --timeout 0 app:app

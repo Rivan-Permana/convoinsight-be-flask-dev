@@ -1,0 +1,76 @@
+# Cloud Build pipeline: Build → Push (Artifact Registry) → Deploy (Cloud Run)
+# Sesuaikan substitutions kalau perlu.
+substitutions:
+  _SERVICE: "ml-bi-flask"             # Nama Cloud Run service
+  _REGION: "asia-southeast2"          # Region Jakarta
+  _REPO: "convoinsight"               # Nama repository di Artifact Registry (format: docker repo)
+  _MIN_INSTANCES: "0"
+  _MAX_INSTANCES: "5"
+  _CONCURRENCY: "80"
+  _CPU: "2"                           # vCPU
+  _MEMORY: "8Gi"
+  _ALLOW_UNAUTH: "true"               # "true" untuk publik, "false" jika private
+  _CORS_ORIGINS: "https://convoinsight.vercel.app/,http://localhost:5173,http://127.0.0.1:5173"
+
+# (Opsional) Ambil secret dari Secret Manager saat deploy:
+# Pastikan kamu punya secret `GEMINI_API_KEY` di Secret Manager project ini.
+availableSecrets:
+  secretManager:
+    - versionName: projects/$PROJECT_ID/secrets/GEMINI_API_KEY/versions/latest
+      env: GEMINI_API_KEY_SECRET
+
+steps:
+  # 1) Build image
+  - name: "gcr.io/cloud-builders/docker"
+    id: "Build image"
+    args:
+      - "build"
+      - "-t"
+      - "${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:$SHORT_SHA"
+      - "."
+
+  # 2) Push image
+  - name: "gcr.io/cloud-builders/docker"
+    id: "Push image"
+    args:
+      - "push"
+      - "${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:$SHORT_SHA"
+
+  # 3) Deploy ke Cloud Run
+  - name: "gcr.io/cloud-builders/gcloud"
+    id: "Deploy to Cloud Run"
+    entrypoint: "bash"
+    args:
+      - "-ceu"
+      - |
+        IMAGE="${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:$SHORT_SHA"
+
+        # Flag auth
+        if [[ "${_ALLOW_UNAUTH}" == "true" ]]; then
+          AUTH_FLAG="--allow-unauthenticated"
+        else
+          AUTH_FLAG="--no-allow-unauthenticated"
+        fi
+
+        # Deploy
+        gcloud run deploy "${_SERVICE}" \
+          --image "${IMAGE}" \
+          --platform managed \
+          --region "${_REGION}" \
+          --port 8080 \
+          --cpu "${_CPU}" \
+          --memory "${_MEMORY}" \
+          --concurrency "${_CONCURRENCY}" \
+          --min-instances "${_MIN_INSTANCES}" \
+          --max-instances "${_MAX_INSTANCES}" \
+          ${AUTH_FLAG} \
+          --set-env-vars "PORT=8080,CORS_ORIGINS=${_CORS_ORIGINS}" \
+          --set-env-vars "PYTHONUNBUFFERED=1,PYTHONDONTWRITEBYTECODE=1" \
+          --set-secrets "GEMINI_API_KEY=GEMINI_API_KEY:latest"
+
+images:
+  - "${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:$SHORT_SHA"
+
+# Log ke Cloud Logging
+options:
+  logging: CLOUD_LOGGING_ONLY

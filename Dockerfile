@@ -19,19 +19,6 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --upgrade pip && pip install -r requirements.txt
 
-# # Tanpa requirements.txt, install paket yang dipakai di app.py:
-# RUN pip install --upgrade pip && pip install \
-#     gunicorn \
-#     flask \
-#     flask-cors \
-#     pandas \
-#     python-dotenv \
-#     litellm \
-#     pandasai \
-#     pandasai-litellm \
-#     duckdb \
-#     plotly
-
 # Copy source code
 COPY . .
 

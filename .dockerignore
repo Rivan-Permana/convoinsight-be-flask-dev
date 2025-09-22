@@ -1,0 +1,13 @@
+.git
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+venv/
+.venv/
+.env
+datasets/
+charts/
+.idea/
+.vscode/
+.DS_Store

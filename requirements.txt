@@ -7,6 +7,7 @@ python-dotenv==1.0.1
 pandas==2.2.2
 pandasai>=3.0.0b2
 pandasai-litellm==0.0.1
+litellm>=1.61.20,<2.0.0
 
 # --- viz (dipakai agent visualizer) ---
 plotly==6.3.0

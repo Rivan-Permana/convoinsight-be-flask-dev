@@ -20684,3 +20684,139 @@ Generate python code and return full updated code:
 
 ### Note: Use only relevant table for query and do aggregation, sorting, joins and grouby through sql query
 2025-09-22 14:11:43 [INFO] 127.0.0.1 - - [22/Sep/2025 14:11:43] "POST /query HTTP/1.1" 200 -
+2025-09-22 14:12:17 [INFO] Code Generated:
+# TODO: import the required dependencies
+import pandas as pd
+
+# Write code here
+# Define the table name from the context
+table_name = "table_ae8f2e4def6e9b3c0acdbed21b052e38"
+
+# 1. Calculate total revenues and overall change
+query_totals = f"""
+SELECT
+    SUM(rev_squad_m0) AS total_rev_m0,
+    SUM(rev_squad_m1) AS total_rev_m1
+FROM {table_name};
+"""
+totals_df = execute_sql_query(query_totals)
+total_rev_m0 = totals_df['total_rev_m0'].iloc[0]
+total_rev_m1 = totals_df['total_rev_m1'].iloc[0]
+
+# Calculate overall absolute and percentage change
+overall_abs_change = total_rev_m1 - total_rev_m0
+overall_pct_change = (overall_abs_change / total_rev_m0) * 100 if total_rev_m0 != 0 else 0
+
+# 2. Identify top 3 positive contributors
+query_positive = f"""
+SELECT product, rev_change_abs
+FROM {table_name}
+WHERE rev_change_abs > 0
+ORDER BY rev_change_abs DESC
+LIMIT 3;
+"""
+positive_df = execute_sql_query(query_positive)
+
+# 3. Identify top 3 negative contributors
+query_negative = f"""
+SELECT product, rev_change_abs
+FROM {table_name}
+WHERE rev_change_abs < 0
+ORDER BY rev_change_abs ASC
+LIMIT 3;
+"""
+negative_df = execute_sql_query(query_negative)
+
+# Helper function to format numbers as Indonesian Rupiah
+def format_idr(amount):
+    return f"Rp {int(amount):,}"
+
+# 4. Summarize the findings into bullet points
+summary_points = []
+
+# Point 1: Overall performance
+summary_points.append(
+    f"• Overall, total revenue decreased by {format_idr(abs(overall_abs_change))} ({overall_pct_change:.2f}%) month-over-month, declining from {format_idr(total_rev_m0)} to {format_idr(total_rev_m1)}."
+)
+
+# Point 2: Top positive contributors
+positive_contributors_str = ", ".join(
+    [f"{row['product']} ({format_idr(row['rev_change_abs'])})" for _, row in positive_df.iterrows()]
+)
+if not positive_df.empty:
+    summary_points.append(
+        f"• The top positive contributors helping to offset the decline were: {positive_contributors_str}."
+    )
+
+# Point 3: Top negative contributors
+negative_contributors_str = ", ".join(
+    [f"{row['product']} ({format_idr(row['rev_change_abs'])})" for _, row in negative_df.iterrows()]
+)
+if not negative_df.empty:
+    summary_points.append(
+        f"• The revenue decline was primarily driven by the top 3 detractors: {negative_contributors_str}."
+    )
+
+# Point 4: Conclusion
+summary_points.append(
+    f"• In conclusion, significant revenue drops from key products like {negative_df['product'].iloc[0]} and {negative_df['product'].iloc[1]} far outweighed the gains from growing products, leading to a substantial net decrease in monthly revenue."
+)
+
+# Combine points into a single string
+final_summary = "\n".join(summary_points)
+
+# Declare result var: 
+result = {"type": "string", "value": final_summary}
+2025-09-22 14:12:17 [INFO] Validating code requirements...
+2025-09-22 14:12:17 [INFO] Code validation successful.
+2025-09-22 14:12:17 [INFO] Cleaning the generated code...
+2025-09-22 14:12:17 [INFO] Executing code: import pandas as pd
+table_name = 'table_ae8f2e4def6e9b3c0acdbed21b052e38'
+query_totals = f"""
+SELECT
+    SUM(rev_squad_m0) AS total_rev_m0,
+    SUM(rev_squad_m1) AS total_rev_m1
+FROM {table_name};
+"""
+totals_df = execute_sql_query(query_totals)
+total_rev_m0 = totals_df['total_rev_m0'].iloc[0]
+total_rev_m1 = totals_df['total_rev_m1'].iloc[0]
+overall_abs_change = total_rev_m1 - total_rev_m0
+overall_pct_change = overall_abs_change / total_rev_m0 * 100 if total_rev_m0 != 0 else 0
+query_positive = f"""
+SELECT product, rev_change_abs
+FROM {table_name}
+WHERE rev_change_abs > 0
+ORDER BY rev_change_abs DESC
+LIMIT 3;
+"""
+positive_df = execute_sql_query(query_positive)
+query_negative = f"""
+SELECT product, rev_change_abs
+FROM {table_name}
+WHERE rev_change_abs < 0
+ORDER BY rev_change_abs ASC
+LIMIT 3;
+"""
+negative_df = execute_sql_query(query_negative)
+
+
+def format_idr(amount):
+    return f'Rp {int(amount):,}'
+
+
+summary_points = []
+summary_points.append(f'• Overall, total revenue decreased by {format_idr(abs(overall_abs_change))} ({overall_pct_change:.2f}%) month-over-month, declining from {format_idr(total_rev_m0)} to {format_idr(total_rev_m1)}.')
+positive_contributors_str = ', '.join([f"{row['product']} ({format_idr(row['rev_change_abs'])})" for _, row in positive_df.iterrows()])
+if not positive_df.empty:
+    summary_points.append(f'• The top positive contributors helping to offset the decline were: {positive_contributors_str}.')
+negative_contributors_str = ', '.join([f"{row['product']} ({format_idr(row['rev_change_abs'])})" for _, row in negative_df.iterrows()])
+if not negative_df.empty:
+    summary_points.append(f'• The revenue decline was primarily driven by the top 3 detractors: {negative_contributors_str}.')
+summary_points.append(f"• In conclusion, significant revenue drops from key products like {negative_df['product'].iloc[0]} and {negative_df['product'].iloc[1]} far outweighed the gains from growing products, leading to a substantial net decrease in monthly revenue.")
+final_summary = '\n'.join(summary_points)
+result = {'type': 'string', 'value': final_summary}
+2025-09-22 14:12:17 [INFO] Response generated successfully.
+2025-09-22 14:12:39 [INFO] 127.0.0.1 - - [22/Sep/2025 14:12:39] "POST /query HTTP/1.1" 200 -
+2025-09-22 14:12:40 [INFO] 127.0.0.1 - - [22/Sep/2025 14:12:40] "GET /charts/Campaign/1758524939816_20250922071028879841.html HTTP/1.1" 200 -
+2025-09-22 14:18:35 [INFO] 127.0.0.1 - - [22/Sep/2025 14:18:35] "OPTIONS /query HTTP/1.1" 200 -

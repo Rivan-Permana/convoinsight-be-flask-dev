@@ -26,7 +26,7 @@ except Exception:
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")  # REQUIRED
 CORS_ORIGINS = os.getenv(
     "CORS_ORIGINS",
-    "http://localhost:5173,http://127.0.0.1:5173,https://convoinsight.vercel.app/"
+    "http://localhost:5173,http://127.0.0.1:5173,https://convoinsight.vercel.app"
 ).split(",")
 
 DATASETS_ROOT = os.getenv("DATASETS_ROOT", os.path.abspath("./datasets"))

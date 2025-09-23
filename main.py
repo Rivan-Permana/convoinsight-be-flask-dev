@@ -1,3 +1,4 @@
+# main.py — Merged Flask API: latest ML pipeline + newer backend bits (slug, /domains, NEED_UPLOAD, CORS origins)
 import os, io, json, time, uuid, re
 from datetime import datetime
 from typing import Dict
@@ -13,6 +14,7 @@ from pandasai import SmartDataframe, SmartDatalake
 from pandasai_litellm.litellm import LiteLLM
 from pandasai.core.response.dataframe import DataFrameResponse
 
+# -------- optional: load .env --------
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -20,7 +22,10 @@ except Exception:
     pass
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-CORS_ORIGINS = os.getenv("CORS_ORIGINS", "https://convoinsight.vercel.app").split(",")
+CORS_ORIGINS = os.getenv(
+    "CORS_ORIGINS",
+    "http://localhost:5173,http://127.0.0.1:5173,https://convoinsight.vercel.app"
+).split(",")
 
 DATASETS_ROOT = os.getenv("DATASETS_ROOT", os.path.abspath("./datasets"))
 CHARTS_ROOT   = os.getenv("CHARTS_ROOT",   os.path.abspath("./charts"))
@@ -28,32 +33,17 @@ os.makedirs(DATASETS_ROOT, exist_ok=True)
 os.makedirs(CHARTS_ROOT,   exist_ok=True)
 
 app = Flask(__name__)
-CORS(app, origins="*", supports_credentials=True)
+CORS(app, origins=CORS_ORIGINS, supports_credentials=True)
 
-# --- Session-scoped conversation state ----------------------------------------
-_SESSIONS: Dict[str, dict] = {}
+# -------- Helpers --------
+def slug(s: str) -> str:
+    # Normalisasi domain agar konsisten FE/BE (case/space safe)
+    return "-".join(s.strip().split()).lower()
 
-def _get_conv_state(session_id: str) -> dict:
-    st = _SESSIONS.get(session_id)
-    if not isinstance(st, dict):
-        st = {
-            "history": [],             # recent (role, content) pairs
-            "last_df_processed": None, # pandas DataFrame (post-manipulation)
-            "last_visual_path": "",    # last HTML chart/table path
-            "last_analyzer_text": "",  # last analyzer bullets/string
-            "last_plan": None,         # last routing decision
-        }
-        _SESSIONS[session_id] = st
-    return st
+def ensure_dir(p: str):
+    os.makedirs(p, exist_ok=True)
+    return p
 
-def _append_history(state: dict, role: str, content: str, max_len=10_000, keep_last=12):
-    content = str(content)
-    if len(content) > max_len:
-        content = content[:max_len] + " …"
-    state["history"].append({"role": role, "content": content, "ts": time.time()})
-    state["history"] = state["history"][-keep_last:]
-
-# --- Helpers: robust get_content + JSON extraction ----------------------------
 def get_content(r):
     """Extract content from LiteLLM response (robust)."""
     try:
@@ -83,9 +73,28 @@ def _safe_json_loads(s: str):
             return json.loads(s[start:end+1])
         raise
 
-def ensure_dir(p: str):
-    os.makedirs(p, exist_ok=True)
-    return p
+# --- Session-scoped conversation state ----------------------------------------
+_SESSIONS: Dict[str, dict] = {}
+
+def _get_conv_state(session_id: str) -> dict:
+    st = _SESSIONS.get(session_id)
+    if not isinstance(st, dict):
+        st = {
+            "history": [],             # recent (role, content) pairs
+            "last_df_processed": None, # pandas DataFrame (post-manipulation)
+            "last_visual_path": "",    # last HTML chart/table path
+            "last_analyzer_text": "",  # last analyzer bullets/string
+            "last_plan": None,         # last routing decision
+        }
+        _SESSIONS[session_id] = st
+    return st
+
+def _append_history(state: dict, role: str, content: str, max_len=10_000, keep_last=12):
+    content = str(content)
+    if len(content) > max_len:
+        content = content[:max_len] + " …"
+    state["history"].append({"role": role, "content": content, "ts": time.time()})
+    state["history"] = state["history"][-keep_last:]
 
 # --- Router: decides which agents/LLM to run based on prompt + context --------
 def plan_agents(user_prompt: str, data_info: dict, data_describe: dict, state: dict):
@@ -179,55 +188,51 @@ def serve_chart(relpath):
     filename = os.path.basename(full)
     return send_from_directory(base, filename)
 
+# --- Health & domain listing ---------------------------------------------------
 @app.get("/health")
 def health():
     return jsonify({"status": "healthy", "ts": datetime.utcnow().isoformat()})
 
-@app.post("/upload_datasets/<domain>")
-def upload_datasets(domain: str):
-    """Accept CSV(s); save under ./datasets/<domain>/ for LOCAL dev."""
+@app.get("/domains")
+def list_domains():
+    """List domain folders & CSV available in this instance (ephemeral-friendly)."""
+    result = {}
     try:
-        files = request.files.getlist("files")
-        if not files:
-            return jsonify({"detail": "No files uploaded. Field name should be 'files'."}), 400
-
-        domain_dir = ensure_dir(os.path.join(DATASETS_ROOT, domain))
-        saved = []
-        for f in files:
-            if not f.filename.lower().endswith(".csv"):
-                return jsonify({"detail": f"Only CSV supported in local mode: {f.filename}"}), 400
-            dest = os.path.join(domain_dir, f.filename)
-            f.save(dest)
-            saved.append({"filename": f.filename, "local_path": dest})
-        return jsonify({"message": f"Uploaded {len(saved)} files for domain {domain}", "files": saved})
+        for d in sorted(os.listdir(DATASETS_ROOT)):
+            p = os.path.join(DATASETS_ROOT, d)
+            if os.path.isdir(p):
+                csvs = [f for f in sorted(os.listdir(p)) if f.lower().endswith(".csv")]
+                result[d] = csvs
+        return jsonify(result)
     except Exception as e:
         return jsonify({"detail": str(e)}), 500
 
+# --- Query endpoint (orchestrated 3-agent pipeline with router + session) -----
 @app.post("/query")
 def query():
     """Run the orchestrated 3-agent pipeline on LOCAL datasets with routing and session context."""
     t0 = time.time()
     try:
         body = request.get_json(force=True)
-        domain     = body.get("domain")
+        domain_in  = body.get("domain")
         prompt     = body.get("prompt")
         session_id = body.get("session_id") or str(uuid.uuid4())
 
-        if not domain or not prompt:
+        if not domain_in or not prompt:
             return jsonify({"detail": "Missing 'domain' or 'prompt'"}), 400
         if not GEMINI_API_KEY:
             return jsonify({"detail": "No API key configured"}), 500
+
+        # Normalize domain & ensure folder exists (ephemeral-friendly)
+        domain = slug(domain_in)
+        domain_dir = ensure_dir(os.path.join(DATASETS_ROOT, domain))
 
         # Session-scoped state
         state = _get_conv_state(session_id)
         globals()["_CONV_STATE"] = state  # used by helper functions
         _append_history(state, "user", prompt)
 
-        # Load datasets
-        domain_dir = os.path.join(DATASETS_ROOT, domain)
-        if not os.path.isdir(domain_dir):
-            return jsonify({"detail": f"No datasets folder for domain '{domain}'"}), 404
-
+        # Load datasets (CSV)
         dfs: Dict[str, pd.DataFrame] = {}
         data_info: Dict[str, str] = {}
         data_describe: Dict[str, str] = {}
@@ -249,7 +254,12 @@ def query():
                     data_describe[name] = "{}"
 
         if not dfs:
-            return jsonify({"detail": f"No CSV files found in domain '{domain}'"}), 404
+            # No CSV uploaded yet for this (possibly new) domain
+            return jsonify({
+                "code": "NEED_UPLOAD",
+                "detail": f"No CSV files found in domain '{domain}'",
+                "domain": domain
+            }), 409
 
         # ------------------- Router (decide which agents to run) -------------------
         agent_plan = plan_agents(
@@ -264,7 +274,7 @@ def query():
         compiler_model = agent_plan.get("compiler_model") or "gemini/gemini-2.5-pro"
         visual_hint = agent_plan.get("visual_hint", "auto")
 
-        # ------------------- Orchestrator (now aware of context + router) ----------
+        # ------------------- Orchestrator (aware of context + router) -------------
         context_hint = {
             "router_plan": agent_plan,
             "last_visual_path": state.get("last_visual_path", ""),
@@ -523,7 +533,6 @@ def query():
             state["last_analyzer_text"] = da_resp or ""
 
         # ---------- Response Compiler (router-selected model) ----------
-        # Compose data_info_runtime (aggregate df.info strings)
         data_info_runtime = data_info  # keep per-file infos
 
         final_response = completion(
@@ -572,6 +581,7 @@ def query():
     except Exception as e:
         return jsonify({"detail": str(e)}), 500
 
+# --- Entry point ---------------------------------------------------------------
 if __name__ == "__main__":
     host = os.getenv("HOST", "127.0.0.1")
     port = int(os.getenv("PORT", "8000"))

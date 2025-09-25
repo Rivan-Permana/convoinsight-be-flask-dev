@@ -1,7 +1,7 @@
-# main.py — Merged Flask API: latest ML pipeline + newer backend bits (slug, /domains, NEED_UPLOAD, CORS origins)
+# main.py — Merged Flask API: GCS datasets CRUD, diagrams(charts|tables) to GCS, Firestore history (GPT-like), cancel "thinking"
 import os, io, json, time, uuid, re
-from datetime import datetime
-from typing import Dict
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional
 from types import SimpleNamespace
 
 from flask import Flask, request, jsonify, send_from_directory
@@ -14,6 +14,10 @@ from pandasai import SmartDataframe, SmartDatalake
 from pandasai_litellm.litellm import LiteLLM
 from pandasai.core.response.dataframe import DataFrameResponse
 
+# --- GCP clients ---
+from google.cloud import storage
+from google.cloud import firestore
+
 # -------- optional: load .env --------
 try:
     from dotenv import load_dotenv
@@ -21,19 +25,39 @@ try:
 except Exception:
     pass
 
+# -------- Config --------
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GCP_PROJECT_ID = os.getenv("GCP_PROJECT_ID")
+
 CORS_ORIGINS = os.getenv(
     "CORS_ORIGINS",
     "http://localhost:5173,http://127.0.0.1:5173,https://convoinsight.vercel.app"
 ).split(",")
 
-DATASETS_ROOT = os.getenv("DATASETS_ROOT", os.path.abspath("./datasets"))
-CHARTS_ROOT   = os.getenv("CHARTS_ROOT",   os.path.abspath("./charts"))
+DATASETS_ROOT = os.getenv("DATASETS_ROOT", os.path.abspath("./datasets"))  # still supported for local/dev
+CHARTS_ROOT   = os.getenv("CHARTS_ROOT",   os.path.abspath("./charts"))    # still supported for local/dev
 os.makedirs(DATASETS_ROOT, exist_ok=True)
 os.makedirs(CHARTS_ROOT,   exist_ok=True)
 
+# GCS / Firestore
+GCS_BUCKET                  = os.getenv("GCS_BUCKET")                        # REQUIRED on Cloud Run
+GCS_DATASETS_PREFIX         = os.getenv("GCS_DATASETS_PREFIX", "datasets")   # datasets/<domain>/<filename>
+GCS_DIAGRAMS_PREFIX         = os.getenv("GCS_DIAGRAMS_PREFIX", "diagrams")   # diagrams/(charts|tables)/<domain>/<session>_<run>.html
+GCS_SIGNED_URL_TTL_SECONDS  = int(os.getenv("GCS_SIGNED_URL_TTL_SECONDS", "604800"))  # 7 days
+
+FIRESTORE_COLLECTION_SESSIONS = os.getenv("FIRESTORE_COLLECTION", "convo_sessions")
+FIRESTORE_COLLECTION_DATASETS = os.getenv("FIRESTORE_DATASETS_COLLECTION", "datasets_meta")
+
+# --- Init Flask ---
 app = Flask(__name__)
 CORS(app, origins=CORS_ORIGINS, supports_credentials=True)
+
+# --- Init GCP clients (ADC creds on Cloud Run) ---
+_storage_client = storage.Client(project=GCP_PROJECT_ID) if GCP_PROJECT_ID else storage.Client()
+_firestore_client = firestore.Client(project=GCP_PROJECT_ID) if GCP_PROJECT_ID else firestore.Client()
+
+# --- Cancel flags (cooperative cancel between stages) ---
+_CANCEL_FLAGS = set()  # holds session_id
 
 # -------- Helpers --------
 def slug(s: str) -> str:
@@ -73,28 +97,200 @@ def _safe_json_loads(s: str):
             return json.loads(s[start:end+1])
         raise
 
-# --- Session-scoped conversation state ----------------------------------------
-_SESSIONS: Dict[str, dict] = {}
+def _should_cancel(session_id: str) -> bool:
+    return session_id in _CANCEL_FLAGS
+
+def _cancel_if_needed(session_id: str):
+    if _should_cancel(session_id):
+        _CANCEL_FLAGS.discard(session_id)
+        raise RuntimeError("CANCELLED_BY_USER")
+
+# --- Firestore-backed conversation state --------------------------------------
+def _fs_default_state():
+    return {
+        "history": [],             # list of dicts: {role, content, ts}
+        "last_visual_gcs_path": "",
+        "last_visual_signed_url": "",
+        "last_visual_kind": "",    # "charts" | "tables"
+        "last_analyzer_text": "",
+        "last_plan": None,
+        "updated_at": firestore.SERVER_TIMESTAMP,
+        "created_at": firestore.SERVER_TIMESTAMP,
+    }
+
+def _fs_sess_ref(session_id: str):
+    return _firestore_client.collection(FIRESTORE_COLLECTION_SESSIONS).document(session_id)
 
 def _get_conv_state(session_id: str) -> dict:
-    st = _SESSIONS.get(session_id)
-    if not isinstance(st, dict):
-        st = {
-            "history": [],             # recent (role, content) pairs
-            "last_df_processed": None, # pandas DataFrame (post-manipulation)
-            "last_visual_path": "",    # last HTML chart/table path
-            "last_analyzer_text": "",  # last analyzer bullets/string
-            "last_plan": None,         # last routing decision
-        }
-        _SESSIONS[session_id] = st
-    return st
+    doc = _fs_sess_ref(session_id).get()
+    if doc.exists:
+        data = doc.to_dict() or {}
+        # ensure keys exist
+        for k, v in _fs_default_state().items():
+            if k not in data:
+                data[k] = v if k not in ("created_at","updated_at") else firestore.SERVER_TIMESTAMP
+        return data
+    else:
+        state = _fs_default_state()
+        _fs_sess_ref(session_id).set(state, merge=True)
+        return state
 
-def _append_history(state: dict, role: str, content: str, max_len=10_000, keep_last=12):
+def _save_conv_state(session_id: str, state: dict):
+    st = dict(state)
+    st["updated_at"] = firestore.SERVER_TIMESTAMP
+    _fs_sess_ref(session_id).set(st, merge=True)
+
+def _append_history(state: dict, role: str, content: str, max_len=10_000, keep_last=100):
     content = str(content)
     if len(content) > max_len:
         content = content[:max_len] + " …"
-    state["history"].append({"role": role, "content": content, "ts": time.time()})
-    state["history"] = state["history"][-keep_last:]
+    hist = state.get("history") or []
+    hist.append({"role": role, "content": content, "ts": time.time()})
+    state["history"] = hist[-keep_last:]
+
+# --- Firestore datasets meta ---------------------------------------------------
+def _ds_ref(domain: str, filename: str):
+    key = f"{slug(domain)}::{filename}"
+    return _firestore_client.collection(FIRESTORE_COLLECTION_DATASETS).document(key)
+
+def _save_dataset_meta(domain: str, filename: str, gs_uri: str, size: int):
+    meta = {
+        "domain": slug(domain),
+        "filename": filename,
+        "gs_uri": gs_uri,
+        "size_bytes": size,
+        "updated_at": firestore.SERVER_TIMESTAMP,
+        "created_at": firestore.SERVER_TIMESTAMP,
+    }
+    _ds_ref(domain, filename).set(meta, merge=True)
+
+def _delete_dataset_meta(domain: str, filename: str):
+    _ds_ref(domain, filename).delete()
+
+def _list_dataset_meta(domain: Optional[str]=None, limit: int=200) -> List[dict]:
+    col = _firestore_client.collection(FIRESTORE_COLLECTION_DATASETS)
+    q = col.order_by("updated_at", direction=firestore.Query.DESCENDING)
+    if domain:
+        q = q.where("domain", "==", slug(domain))
+    docs = q.limit(limit).stream()
+    return [d.to_dict() for d in docs if d.exists]
+
+# --- GCS helpers ---------------------------------------------------------------
+def _gcs_bucket():
+    if not GCS_BUCKET:
+        raise RuntimeError("GCS_BUCKET is not set")
+    return _storage_client.bucket(GCS_BUCKET)
+
+def _signed_url(blob, filename: str, content_type: str, ttl_seconds: int) -> str:
+    return blob.generate_signed_url(
+        version="v4",
+        expiration=timedelta(seconds=ttl_seconds),
+        method="GET",
+        response_disposition=f'inline; filename="{filename}"',
+        response_type=content_type,
+    )
+
+def upload_dataset_file(file_storage, *, domain: str) -> dict:
+    """
+    Upload a Werkzeug FileStorage to GCS under datasets/<domain>/<filename>.
+    """
+    safe_domain = slug(domain)
+    filename = file_storage.filename
+    blob_name = f"{GCS_DATASETS_PREFIX}/{safe_domain}/{filename}"
+    bucket = _gcs_bucket()
+    blob = bucket.blob(blob_name)
+    blob.cache_control = "private, max-age=0"
+    blob.content_type = "text/csv"
+    file_storage.stream.seek(0)
+    blob.upload_from_file(file_storage.stream, rewind=True, size=None, content_type="text/csv")
+    size = blob.size or 0
+    gs_uri = f"gs://{GCS_BUCKET}/{blob_name}"
+    _save_dataset_meta(domain, filename, gs_uri, size)
+    return {
+        "filename": filename,
+        "gs_uri": gs_uri,
+        "signed_url": _signed_url(blob, filename, "text/csv", GCS_SIGNED_URL_TTL_SECONDS),
+        "size_bytes": size,
+    }
+
+def list_gcs_csvs(domain: str) -> List[storage.Blob]:
+    safe_domain = slug(domain)
+    prefix = f"{GCS_DATASETS_PREFIX}/{safe_domain}/"
+    return list(_gcs_bucket().list_blobs(prefix=prefix))
+
+def read_gcs_csv_to_df(gs_uri_or_blobname: str, *, sep_candidates: List[str] = (",","|",";","\\t")) -> pd.DataFrame:
+    """
+    Download a CSV from GCS and parse to DataFrame with simple separator heuristics.
+    Accepts 'gs://bucket/path' or 'path/inside/bucket'.
+    """
+    if gs_uri_or_blobname.startswith("gs://"):
+        _, bucket_name, *rest = gs_uri_or_blobname.replace("gs://","").split("/")
+        blob_name = "/".join(rest)
+        bucket = _storage_client.bucket(bucket_name)
+    else:
+        bucket = _gcs_bucket()
+        blob_name = gs_uri_or_blobname
+    blob = bucket.blob(blob_name)
+    data = blob.download_as_bytes()
+    for sep in sep_candidates:
+        try:
+            return pd.read_csv(io.BytesIO(data), sep=sep if sep!="\\t" else "\t")
+        except Exception:
+            continue
+    return pd.read_csv(io.BytesIO(data))
+
+def delete_gcs_object(blob_name_or_gs_uri: str):
+    if blob_name_or_gs_uri.startswith("gs://"):
+        _, bucket_name, *rest = blob_name_or_gs_uri.replace("gs://","").split("/")
+        blob_name = "/".join(rest)
+        bucket = _storage_client.bucket(bucket_name)
+    else:
+        bucket = _gcs_bucket()
+        blob_name = blob_name_or_gs_uri
+    bucket.blob(blob_name).delete()
+
+# ---- Diagrams (charts|tables) helper -----------------------------------------
+def _detect_diagram_kind(local_html_path: str, visual_hint: str) -> str:
+    """
+    Heuristics:
+      - if contains 'plotly' or 'Plotly.newPlot' -> charts
+      - elif contains '<table' -> tables
+      - else fallback to visual_hint (table -> tables) otherwise charts
+    """
+    try:
+        with open(local_html_path, "r", encoding="utf-8", errors="ignore") as f:
+            head = f.read(20000).lower()
+        if "plotly" in head or "plotly.newplot" in head:
+            return "charts"
+        if "<table" in head:
+            return "tables"
+    except Exception:
+        pass
+    return "tables" if str(visual_hint).lower().strip() == "table" else "charts"
+
+def upload_diagram_to_gcs(local_path: str, *, domain: str, session_id: str, run_id: str, kind: str) -> dict:
+    """
+    Upload local HTML diagram to GCS under diagrams/<kind>/<domain>/<session>_<run>.html
+    kind in {"charts","tables"}
+    """
+    if not os.path.exists(local_path):
+        raise FileNotFoundError(local_path)
+    safe_domain = slug(domain)
+    filename = f"{session_id}_{run_id}.html"
+    kind = "tables" if kind == "tables" else "charts"  # sanitize
+    blob_name = f"{GCS_DIAGRAMS_PREFIX}/{kind}/{safe_domain}/{filename}"
+    bucket = _gcs_bucket()
+    blob = bucket.blob(blob_name)
+    blob.cache_control = "public, max-age=86400"
+    blob.content_type = "text/html; charset=utf-8"
+    blob.upload_from_filename(local_path)
+    return {
+        "blob_name": blob_name,
+        "gs_uri": f"gs://{GCS_BUCKET}/{blob_name}",
+        "signed_url": _signed_url(blob, filename, "text/html", GCS_SIGNED_URL_TTL_SECONDS),
+        "public_url": f"https://storage.googleapis.com/{GCS_BUCKET}/{blob_name}",
+        "kind": kind,
+    }
 
 # --- Router: decides which agents/LLM to run based on prompt + context --------
 def plan_agents(user_prompt: str, data_info: dict, data_describe: dict, state: dict):
@@ -180,7 +376,7 @@ def plan_agents(user_prompt: str, data_info: dict, data_describe: dict, state: d
     state["last_plan"] = plan
     return plan
 
-# --- Static file serving for charts -------------------------------------------
+# --- Static file serving for charts (dev preview) ------------------------------
 @app.route("/charts/<path:relpath>")
 def serve_chart(relpath):
     full = os.path.join(CHARTS_ROOT, relpath)
@@ -195,22 +391,163 @@ def health():
 
 @app.get("/domains")
 def list_domains():
-    """List domain folders & CSV available in this instance (ephemeral-friendly)."""
+    """List domain folders & CSV available in this instance (ephemeral-friendly) + GCS meta."""
     result = {}
     try:
+        # local
         for d in sorted(os.listdir(DATASETS_ROOT)):
             p = os.path.join(DATASETS_ROOT, d)
             if os.path.isdir(p):
                 csvs = [f for f in sorted(os.listdir(p)) if f.lower().endswith(".csv")]
-                result[d] = csvs
+                if csvs:
+                    result[d] = csvs
+        # gcs (merge by name)
+        metas = _list_dataset_meta()
+        for m in metas:
+            d = m.get("domain","")
+            f = m.get("filename","")
+            if not d or not f: continue
+            result.setdefault(d, [])
+            if f not in result[d]:
+                result[d].append(f)
         return jsonify(result)
     except Exception as e:
         return jsonify({"detail": str(e)}), 500
 
-# --- Query endpoint (orchestrated 3-agent pipeline with router + session) -----
+# --- DATASETS: upload/list/read/delete (GCS) ----------------------------------
+@app.post("/datasets/upload")
+def datasets_upload():
+    """
+    Multipart upload:
+      - domain (str, required)
+      - file (file, required)
+    """
+    try:
+        domain = request.form.get("domain")
+        file = request.files.get("file")
+        if not domain or not file:
+            return jsonify({"detail":"Missing 'domain' or 'file'"}), 400
+        uploaded = upload_dataset_file(file, domain=domain)
+        return jsonify(uploaded), 201
+    except Exception as e:
+        return jsonify({"detail": str(e)}), 500
+
+@app.get("/datasets")
+def datasets_list():
+    """
+    Query:
+      - domain (optional)
+      - signed=true|false (include signed_url)
+    """
+    try:
+        domain = request.args.get("domain")
+        add_signed = request.args.get("signed","false").lower() in ("1","true","yes")
+        items = _list_dataset_meta(domain=domain)
+        if add_signed:
+            for it in items:
+                gs_uri = it.get("gs_uri","")
+                if not gs_uri: continue
+                _, bucket_name, *rest = gs_uri.replace("gs://","").split("/")
+                blob_name = "/".join(rest)
+                blob = _storage_client.bucket(bucket_name).blob(blob_name)
+                it["signed_url"] = _signed_url(blob, it["filename"], "text/csv", GCS_SIGNED_URL_TTL_SECONDS)
+        return jsonify({"items": items})
+    except Exception as e:
+        return jsonify({"detail": str(e)}), 500
+
+@app.get("/datasets/<domain>/<path:filename>")
+def datasets_read(domain, filename):
+    """
+    Read dataset content (preview).
+    Query:
+      - n (int) default 50
+      - as=json|csv (default json)
+    """
+    try:
+        n = int(request.args.get("n","50"))
+        as_fmt = request.args.get("as","json")
+        blob_name = f"{GCS_DATASETS_PREFIX}/{slug(domain)}/{filename}"
+        df = read_gcs_csv_to_df(blob_name)
+        if n > 0:
+            df = df.head(n)
+        if as_fmt == "csv":
+            out = io.StringIO(); df.to_csv(out, index=False)
+            return out.getvalue(), 200, {"Content-Type":"text/csv; charset=utf-8"}
+        return jsonify({"records": json.loads(df.to_json(orient="records"))})
+    except Exception as e:
+        return jsonify({"detail": str(e)}), 500
+
+@app.delete("/datasets/<domain>/<path:filename>")
+def datasets_delete(domain, filename):
+    try:
+        blob_name = f"{GCS_DATASETS_PREFIX}/{slug(domain)}/{filename}"
+        delete_gcs_object(blob_name)
+        _delete_dataset_meta(domain, filename)
+        # best-effort local cleanup
+        local_path = os.path.join(DATASETS_ROOT, slug(domain), filename)
+        try:
+            if os.path.exists(local_path):
+                os.remove(local_path)
+        except Exception:
+            pass
+        return jsonify({"deleted": True, "domain": slug(domain), "filename": filename})
+    except Exception as e:
+        return jsonify({"detail": str(e)}), 500
+
+# --- Sessions / History (GPT-like persistence) --------------------------------
+@app.get("/sessions")
+def sessions_list():
+    try:
+        limit = int(request.args.get("limit","20"))
+        col = _firestore_client.collection(FIRESTORE_COLLECTION_SESSIONS)
+        docs = col.order_by("updated_at", direction=firestore.Query.DESCENDING).limit(limit).stream()
+        items = []
+        for d in docs:
+            if not d.exists: continue
+            data = d.to_dict() or {}
+            items.append({
+                "session_id": d.id,
+                "updated_at": str(data.get("updated_at","")),
+                "created_at": str(data.get("created_at","")),
+                "last_visual_signed_url": data.get("last_visual_signed_url","") or "",
+                "last_visual_kind": data.get("last_visual_kind",""),
+                "last_plan": data.get("last_plan"),
+            })
+        return jsonify({"items": items})
+    except Exception as e:
+        return jsonify({"detail": str(e)}), 500
+
+@app.get("/sessions/<session_id>/history")
+def sessions_history(session_id):
+    try:
+        st = _get_conv_state(session_id)
+        return jsonify({
+            "session_id": session_id,
+            "history": st.get("history", []),
+            "last_visual_signed_url": st.get("last_visual_signed_url",""),
+            "last_visual_kind": st.get("last_visual_kind",""),
+            "last_plan": st.get("last_plan"),
+        })
+    except Exception as e:
+        return jsonify({"detail": str(e)}), 500
+
+# --- Cancel “thinking” (cooperative stop) -------------------------------------
+@app.post("/query/cancel")
+def query_cancel():
+    try:
+        body = request.get_json(force=True) if request.data else {}
+        session_id = body.get("session_id")
+        if not session_id:
+            return jsonify({"detail":"Missing 'session_id'"}), 400
+        _CANCEL_FLAGS.add(session_id)
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"detail": str(e)}), 500
+
+# --- Query endpoint (GCS + local fallback) ------------------------------------
 @app.post("/query")
 def query():
-    """Run the orchestrated 3-agent pipeline on LOCAL datasets with routing and session context."""
+    """Run the orchestrated 3-agent pipeline on datasets (GCS-first) with routing and persistent session context."""
     t0 = time.time()
     try:
         body = request.get_json(force=True)
@@ -223,35 +560,57 @@ def query():
         if not GEMINI_API_KEY:
             return jsonify({"detail": "No API key configured"}), 500
 
-        # Normalize domain & ensure folder exists (ephemeral-friendly)
+        # Normalize domain
         domain = slug(domain_in)
-        domain_dir = ensure_dir(os.path.join(DATASETS_ROOT, domain))
 
-        # Session-scoped state
+        # Persistent state (Firestore)
         state = _get_conv_state(session_id)
-        globals()["_CONV_STATE"] = state  # used by helper functions
         _append_history(state, "user", prompt)
+        _save_conv_state(session_id, state)
 
-        # Load datasets (CSV)
+        _cancel_if_needed(session_id)
+
+        # Load datasets from GCS first; fallback to local
         dfs: Dict[str, pd.DataFrame] = {}
         data_info: Dict[str, str] = {}
         data_describe: Dict[str, str] = {}
 
+        # GCS
+        try:
+            for b in list_gcs_csvs(domain):
+                if not b.name.lower().endswith(".csv"):
+                    continue
+                df = read_gcs_csv_to_df(b.name)
+                key = os.path.basename(b.name)
+                dfs[key] = df
+                buf = io.StringIO(); df.info(buf=buf)
+                data_info[key] = buf.getvalue()
+                try:
+                    data_describe[key] = df.describe(include="all").to_json()
+                except Exception:
+                    data_describe[key] = "{}"
+        except Exception:
+            pass
+
+        # Local fallback (dev)
+        domain_dir = ensure_dir(os.path.join(DATASETS_ROOT, domain))
         for name in sorted(os.listdir(domain_dir)):
-            if name.lower().endswith(".csv"):
+            if name.lower().endswith(".csv") and name not in dfs:
                 path = os.path.join(domain_dir, name)
                 try:
-                    df = pd.read_csv(path, sep="|")
+                    try:
+                        df = pd.read_csv(path, sep="|")
+                    except Exception:
+                        df = pd.read_csv(path)
+                    dfs[name] = df
+                    buf = io.StringIO(); df.info(buf=buf)
+                    data_info[name] = buf.getvalue()
+                    try:
+                        data_describe[name] = df.describe(include="all").to_json()
+                    except Exception:
+                        data_describe[name] = "{}"
                 except Exception:
-                    df = pd.read_csv(path)
-                dfs[name] = df
-                buf = io.StringIO()
-                df.info(buf=buf)
-                data_info[name] = buf.getvalue()
-                try:
-                    data_describe[name] = df.describe(include="all").to_json()
-                except Exception:
-                    data_describe[name] = "{}"
+                    pass
 
         if not dfs:
             # No CSV uploaded yet for this (possibly new) domain
@@ -277,11 +636,12 @@ def query():
         # ------------------- Orchestrator (aware of context + router) -------------
         context_hint = {
             "router_plan": agent_plan,
-            "last_visual_path": state.get("last_visual_path", ""),
-            "has_prev_df_processed": state.get("last_df_processed") is not None,
+            "last_visual_path": "",  # local path deprecated; use signed url below
+            "has_prev_df_processed": False,
             "last_analyzer_excerpt": (state.get("last_analyzer_text") or "")[:400],
         }
 
+        _cancel_if_needed(session_id)
         orchestrator_response = completion(
             model="gemini/gemini-2.5-pro",
             messages=[
@@ -440,8 +800,9 @@ def query():
         pai.config.set({"llm": llm})
 
         # ---------- Data Manipulator (conditional) ----------
+        _cancel_if_needed(session_id)
         df_processed = None
-        if need_manip or (state.get("last_df_processed") is None and (need_visual or need_analyze)):
+        if need_manip or (need_visual or need_analyze):
             data_manipulator = SmartDatalake(
                 list(dfs.values()),
                 config={
@@ -463,13 +824,14 @@ def query():
                 df_processed = dm_resp.value
             else:
                 df_processed = dm_resp
-            state["last_df_processed"] = df_processed
-        else:
-            df_processed = state.get("last_df_processed")
 
         # ---------- Data Visualizer (conditional) ----------
+        _cancel_if_needed(session_id)
         dv_resp = SimpleNamespace(value="")
         chart_url = None
+        diagram_signed_url = None
+        diagram_gs_uri = None
+        diagram_kind = ""  # "charts" | "tables"
         run_id = datetime.utcnow().strftime("%Y%m%d%H%M%S%f")
         globals()["_RUN_ID"] = run_id
 
@@ -494,7 +856,7 @@ def query():
             )
             dv_resp = data_visualizer.chat(visualizer_prompt)
 
-            # Move produced HTML to CHARTS_ROOT for serving
+            # Move produced HTML to CHARTS_ROOT for serving (local dev) + upload to GCS/diagrams
             chart_path = getattr(dv_resp, "value", None)
             if isinstance(chart_path, str) and os.path.exists(chart_path):
                 out_dir = ensure_dir(os.path.join(CHARTS_ROOT, domain))
@@ -505,9 +867,20 @@ def query():
                 except Exception:
                     import shutil; shutil.copyfile(chart_path, dest)
                 chart_url = f"/charts/{domain}/{filename}"
-                state["last_visual_path"] = dest
+
+                # Determine diagram kind and upload
+                diagram_kind = _detect_diagram_kind(dest, visual_hint)
+                uploaded = upload_diagram_to_gcs(dest, domain=domain, session_id=session_id, run_id=run_id, kind=diagram_kind)
+                diagram_signed_url = uploaded["signed_url"]
+                diagram_gs_uri     = uploaded["gs_uri"]
+
+                # persist for GPT-like reload
+                state["last_visual_gcs_path"]   = diagram_gs_uri
+                state["last_visual_signed_url"] = diagram_signed_url
+                state["last_visual_kind"]       = diagram_kind
 
         # ---------- Data Analyzer (conditional) ----------
+        _cancel_if_needed(session_id)
         da_resp = ""
         if need_analyze:
             if df_processed is None:
@@ -533,6 +906,7 @@ def query():
             state["last_analyzer_text"] = da_resp or ""
 
         # ---------- Response Compiler (router-selected model) ----------
+        _cancel_if_needed(session_id)
         data_info_runtime = data_info  # keep per-file infos
 
         final_response = completion(
@@ -562,22 +936,40 @@ def query():
         # --- Persist summary to conversation history ---
         _append_history(state, "assistant", {
             "plan": agent_plan,
-            "visual_path": state.get("last_visual_path", ""),
+            "visual_path": "",  # local path deprecated
+            "visual_signed_url": state.get("last_visual_signed_url",""),
+            "visual_gs_uri": state.get("last_visual_gcs_path",""),
+            "visual_kind": state.get("last_visual_kind",""),
             "analyzer_excerpt": (state.get("last_analyzer_text") or "")[:400],
             "final_preview": final_content[:600]
         })
-        _SESSIONS[session_id] = state  # save back
+        _save_conv_state(session_id, state)
 
         exec_time = time.time() - t0
         return jsonify({
             "session_id": session_id,
             "response": final_content,
+            # local (dev) preview:
             "chart_url": chart_url,
+
+            # preferred fields (diagrams on GCS):
+            "diagram_kind": diagram_kind,               # "charts" | "tables"
+            "diagram_gs_uri": diagram_gs_uri,           # gs://...
+            "diagram_signed_url": diagram_signed_url,   # FE should use this
+
+            # backward-compat (deprecated):
+            "chart_gs_uri": diagram_gs_uri,
+            "chart_signed_url": diagram_signed_url,
+
             "execution_time": exec_time,
             "need_visualizer": need_visual,
             "need_analyzer": need_analyze,
             "need_manipulator": need_manip,
         })
+    except RuntimeError as rexc:
+        if "CANCELLED_BY_USER" in str(rexc):
+            return jsonify({"code":"CANCELLED","detail":"Processing cancelled by user."}), 409
+        return jsonify({"detail": str(rexc)}), 500
     except Exception as e:
         return jsonify({"detail": str(e)}), 500
 

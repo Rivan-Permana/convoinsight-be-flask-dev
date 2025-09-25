@@ -1,7 +1,7 @@
 # Cloud Build pipeline: Build → Push (Artifact Registry) → Deploy (Cloud Run)
 # Sesuaikan substitutions kalau perlu.
 substitutions:
-  _SERVICE: "ml-bi-flask"             # Nama Cloud Run service
+  _SERVICE: "convoinsight-be-flask"             # Nama Cloud Run service
   _REGION: "asia-southeast2"          # Region Jakarta
   _REPO: "convoinsight"               # Nama repository di Artifact Registry (format: docker repo)
   _MIN_INSTANCES: "0"
@@ -11,6 +11,14 @@ substitutions:
   _MEMORY: "8Gi"
   _ALLOW_UNAUTH: "true"               # "true" untuk publik, "false" jika private
   _CORS_ORIGINS: "https://convoinsight.vercel.app/,http://localhost:5173,http://127.0.0.1:5173"
+
+   # --- tambahan penting untuk app ini ---
+  _GCS_BUCKET: "convoinsight-assets"
+  _GCS_DATASETS_PREFIX: "datasets"
+  _GCS_DIAGRAMS_PREFIX: "diagrams"
+  _GCS_SIGNED_URL_TTL_SECONDS: "604800"
+  _FIRESTORE_COLLECTION: "convo_sessions"
+  _FIRESTORE_DATASETS_COLLECTION: "datasets_meta"
 
 # (Opsional) Ambil secret dari Secret Manager saat deploy:
 # Pastikan kamu punya secret `GEMINI_API_KEY` di Secret Manager project ini.

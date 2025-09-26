@@ -171,7 +171,6 @@ def _list_dataset_meta(domain: Optional[str]=None, limit: int=200) -> List[dict]
     col = _firestore_client.collection(FIRESTORE_COLLECTION_DATASETS)
     q = col.order_by("updated_at", direction=firestore.Query.DESCENDING)
     if domain:
-        # NOTE: Firestore Python SDK now prefers keyword 'filter=...' — but positional still works.
         q = q.where("domain", "==", slug(domain))
     docs = q.limit(limit).stream()
     return [d.to_dict() for d in docs if d.exists]
@@ -737,6 +736,8 @@ def query():
         domain_in  = body.get("domain")
         prompt     = body.get("prompt")
         session_id = body.get("session_id") or str(uuid.uuid4())
+        # ---------- NEW: optional dataset filter ----------
+        dataset_filter = (body.get("dataset") or "").strip() or None  # e.g., "product.csv"
 
         if not domain_in or not prompt:
             return jsonify({"detail": "Missing 'domain' or 'prompt'"}), 400
@@ -764,8 +765,10 @@ def query():
                 for b in list_gcs_csvs(domain):
                     if not b.name.lower().endswith(".csv"):
                         continue
-                    df = read_gcs_csv_to_df(b.name)
                     key = os.path.basename(b.name)
+                    if dataset_filter and key != dataset_filter:
+                        continue
+                    df = read_gcs_csv_to_df(b.name)
                     dfs[key] = df
                     buf = io.StringIO(); df.info(buf=buf)
                     data_info[key] = buf.getvalue()
@@ -779,22 +782,45 @@ def query():
         # Local fallback (dev)
         domain_dir = ensure_dir(os.path.join(DATASETS_ROOT, domain))
         for name in sorted(os.listdir(domain_dir)):
-            if name.lower().endswith(".csv") and name not in dfs:
-                path = os.path.join(domain_dir, name)
+            if not name.lower().endswith(".csv"):
+                continue
+            if dataset_filter and name != dataset_filter:
+                continue
+            if name in dfs:
+                continue
+            path = os.path.join(domain_dir, name)
+            try:
+                df = _read_local_csv_to_df(path)
+                dfs[name] = df
+                buf = io.StringIO(); df.info(buf=buf)
+                data_info[name] = buf.getvalue()
                 try:
-                    df = _read_local_csv_to_df(path)
-                    dfs[name] = df
-                    buf = io.StringIO(); df.info(buf=buf)
-                    data_info[name] = buf.getvalue()
-                    try:
-                        data_describe[name] = df.describe(include="all").to_json()
-                    except Exception:
-                        data_describe[name] = "{}"
+                    data_describe[name] = df.describe(include="all").to_json()
                 except Exception:
-                    pass
+                    data_describe[name] = "{}"
+            except Exception:
+                pass
 
         if not dfs:
-            # No CSV uploaded yet for this (possibly new) domain
+            # No CSV uploaded for requested scope
+            if dataset_filter:
+                # dataset was explicitly requested but not found
+                available = []
+                # list local files
+                if os.path.isdir(domain_dir):
+                    available.extend(sorted([f for f in os.listdir(domain_dir) if f.lower().endswith(".csv")]))
+                # add GCS names (best-effort)
+                try:
+                    if GCS_BUCKET:
+                        available.extend(sorted({os.path.basename(b.name) for b in list_gcs_csvs(domain) if b.name.lower().endswith(".csv")}))
+                except Exception:
+                    pass
+                return jsonify({
+                    "code": "DATASET_NOT_FOUND",
+                    "detail": f"Requested dataset '{dataset_filter}' not found in domain '{domain}'.",
+                    "domain": domain,
+                    "available": sorted(list(set(available))),
+                }), 404
             return jsonify({
                 "code": "NEED_UPLOAD",
                 "detail": f"No CSV files found in domain '{domain}'",
@@ -811,7 +837,7 @@ def query():
         need_manip = bool(agent_plan.get("need_manipulator", True))
         need_visual = bool(agent_plan.get("need_visualizer", True))
         need_analyze = bool(agent_plan.get("need_analyzer", True))
-        compiler_model = "gemini/gemini-2.5-pro"
+        compiler_model = agent_plan.get("compiler_model") or "gemini/gemini-2.5-pro"
         visual_hint = agent_plan.get("visual_hint", "auto")
 
         # ------------------- Orchestrator (aware of context + router) -------------
@@ -820,6 +846,7 @@ def query():
             "last_visual_path": "",  # local path deprecated; use signed url below
             "has_prev_df_processed": False,
             "last_analyzer_excerpt": (state.get("last_analyzer_text") or "")[:400],
+            "dataset_filter": dataset_filter or "ALL",  # NEW: expose selected dataset to LLM context
         }
 
         _cancel_if_needed(session_id)

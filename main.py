@@ -555,10 +555,20 @@ def query():
         prompt     = body.get("prompt")
         session_id = body.get("session_id") or str(uuid.uuid4())
 
+        dataset_field = body.get("dataset")
+        if isinstance(dataset_field, list):
+            datasets = dataset_field
+        elif isinstance(dataset_field, str) and dataset_field.strip():
+            datasets = [dataset_field.strip()]
+        else:
+            datasets = []
+
         if not domain_in or not prompt:
             return jsonify({"detail": "Missing 'domain' or 'prompt'"}), 400
         if not GEMINI_API_KEY:
             return jsonify({"detail": "No API key configured"}), 500
+        
+        print("Datasets selected:", datasets)
 
         # Normalize domain
         domain = slug(domain_in)

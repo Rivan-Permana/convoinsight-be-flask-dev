@@ -190,28 +190,84 @@ def _signed_url(blob, filename: str, content_type: str, ttl_seconds: int) -> str
         response_type=content_type,
     )
 
-def upload_dataset_file(file_storage, *, domain: str) -> dict:
-    """
-    Upload a Werkzeug FileStorage to GCS under datasets/<domain>/<filename>.
-    """
+# ---- Local helpers / robust dev mode -----------------------------------------
+def _upload_dataset_file_local(file_storage, *, domain: str) -> dict:
     safe_domain = slug(domain)
+    folder = ensure_dir(os.path.join(DATASETS_ROOT, safe_domain))
     filename = file_storage.filename
-    blob_name = f"{GCS_DATASETS_PREFIX}/{safe_domain}/{filename}"
-    bucket = _gcs_bucket()
-    blob = bucket.blob(blob_name)
-    blob.cache_control = "private, max-age=0"
-    blob.content_type = "text/csv"
-    file_storage.stream.seek(0)
-    blob.upload_from_file(file_storage.stream, rewind=True, size=None, content_type="text/csv")
-    size = blob.size or 0
-    gs_uri = f"gs://{GCS_BUCKET}/{blob_name}"
-    _save_dataset_meta(domain, filename, gs_uri, size)
+    dest = os.path.join(folder, filename)
+    file_storage.save(dest)
+    size = os.path.getsize(dest) if os.path.exists(dest) else 0
     return {
         "filename": filename,
-        "gs_uri": gs_uri,
-        "signed_url": _signed_url(blob, filename, "text/csv", GCS_SIGNED_URL_TTL_SECONDS),
+        "gs_uri": "",
+        "signed_url": "",
         "size_bytes": size,
+        "local_path": dest,
     }
+
+def _save_bytes_local(domain: str, filename: str, data: bytes) -> dict:
+    safe_domain = slug(domain)
+    folder = ensure_dir(os.path.join(DATASETS_ROOT, safe_domain))
+    dest = os.path.join(folder, filename)
+    with open(dest, "wb") as f:
+        f.write(data)
+    size = os.path.getsize(dest)
+    return {
+        "filename": filename,
+        "gs_uri": "",
+        "signed_url": "",
+        "size_bytes": size,
+        "local_path": dest,
+    }
+
+def _read_local_csv_to_df(path: str, sep_candidates: List[str] = (",", "|", ";", "\\t")) -> pd.DataFrame:
+    with open(path, "rb") as f:
+        data = f.read()
+    for sep in sep_candidates:
+        try:
+            return pd.read_csv(io.BytesIO(data), sep=sep if sep != "\\t" else "\t")
+        except Exception:
+            continue
+    return pd.read_csv(io.BytesIO(data))
+
+# ---- Upload (GCS when possible, safe local fallback otherwise) ----------------
+def upload_dataset_file(file_storage, *, domain: str) -> dict:
+    """
+    Upload a Werkzeug FileStorage.
+    - If GCS_BUCKET is set → try GCS (and write Firestore meta).
+    - If GCS upload/meta fails (common in local dev) → automatically fall back to local save.
+    - If GCS_BUCKET is not set → save locally.
+    """
+    if not GCS_BUCKET:
+        return _upload_dataset_file_local(file_storage, domain=domain)
+
+    try:
+        safe_domain = slug(domain)
+        filename = file_storage.filename
+        blob_name = f"{GCS_DATASETS_PREFIX}/{safe_domain}/{filename}"
+        bucket = _gcs_bucket()
+        blob = bucket.blob(blob_name)
+        blob.cache_control = "private, max-age=0"
+        blob.content_type = "text/csv"
+        file_storage.stream.seek(0)
+        blob.upload_from_file(file_storage.stream, rewind=True, size=None, content_type="text/csv")
+        size = blob.size or 0
+        gs_uri = f"gs://{GCS_BUCKET}/{blob_name}"
+        try:
+            _save_dataset_meta(domain, filename, gs_uri, size)
+        except Exception:
+            # ignore meta failure in local/dev
+            pass
+        return {
+            "filename": filename,
+            "gs_uri": gs_uri,
+            "signed_url": _signed_url(blob, filename, "text/csv", GCS_SIGNED_URL_TTL_SECONDS),
+            "size_bytes": size,
+        }
+    except Exception:
+        # Any GCS error → use local fallback
+        return _upload_dataset_file_local(file_storage, domain=domain)
 
 def list_gcs_csvs(domain: str) -> List[storage.Blob]:
     safe_domain = slug(domain)
@@ -402,14 +458,17 @@ def list_domains():
                 if csvs:
                     result[d] = csvs
         # gcs (merge by name)
-        metas = _list_dataset_meta()
-        for m in metas:
-            d = m.get("domain","")
-            f = m.get("filename","")
-            if not d or not f: continue
-            result.setdefault(d, [])
-            if f not in result[d]:
-                result[d].append(f)
+        try:
+            metas = _list_dataset_meta()
+            for m in metas:
+                d = m.get("domain","")
+                f = m.get("filename","")
+                if not d or not f: continue
+                result.setdefault(d, [])
+                if f not in result[d]:
+                    result[d].append(f)
+        except Exception:
+            pass
         return jsonify(result)
     except Exception as e:
         return jsonify({"detail": str(e)}), 500
@@ -442,15 +501,30 @@ def datasets_list():
     try:
         domain = request.args.get("domain")
         add_signed = request.args.get("signed","false").lower() in ("1","true","yes")
-        items = _list_dataset_meta(domain=domain)
-        if add_signed:
-            for it in items:
-                gs_uri = it.get("gs_uri","")
-                if not gs_uri: continue
-                _, bucket_name, *rest = gs_uri.replace("gs://","").split("/")
-                blob_name = "/".join(rest)
-                blob = _storage_client.bucket(bucket_name).blob(blob_name)
-                it["signed_url"] = _signed_url(blob, it["filename"], "text/csv", GCS_SIGNED_URL_TTL_SECONDS)
+        items = []
+        try:
+            items = _list_dataset_meta(domain=domain)
+            if add_signed:
+                for it in items:
+                    gs_uri = it.get("gs_uri","")
+                    if not gs_uri: continue
+                    _, bucket_name, *rest = gs_uri.replace("gs://","").split("/")
+                    blob_name = "/".join(rest)
+                    blob = _storage_client.bucket(bucket_name).blob(blob_name)
+                    it["signed_url"] = _signed_url(blob, it["filename"], "text/csv", GCS_SIGNED_URL_TTL_SECONDS)
+        except Exception:
+            items = []
+
+        # local fallback merge
+        if domain:
+            domain_dir = os.path.join(DATASETS_ROOT, slug(domain))
+            if os.path.isdir(domain_dir):
+                known = { (i.get("domain"), i.get("filename")) for i in items }
+                for name in sorted(os.listdir(domain_dir)):
+                    if name.lower().endswith(".csv") and (slug(domain), name) not in known:
+                        path = os.path.join(domain_dir, name)
+                        size = os.path.getsize(path)
+                        items.append({"domain": slug(domain), "filename": name, "gs_uri":"", "size_bytes": size, "signed_url": ""})
         return jsonify({"items": items})
     except Exception as e:
         return jsonify({"detail": str(e)}), 500
@@ -466,8 +540,16 @@ def datasets_read(domain, filename):
     try:
         n = int(request.args.get("n","50"))
         as_fmt = request.args.get("as","json")
-        blob_name = f"{GCS_DATASETS_PREFIX}/{slug(domain)}/{filename}"
-        df = read_gcs_csv_to_df(blob_name)
+        # prefer GCS if configured, else local
+        if GCS_BUCKET:
+            blob_name = f"{GCS_DATASETS_PREFIX}/{slug(domain)}/{filename}"
+            df = read_gcs_csv_to_df(blob_name)
+        else:
+            local_path = os.path.join(DATASETS_ROOT, slug(domain), filename)
+            if not os.path.exists(local_path):
+                return jsonify({"detail": "File not found"}), 404
+            df = _read_local_csv_to_df(local_path)
+
         if n > 0:
             df = df.head(n)
         if as_fmt == "csv":
@@ -480,9 +562,13 @@ def datasets_read(domain, filename):
 @app.delete("/datasets/<domain>/<path:filename>")
 def datasets_delete(domain, filename):
     try:
-        blob_name = f"{GCS_DATASETS_PREFIX}/{slug(domain)}/{filename}"
-        delete_gcs_object(blob_name)
-        _delete_dataset_meta(domain, filename)
+        if GCS_BUCKET:
+            blob_name = f"{GCS_DATASETS_PREFIX}/{slug(domain)}/{filename}"
+            delete_gcs_object(blob_name)
+            try:
+                _delete_dataset_meta(domain, filename)
+            except Exception:
+                pass
         # best-effort local cleanup
         local_path = os.path.join(DATASETS_ROOT, slug(domain), filename)
         try:
@@ -493,6 +579,102 @@ def datasets_delete(domain, filename):
         return jsonify({"deleted": True, "domain": slug(domain), "filename": filename})
     except Exception as e:
         return jsonify({"detail": str(e)}), 500
+
+# ----------------- FE COMPAT ALIASES (fix 404/500 seen in console) -----------------
+# POST /upload_datasets/<domain>  (UploadDropzone.tsx)
+@app.post("/upload_datasets/<domain>")
+def compat_upload_datasets(domain: str):
+    """
+    FE compatibility endpoint.
+    Accepts:
+      - single file via 'file'
+      - multiple files via 'files' or 'files[]'
+      - raw body (bytes) with ?filename=... or header X-Filename (fallback to timestamped CSV)
+    Returns:
+      { "items": [ {filename, gs_uri, signed_url, size_bytes, local_path?}, ... ] }
+    """
+    try:
+        files: List = []
+        # support various possible field names
+        single = request.files.get("file")
+        if single:
+            files.append(single)
+        files.extend(request.files.getlist("files"))
+        files.extend(request.files.getlist("files[]"))
+
+        uploads = []
+        for f in files:
+            uploads.append(upload_dataset_file(f, domain=domain))
+
+        # raw body fallback (some uploaders stream bytes instead of multipart)
+        if not uploads and request.data:
+            fname = request.args.get("filename") or request.headers.get("X-Filename") or f"upload_{int(time.time())}.csv"
+            uploads.append(_save_bytes_local(domain, fname, request.data))
+
+        if not uploads:
+            return jsonify({"detail": "No file provided (expected 'file', 'files', or 'files[]', or raw body)."}), 400
+
+        return jsonify({"items": uploads}), 201
+    except Exception as e:
+        return jsonify({"detail": str(e)}), 500
+
+# GET /domains/<domain>/datasets  (DatasetsPage.tsx)
+@app.get("/domains/<domain>/datasets>")
+def compat_list_domain_datasets_trailing(domain: str):
+    # Guard for accidental trailing '>' routes from some routers — redirect to proper JSON.
+    return compat_list_domain_datasets(domain)
+
+@app.get("/domains/<domain>/datasets")
+def compat_list_domain_datasets(domain: str):
+    """
+    FE compatibility endpoint.
+    Always includes signed URLs when available (GCS mode).
+    Returns both 'items' and 'datasets' keys for broader FE compatibility.
+    """
+    try:
+        items: List[dict] = []
+
+        # Firestore-backed meta (GCS mode)
+        try:
+            fs_items = _list_dataset_meta(domain=domain)
+            for it in fs_items:
+                gs_uri = it.get("gs_uri","")
+                if gs_uri:
+                    try:
+                        _, bucket_name, *rest = gs_uri.replace("gs://","").split("/")
+                        blob_name = "/".join(rest)
+                        blob = _storage_client.bucket(bucket_name).blob(blob_name)
+                        it["signed_url"] = _signed_url(blob, it["filename"], "text/csv", GCS_SIGNED_URL_TTL_SECONDS)
+                    except Exception:
+                        it.setdefault("signed_url","")
+            items.extend(fs_items)
+        except Exception:
+            # ignore when Firestore not configured in local dev
+            pass
+
+        # Local files (dev) — merged & deduped by filename
+        try:
+            domain_dir = os.path.join(DATASETS_ROOT, slug(domain))
+            if os.path.isdir(domain_dir):
+                known_names = { i.get("filename") for i in items }
+                for name in sorted(os.listdir(domain_dir)):
+                    if name.lower().endswith(".csv") and name not in known_names:
+                        path = os.path.join(domain_dir, name)
+                        size = os.path.getsize(path)
+                        items.append({
+                            "domain": slug(domain),
+                            "filename": name,
+                            "gs_uri": "",
+                            "size_bytes": size,
+                            "signed_url": "",
+                        })
+        except Exception:
+            pass
+
+        return jsonify({"items": items, "datasets": items})
+    except Exception as e:
+        return jsonify({"detail": str(e)}), 500
+# -------------------------------------------------------------------------------
 
 # --- Sessions / History (GPT-like persistence) --------------------------------
 @app.get("/sessions")
@@ -554,6 +736,8 @@ def query():
         domain_in  = body.get("domain")
         prompt     = body.get("prompt")
         session_id = body.get("session_id") or str(uuid.uuid4())
+        # ---------- NEW: optional dataset filter ----------
+        dataset_filter = (body.get("dataset") or "").strip() or None  # e.g., "product.csv"
 
         dataset_field = body.get("dataset")
         if isinstance(dataset_field, list):
@@ -587,43 +771,66 @@ def query():
 
         # GCS
         try:
-            for b in list_gcs_csvs(domain):
-                if not b.name.lower().endswith(".csv"):
-                    continue
-                df = read_gcs_csv_to_df(b.name)
-                key = os.path.basename(b.name)
-                dfs[key] = df
-                buf = io.StringIO(); df.info(buf=buf)
-                data_info[key] = buf.getvalue()
-                try:
-                    data_describe[key] = df.describe(include="all").to_json()
-                except Exception:
-                    data_describe[key] = "{}"
+            if GCS_BUCKET:
+                for b in list_gcs_csvs(domain):
+                    if not b.name.lower().endswith(".csv"):
+                        continue
+                    key = os.path.basename(b.name)
+                    if dataset_filter and key != dataset_filter:
+                        continue
+                    df = read_gcs_csv_to_df(b.name)
+                    dfs[key] = df
+                    buf = io.StringIO(); df.info(buf=buf)
+                    data_info[key] = buf.getvalue()
+                    try:
+                        data_describe[key] = df.describe(include="all").to_json()
+                    except Exception:
+                        data_describe[key] = "{}"
         except Exception:
             pass
 
         # Local fallback (dev)
         domain_dir = ensure_dir(os.path.join(DATASETS_ROOT, domain))
         for name in sorted(os.listdir(domain_dir)):
-            if name.lower().endswith(".csv") and name not in dfs:
-                path = os.path.join(domain_dir, name)
+            if not name.lower().endswith(".csv"):
+                continue
+            if dataset_filter and name != dataset_filter:
+                continue
+            if name in dfs:
+                continue
+            path = os.path.join(domain_dir, name)
+            try:
+                df = _read_local_csv_to_df(path)
+                dfs[name] = df
+                buf = io.StringIO(); df.info(buf=buf)
+                data_info[name] = buf.getvalue()
                 try:
-                    try:
-                        df = pd.read_csv(path, sep="|")
-                    except Exception:
-                        df = pd.read_csv(path)
-                    dfs[name] = df
-                    buf = io.StringIO(); df.info(buf=buf)
-                    data_info[name] = buf.getvalue()
-                    try:
-                        data_describe[name] = df.describe(include="all").to_json()
-                    except Exception:
-                        data_describe[name] = "{}"
+                    data_describe[name] = df.describe(include="all").to_json()
                 except Exception:
-                    pass
+                    data_describe[name] = "{}"
+            except Exception:
+                pass
 
         if not dfs:
-            # No CSV uploaded yet for this (possibly new) domain
+            # No CSV uploaded for requested scope
+            if dataset_filter:
+                # dataset was explicitly requested but not found
+                available = []
+                # list local files
+                if os.path.isdir(domain_dir):
+                    available.extend(sorted([f for f in os.listdir(domain_dir) if f.lower().endswith(".csv")]))
+                # add GCS names (best-effort)
+                try:
+                    if GCS_BUCKET:
+                        available.extend(sorted({os.path.basename(b.name) for b in list_gcs_csvs(domain) if b.name.lower().endswith(".csv")}))
+                except Exception:
+                    pass
+                return jsonify({
+                    "code": "DATASET_NOT_FOUND",
+                    "detail": f"Requested dataset '{dataset_filter}' not found in domain '{domain}'.",
+                    "domain": domain,
+                    "available": sorted(list(set(available))),
+                }), 404
             return jsonify({
                 "code": "NEED_UPLOAD",
                 "detail": f"No CSV files found in domain '{domain}'",
@@ -649,6 +856,7 @@ def query():
             "last_visual_path": "",  # local path deprecated; use signed url below
             "has_prev_df_processed": False,
             "last_analyzer_excerpt": (state.get("last_analyzer_text") or "")[:400],
+            "dataset_filter": dataset_filter or "ALL",  # NEW: expose selected dataset to LLM context
         }
 
         _cancel_if_needed(session_id)
@@ -880,14 +1088,15 @@ def query():
 
                 # Determine diagram kind and upload
                 diagram_kind = _detect_diagram_kind(dest, visual_hint)
-                uploaded = upload_diagram_to_gcs(dest, domain=domain, session_id=session_id, run_id=run_id, kind=diagram_kind)
-                diagram_signed_url = uploaded["signed_url"]
-                diagram_gs_uri     = uploaded["gs_uri"]
+                if GCS_BUCKET:
+                    uploaded = upload_diagram_to_gcs(dest, domain=domain, session_id=session_id, run_id=run_id, kind=diagram_kind)
+                    diagram_signed_url = uploaded["signed_url"]
+                    diagram_gs_uri     = uploaded["gs_uri"]
 
-                # persist for GPT-like reload
-                state["last_visual_gcs_path"]   = diagram_gs_uri
-                state["last_visual_signed_url"] = diagram_signed_url
-                state["last_visual_kind"]       = diagram_kind
+                    # persist for GPT-like reload
+                    state["last_visual_gcs_path"]   = diagram_gs_uri
+                    state["last_visual_signed_url"] = diagram_signed_url
+                    state["last_visual_kind"]       = diagram_kind
 
         # ---------- Data Analyzer (conditional) ----------
         _cancel_if_needed(session_id)

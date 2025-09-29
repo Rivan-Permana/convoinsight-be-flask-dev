@@ -18,6 +18,9 @@ from pandasai.core.response.dataframe import DataFrameResponse
 from google.cloud import storage
 from google.cloud import firestore
 
+import requests, os
+from cryptography.fernet import Fernet
+
 # -------- optional: load .env --------
 try:
     from dotenv import load_dotenv
@@ -29,10 +32,14 @@ except Exception:
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GCP_PROJECT_ID = os.getenv("GCP_PROJECT_ID")
 
+FERNET_KEY = os.getenv("FERNET_KEY")
+fernet = Fernet(FERNET_KEY.encode()) if FERNET_KEY else None
+
 CORS_ORIGINS = os.getenv(
     "CORS_ORIGINS",
     "http://localhost:5173,http://127.0.0.1:5173,https://convoinsight.vercel.app"
 ).split(",")
+
 
 DATASETS_ROOT = os.getenv("DATASETS_ROOT", os.path.abspath("./datasets"))  # still supported for local/dev
 CHARTS_ROOT   = os.getenv("CHARTS_ROOT",   os.path.abspath("./charts"))    # still supported for local/dev
@@ -47,6 +54,7 @@ GCS_SIGNED_URL_TTL_SECONDS  = int(os.getenv("GCS_SIGNED_URL_TTL_SECONDS", "60480
 
 FIRESTORE_COLLECTION_SESSIONS = os.getenv("FIRESTORE_COLLECTION", "convo_sessions")
 FIRESTORE_COLLECTION_DATASETS = os.getenv("FIRESTORE_DATASETS_COLLECTION", "datasets_meta")
+FIRESTORE_COLLECTION_PROVIDERS = os.getenv("FIRESTORE_COLLECTION", "convo_providers")
 
 # --- Init Flask ---
 app = Flask(__name__)
@@ -104,6 +112,61 @@ def _cancel_if_needed(session_id: str):
     if _should_cancel(session_id):
         _CANCEL_FLAGS.discard(session_id)
         raise RuntimeError("CANCELLED_BY_USER")
+    
+def get_provider_config(provider: str, api_key: str):
+    """Return endpoint and headers based on provider"""
+    if provider == "openai":
+        return {
+            "url": "https://api.openai.com/v1/models",
+            "headers": {"Authorization": f"Bearer {api_key}"}
+        }
+
+    elif provider == "groq":
+        return {
+            "url": "https://api.groq.com/openai/v1/models",
+            "headers": {"Authorization": f"Bearer {api_key}"}
+        }
+
+    elif provider == "anthropic":
+        return {
+            "url": "https://api.anthropic.com/v1/models",
+            "headers": {"x-api-key": api_key}
+        }
+
+    elif provider == "google":
+        # Google pakai query param ?key=
+        return {
+            "url": f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}",
+            "headers": {}
+        }
+
+    else:
+        raise ValueError("Provider not supported")
+
+def save_provider_key(user_id: str, provider: str, encrypted_key: str, models: list):
+    """
+    Save the encrypted API key to the Firestore collection
+    """
+    try:
+        doc_id = f"{user_id}_{provider}"
+        doc_ref = _firestore_client.collection(FIRESTORE_COLLECTION_PROVIDERS).document(doc_id)
+
+        data = {
+            "user_id": user_id,
+            "provider": provider,
+            "token": encrypted_key,     
+            "models": models,           
+            "is_active": True,
+            "updated_at": datetime.utcnow(),
+            "created_at": firestore.SERVER_TIMESTAMP,
+        }
+
+        doc_ref.set(data, merge=True)
+        print(f"Saved {provider} for user {user_id}")
+        return True
+    except Exception as e:
+        print("Firestore save error:", e)
+        return False
 
 # --- Firestore-backed conversation state --------------------------------------
 def _fs_default_state():
@@ -444,6 +507,161 @@ def serve_chart(relpath):
 @app.get("/health")
 def health():
     return jsonify({"status": "healthy", "ts": datetime.utcnow().isoformat()})
+
+@app.route("/validate-key", methods=["POST"])
+def validate_key():
+    try:
+        data = request.get_json()
+        provider = data.get("provider")
+        api_key = data.get("apiKey")
+        user_id = data.get("userId")
+
+        if not provider or not api_key or not user_id:
+            return jsonify({"valid": False, "error": "Missing provider, apiKey, or userId"}), 400
+
+        cfg = get_provider_config(provider, api_key)
+        res = requests.get(cfg["url"], headers=cfg["headers"], timeout=6)
+        print(f"[{provider}] status:", res.status_code)
+
+        if res.status_code == 200:
+            j = res.json()
+            models = []
+
+            # ambil daftar model dari API
+            if "data" in j:
+                models = [m.get("id") for m in j["data"] if "id" in m]
+            elif "models" in j:
+                models = [m.get("name") or m.get("id") for m in j["models"]]
+
+            # enkripsi API Key
+            encrypted_key = fernet.encrypt(api_key.encode()).decode() if fernet else None
+
+            # 🔐 simpan ke Firestore
+            save_provider_key(user_id, provider, encrypted_key, models)
+
+            return jsonify({
+                "valid": True,
+                "provider": provider,
+                "models": models,
+                "token": encrypted_key
+            })
+        else:
+            return jsonify({
+                "valid": False,
+                "provider": provider,
+                "status": res.status_code,
+                "detail": res.text
+            }), 400
+
+    except Exception as e:
+        print("Validation error:", e)
+        return jsonify({"valid": False, "error": str(e)}), 500
+    
+@app.route("/get-provider-keys", methods=["GET"])
+def get_provider_keys():
+    try:
+        user_id = request.args.get("userId")
+        if not user_id:
+            return jsonify({"error": "Missing userId"}), 400
+
+        docs = (
+            _firestore_client.collection(FIRESTORE_COLLECTION_PROVIDERS)
+            .where("user_id", "==", user_id)
+            .stream()
+        )
+
+        items = []
+        for doc in docs:
+            d = doc.to_dict()
+            items.append({
+                "id": doc.id,
+                "provider": d.get("provider"),
+                "models": d.get("models", []),
+                "is_active": d.get("is_active", True),
+                "updated_at": d.get("updated_at").isoformat() if d.get("updated_at") else None,
+            })
+
+        return jsonify({"items": items, "count": len(items)})
+
+    except Exception as e:
+        print("Error get-provider-keys:", e)
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/update-provider-key", methods=["PUT"])
+def update_provider_key():
+    try:
+        data = request.get_json()
+        user_id = data.get("userId")
+        provider = data.get("provider")
+        api_key = data.get("apiKey")
+
+        if not user_id or not provider or not api_key:
+            return jsonify({"updated": False, "error": "Missing fields"}), 400
+
+        # 1️⃣ Validasi dulu API key baru
+        cfg = get_provider_config(provider, api_key)
+        res = requests.get(cfg["url"], headers=cfg["headers"], timeout=6)
+        if res.status_code != 200:
+            return jsonify({"updated": False, "error": "Invalid API key"}), 400
+
+        j = res.json()
+        models = []
+        if "data" in j:
+            models = [m.get("id") for m in j["data"] if "id" in m]
+        elif "models" in j:
+            models = [m.get("name") or m.get("id") for m in j["models"]]
+
+        # 2️⃣ Enkripsi ulang API key
+        encrypted_key = (
+            fernet.encrypt(api_key.encode()).decode() if fernet else None
+        )
+
+        # 3️⃣ Update Firestore document
+        doc_ref = _firestore_client.collection(FIRESTORE_COLLECTION_PROVIDERS).document(
+            f"{user_id}_{provider}"
+        )
+        doc_ref.set(
+            {
+                "user_id": user_id,
+                "provider": provider,
+                "token": encrypted_key,
+                "models": models,
+                "updated_at": datetime.utcnow().isoformat(),
+            },
+            merge=True,  
+        )
+
+        return jsonify({"updated": True, "models": models})
+
+    except Exception as e:
+        print("Update provider error:", e)
+        return jsonify({"updated": False, "error": str(e)}), 500
+
+
+@app.route("/delete-provider-key", methods=["DELETE"])
+def delete_provider_key():
+    try:
+        data = request.get_json()
+        user_id = data.get("userId")
+        provider = data.get("provider")
+
+        if not user_id or not provider:
+            return jsonify({"error": "Missing userId or provider"}), 400
+
+        doc_id = f"{user_id}_{provider}"
+        doc_ref = _firestore_client.collection(FIRESTORE_COLLECTION_PROVIDERS).document(doc_id)
+
+        doc = doc_ref.get()
+        if not doc.exists:
+            return jsonify({"error": "Key not found"}), 404
+
+        # bisa pilih: delete atau soft delete
+        doc_ref.delete()
+        print(f"Deleted provider={provider} for user_id={user_id}")
+        return jsonify({"deleted": True})
+    except Exception as e:
+        print("Error delete-provider-key:", e)
+        return jsonify({"error": str(e)}), 500
 
 @app.get("/domains")
 def list_domains():

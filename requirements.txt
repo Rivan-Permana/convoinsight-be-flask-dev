@@ -21,9 +21,12 @@ google-cloud-storage>=2.16.0
 google-cloud-firestore>=2.16.0
 google-api-core[grpc]>=2.17.0
 
+<<<<<<< HEAD
 # --- export to pdf feature ---
-reportlab
+reportlab>=3.6
 
 # --- validate api and it's security
+=======
+>>>>>>> 5dd0c49beeb1444b572aefe66c091049fee5bc21
 requests==2.32.3
 cryptography==43.0.3

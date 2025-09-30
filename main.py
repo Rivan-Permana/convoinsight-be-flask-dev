@@ -1,5 +1,5 @@
 # main.py — Merged Flask API: GCS datasets CRUD, diagrams(charts|tables) to GCS,
-# Firestore history (GPT-like), provider key mgmt, cancel "thinking", export to PDF
+# Firestore history (GPT-like), provider api key, cancel "thinking", export to PDF
 import os, io, json, time, uuid, re, html
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional

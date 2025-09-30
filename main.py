@@ -19,11 +19,7 @@ from pandasai.core.response.dataframe import DataFrameResponse
 from google.cloud import storage
 from google.cloud import firestore
 
-<<<<<<< HEAD
 import requests
-=======
-import requests, os
->>>>>>> 5dd0c49beeb1444b572aefe66c091049fee5bc21
 from cryptography.fernet import Fernet
 
 # -------- optional: load .env --------
@@ -56,7 +52,6 @@ CORS_ORIGINS = os.getenv(
     "http://localhost:5173,http://127.0.0.1:5173,https://convoinsight.vercel.app"
 ).split(",")
 
-
 DATASETS_ROOT = os.getenv("DATASETS_ROOT", os.path.abspath("./datasets"))  # still supported for local/dev
 CHARTS_ROOT   = os.getenv("CHARTS_ROOT",   os.path.abspath("./charts"))    # still supported for local/dev
 os.makedirs(DATASETS_ROOT, exist_ok=True)
@@ -68,13 +63,8 @@ GCS_DATASETS_PREFIX         = os.getenv("GCS_DATASETS_PREFIX", "datasets")   # d
 GCS_DIAGRAMS_PREFIX         = os.getenv("GCS_DIAGRAMS_PREFIX", "diagrams")   # diagrams/(charts|tables)/<domain>/<session>_<run>.html
 GCS_SIGNED_URL_TTL_SECONDS  = int(os.getenv("GCS_SIGNED_URL_TTL_SECONDS", "604800"))  # 7 days
 
-<<<<<<< HEAD
 FIRESTORE_COLLECTION_SESSIONS  = os.getenv("FIRESTORE_COLLECTION", "convo_sessions")
 FIRESTORE_COLLECTION_DATASETS  = os.getenv("FIRESTORE_DATASETS_COLLECTION", "datasets_meta")
-=======
-FIRESTORE_COLLECTION_SESSIONS = os.getenv("FIRESTORE_COLLECTION", "convo_sessions")
-FIRESTORE_COLLECTION_DATASETS = os.getenv("FIRESTORE_DATASETS_COLLECTION", "datasets_meta")
->>>>>>> 5dd0c49beeb1444b572aefe66c091049fee5bc21
 FIRESTORE_COLLECTION_PROVIDERS = os.getenv("FIRESTORE_COLLECTION", "convo_providers")
 
 # --- Init Flask ---
@@ -133,61 +123,6 @@ def _cancel_if_needed(session_id: str):
     if _should_cancel(session_id):
         _CANCEL_FLAGS.discard(session_id)
         raise RuntimeError("CANCELLED_BY_USER")
-    
-def get_provider_config(provider: str, api_key: str):
-    """Return endpoint and headers based on provider"""
-    if provider == "openai":
-        return {
-            "url": "https://api.openai.com/v1/models",
-            "headers": {"Authorization": f"Bearer {api_key}"}
-        }
-
-    elif provider == "groq":
-        return {
-            "url": "https://api.groq.com/openai/v1/models",
-            "headers": {"Authorization": f"Bearer {api_key}"}
-        }
-
-    elif provider == "anthropic":
-        return {
-            "url": "https://api.anthropic.com/v1/models",
-            "headers": {"x-api-key": api_key}
-        }
-
-    elif provider == "google":
-        # Google pakai query param ?key=
-        return {
-            "url": f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}",
-            "headers": {}
-        }
-
-    else:
-        raise ValueError("Provider not supported")
-
-def save_provider_key(user_id: str, provider: str, encrypted_key: str, models: list):
-    """
-    Save the encrypted API key to the Firestore collection
-    """
-    try:
-        doc_id = f"{user_id}_{provider}"
-        doc_ref = _firestore_client.collection(FIRESTORE_COLLECTION_PROVIDERS).document(doc_id)
-
-        data = {
-            "user_id": user_id,
-            "provider": provider,
-            "token": encrypted_key,     
-            "models": models,           
-            "is_active": True,
-            "updated_at": datetime.utcnow(),
-            "created_at": firestore.SERVER_TIMESTAMP,
-        }
-
-        doc_ref.set(data, merge=True)
-        print(f"Saved {provider} for user {user_id}")
-        return True
-    except Exception as e:
-        print("Firestore save error:", e)
-        return False
 
 def get_provider_config(provider: str, api_key: str):
     """Return endpoint and headers based on provider"""
@@ -580,10 +515,7 @@ def serve_chart(relpath):
 def health():
     return jsonify({"status": "healthy", "ts": datetime.utcnow().isoformat()})
 
-<<<<<<< HEAD
 # --- Provider key management endpoints (kept from previous version) -----------
-=======
->>>>>>> 5dd0c49beeb1444b572aefe66c091049fee5bc21
 @app.route("/validate-key", methods=["POST"])
 def validate_key():
     try:
@@ -612,11 +544,7 @@ def validate_key():
             # enkripsi API Key
             encrypted_key = fernet.encrypt(api_key.encode()).decode() if fernet else None
 
-<<<<<<< HEAD
             # simpan ke Firestore
-=======
-            # 🔐 simpan ke Firestore
->>>>>>> 5dd0c49beeb1444b572aefe66c091049fee5bc21
             save_provider_key(user_id, provider, encrypted_key, models)
 
             return jsonify({
@@ -636,11 +564,7 @@ def validate_key():
     except Exception as e:
         print("Validation error:", e)
         return jsonify({"valid": False, "error": str(e)}), 500
-<<<<<<< HEAD
 
-=======
-    
->>>>>>> 5dd0c49beeb1444b572aefe66c091049fee5bc21
 @app.route("/get-provider-keys", methods=["GET"])
 def get_provider_keys():
     try:
@@ -682,11 +606,7 @@ def update_provider_key():
         if not user_id or not provider or not api_key:
             return jsonify({"updated": False, "error": "Missing fields"}), 400
 
-<<<<<<< HEAD
         # 1) Validasi dulu API key baru
-=======
-        # 1️⃣ Validasi dulu API key baru
->>>>>>> 5dd0c49beeb1444b572aefe66c091049fee5bc21
         cfg = get_provider_config(provider, api_key)
         res = requests.get(cfg["url"], headers=cfg["headers"], timeout=6)
         if res.status_code != 200:
@@ -699,20 +619,12 @@ def update_provider_key():
         elif "models" in j:
             models = [m.get("name") or m.get("id") for m in j["models"]]
 
-<<<<<<< HEAD
         # 2) Enkripsi ulang API key
-=======
-        # 2️⃣ Enkripsi ulang API key
->>>>>>> 5dd0c49beeb1444b572aefe66c091049fee5bc21
         encrypted_key = (
             fernet.encrypt(api_key.encode()).decode() if fernet else None
         )
 
-<<<<<<< HEAD
         # 3) Update Firestore document
-=======
-        # 3️⃣ Update Firestore document
->>>>>>> 5dd0c49beeb1444b572aefe66c091049fee5bc21
         doc_ref = _firestore_client.collection(FIRESTORE_COLLECTION_PROVIDERS).document(
             f"{user_id}_{provider}"
         )
@@ -724,11 +636,7 @@ def update_provider_key():
                 "models": models,
                 "updated_at": datetime.utcnow().isoformat(),
             },
-<<<<<<< HEAD
             merge=True,
-=======
-            merge=True,  
->>>>>>> 5dd0c49beeb1444b572aefe66c091049fee5bc21
         )
 
         return jsonify({"updated": True, "models": models})
@@ -737,10 +645,6 @@ def update_provider_key():
         print("Update provider error:", e)
         return jsonify({"updated": False, "error": str(e)}), 500
 
-<<<<<<< HEAD
-=======
-
->>>>>>> 5dd0c49beeb1444b572aefe66c091049fee5bc21
 @app.route("/delete-provider-key", methods=["DELETE"])
 def delete_provider_key():
     try:

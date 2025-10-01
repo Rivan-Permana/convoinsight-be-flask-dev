@@ -1024,23 +1024,25 @@ def query():
         domain_in  = body.get("domain")
         prompt     = body.get("prompt")
         session_id = body.get("session_id") or str(uuid.uuid4())
-        # ---------- NEW: optional dataset filter ----------
-        dataset_filter = (body.get("dataset") or "").strip() or None  # e.g., "product.csv"
 
+        # ---------- FIX: robust parsing for single or multi dataset selection ----------
         dataset_field = body.get("dataset")
         if isinstance(dataset_field, list):
-            datasets = dataset_field
+            datasets = [s.strip() for s in dataset_field if isinstance(s, str) and s.strip()]
+            dataset_filters = set(datasets) if datasets else None
         elif isinstance(dataset_field, str) and dataset_field.strip():
             datasets = [dataset_field.strip()]
+            dataset_filters = {datasets[0]}
         else:
             datasets = []
+            dataset_filters = None
+        print("Datasets selected:", datasets)
+        # -------------------------------------------------------------------------------
 
         if not domain_in or not prompt:
             return jsonify({"detail": "Missing 'domain' or 'prompt'"}), 400
         if not GEMINI_API_KEY:
             return jsonify({"detail": "No API key configured"}), 500
-
-        print("Datasets selected:", datasets)
 
         # Normalize domain
         domain = slug(domain_in)
@@ -1064,8 +1066,10 @@ def query():
                     if not b.name.lower().endswith(".csv"):
                         continue
                     key = os.path.basename(b.name)
-                    if dataset_filter and key != dataset_filter:
+                    # ---------- FIX: apply multi-select filter ----------
+                    if dataset_filters and key not in dataset_filters:
                         continue
+                    # ---------------------------------------------------
                     df = read_gcs_csv_to_df(b.name)
                     dfs[key] = df
                     buf = io.StringIO(); df.info(buf=buf)
@@ -1082,8 +1086,10 @@ def query():
         for name in sorted(os.listdir(domain_dir)):
             if not name.lower().endswith(".csv"):
                 continue
-            if dataset_filter and name != dataset_filter:
+            # ---------- FIX: apply multi-select filter ----------
+            if dataset_filters and name not in dataset_filters:
                 continue
+            # ---------------------------------------------------
             if name in dfs:
                 continue
             path = os.path.join(domain_dir, name)
@@ -1101,8 +1107,7 @@ def query():
 
         if not dfs:
             # No CSV uploaded for requested scope
-            if dataset_filter:
-                # dataset was explicitly requested but not found
+            if dataset_filters:
                 available = []
                 # list local files
                 if os.path.isdir(domain_dir):
@@ -1115,7 +1120,7 @@ def query():
                     pass
                 return jsonify({
                     "code": "DATASET_NOT_FOUND",
-                    "detail": f"Requested dataset '{dataset_filter}' not found in domain '{domain}'.",
+                    "detail": f"Requested datasets {sorted(list(dataset_filters))} not found in domain '{domain}'.",
                     "domain": domain,
                     "available": sorted(list(set(available))),
                 }), 404
@@ -1135,7 +1140,7 @@ def query():
         need_manip = bool(agent_plan.get("need_manipulator", True))
         need_visual = bool(agent_plan.get("need_visualizer", True))
         need_analyze = bool(agent_plan.get("need_analyzer", True))
-        compiler_model = agent_plan.get("compiler_model") or "gemini/gemini-2.5-pro"
+        compiler_model = "gemini/gemini-2.5-pro"
         visual_hint = agent_plan.get("visual_hint", "auto")
 
         # ------------------- Orchestrator (aware of context + router) -------------
@@ -1144,7 +1149,9 @@ def query():
             "last_visual_path": "",  # local path deprecated; use signed url below
             "has_prev_df_processed": False,
             "last_analyzer_excerpt": (state.get("last_analyzer_text") or "")[:400],
-            "dataset_filter": dataset_filter or "ALL",  # expose selected dataset to LLM context
+            # ---------- FIX: expose selected datasets list ----------
+            "dataset_filter": (sorted(datasets) if datasets else "ALL"),
+            # -------------------------------------------------------
         }
 
         _cancel_if_needed(session_id)

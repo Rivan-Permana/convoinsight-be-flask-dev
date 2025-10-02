@@ -276,7 +276,6 @@ def upload_dataset_file(file_storage, *, domain: str) -> dict:
         try:
             _save_dataset_meta(domain, filename, gs_uri, size)
         except Exception:
-            # ignore meta failure in local/dev
             pass
         return {
             "filename": filename,
@@ -285,7 +284,6 @@ def upload_dataset_file(file_storage, *, domain: str) -> dict:
             "size_bytes": size,
         }
     except Exception:
-        # Any GCS error → use local fallback
         return _upload_dataset_file_local(file_storage, domain=domain)
 
 
@@ -360,7 +358,6 @@ def upload_diagram_to_gcs(local_path: str, *, domain: str, session_id: str, run_
 # Latest Pipeline Configs
 # =========================
 
-# --- Router SYSTEM configuration (from a0.0.7) ---
 router_system_configuration = f"""Make sure all of the information below is applied.
 1. You are the Orchestration Router: decide which agents/LLMs to run for a business data prompt.
 2. Output must be STRICT one-line JSON with keys: need_manipulator, need_visualizer, need_analyzer, need_compiler, compiler_model, visual_hint, reason.
@@ -382,7 +379,6 @@ router_system_configuration = f"""Make sure all of the information below is appl
 18. In short: choose the most efficient set of agents/LLMs to answer the prompt well while respecting overrides.
 19. By default, Manipulator and Analyzer should always be used in most scenario, because response compiler did not have access to the complete detailed data."""
 
-# --- Orchestrator SYSTEM configuration (from a0.0.7) ---
 orchestrator_system_configuration = f"""1. Honor precedence: direct user prompt > USER specific configuration > DOMAIN specific configuration > SYSTEM defaults.
 2. Think step by step.
 3. You orchestrate 3 LLM PandasAI Agents for business data analysis.
@@ -400,7 +396,6 @@ orchestrator_system_configuration = f"""1. Honor precedence: direct user prompt 
 15. Return STRICT JSON with keys: manipulator_prompt, visualizer_prompt, analyzer_prompt, compiler_instruction.
 16. Each value must be a single-line string. No extra keys, no prose, no markdown/code fences."""
 
-# --- Data Manipulator SYSTEM configuration (from a0.0.7) ---
 data_manipulator_system_configuration = f"""1. Honor precedence: direct user prompt > USER specific configuration > DOMAIN specific configuration > SYSTEM defaults.
 2. Enforce data hygiene before analysis.
 3. Parse dates to datetime; create explicit period columns (day/week/month).
@@ -413,7 +408,6 @@ data_manipulator_system_configuration = f"""1. Honor precedence: direct user pro
    result = {{"type":"dataframe","value": <THE_FINAL_DATAFRAME>}}
 10. Honor any user-level and domain-level instructions injected below."""
 
-# --- Data Visualizer SYSTEM configuration (from a0.0.7) ---
 data_visualizer_system_configuration = f"""1. Honor precedence: direct user prompt > USER specific configuration > DOMAIN specific configuration > SYSTEM defaults.
 2. Produce exactly ONE interactive visualization (a Plotly diagram or a table) per request.
 3. Choose the best form based on the user's question: Plotly diagrams for trends/comparisons; Table for discrete, plan, or allocation outputs.
@@ -422,21 +416,19 @@ data_visualizer_system_configuration = f"""1. Honor precedence: direct user prom
 6. For Plotly diagrams: insight-first formatting (clear title/subtitle, axis units, thousands separators, rich hover).
 7. Aggregate data to sensible granularity (day/week/month) and cap extreme outliers for readability (note in subtitle).
 8. Use bar, grouped bar, or line chart; apply a truncated monochromatic colorscale by sampling from 0.25–1.0 of a standard scale (e.g., Blues).
-9. Output Python code only (no prose/comments/markdown). Import os and datetime. Build an export dir and a run-scoped timestamped filename using globals()["_RUN_ID"].
+9. Output Python code only (no prose/comments/markdown). Import os and datetime. Build an export dir and a run-scoped filename using globals()["_RUN_ID"].
 10. Write the file exactly once using an atomic lock (.lock) to avoid duplicates across retries; write fig HTML or table HTML as appropriate.
 11. Ensure file_path is a plain Python string; do not print/return anything else.
 12. The last line of code MUST be exactly:
     result = {{"type": "string", "value": file_path}}
 13. DO NOT rely on pandas-specific styling; prefer Plotly Table when a table is needed."""
 
-# --- Data Analyzer SYSTEM configuration (from a0.0.7) ---
 data_analyzer_system_configuration = f"""1. Honor precedence: direct user prompt > USER configuration specific > DOMAIN specific configuration > SYSTEM defaults.
 2. Write like you’re speaking to a person; be concise and insight-driven.
 3. Quantify where possible (deltas, % contributions, time windows); reference exact columns/filters used.
 4. Return only:
    result = {{"type":"string","value":"<3–6 crisp bullets or 2 short paragraphs of insights>"}}"""
 
-# --- Response Compiler SYSTEM configuration (from a0.0.7) ---
 response_compiler_system_configuration = f"""1. Honor precedence: direct user prompt > USER specific configuration > DOMAIN specific configuration > SYSTEM defaults.
 2. Brevity: ≤180 words; bullets preferred; no code blocks, no JSON, no screenshots.
 3. Lead with the answer: 1–2 sentence “Bottom line” with main number, time window, and delta.
@@ -478,19 +470,10 @@ response_compiler_system_configuration = f"""1. Honor precedence: direct user pr
 39. Mention the data source of each statement.
 40. SHOULD BE STRICTLY ONLY respond in HTML format."""
 
-# --- User/Domain configs (from a0.0.7) ---
-user_specific_configuration = """1. (no user-specific instructions provided yet).""" # The default value is """1. (no user-specific instructions provided yet)."""
-
+user_specific_configuration = """1. (no user-level instructions provided yet)."""
 domain_specific_configuration = """1. Use period labels like m0 (current month) and m1 (prior month); apply consistently.
 2. Use IDR as currency, for example: Rp93,000.00 or Rp354,500.00.
-3. Use blue themed chart and table colors.
-4. target should be in mn (million).
-5. %TUR is take up rate percentage.
-6. % Taker, % Transaction, and % Revenue squad is the percentage of each product of all product Revenue all is in bn which is billion idr.
-7. Revenue Squad is in mn wich is million idr.
-8. rev/subs and rev/trx should be in thousands of idr.
-9. MoM is month after month in percentage
-10. Subs is taker.""" # The default value is """1. (no domain-specific instructions provided yet)."""
+3. Use blue themed chart and table colors."""
 
 
 # =========================
@@ -576,7 +559,7 @@ def _run_router(user_prompt: str, data_info, data_describe, state: dict) -> dict
         optimize_terms = bool(re.search(r"\b(allocate|allocation|optimal|optimi[sz]e|plan|planning|min(?:imum)? number|minimum number|close (?:the )?gap|gap closure|takers?)\b", p))
         need_analyze = bool(re.search(r"\b(why|driver|explain|root cause|trend|surprise|reason)\b", p)) or optimize_terms
         follow_up = bool(re.search(r"\b(what about|and|how about|ok but|also)\b", p)) or len(p.split()) <= 8
-        need_manip = not follow_up  # reuse if follow-up
+        need_manip = not follow_up
         visual_hint = "bar" if "bar" in p else ("line" if "line" in p else ("table" if ("table" in p or optimize_terms) else "auto"))
         plan = {
             "need_manipulator": bool(need_manip),
@@ -588,7 +571,6 @@ def _run_router(user_prompt: str, data_info, data_describe, state: dict) -> dict
             "reason": "heuristic fallback",
         }
 
-    # Hard guard for allocation/gap prompts
     p_low = user_prompt.lower()
     if re.search(r"\b(min(?:imum)? number|minimum number of additional takers|additional takers|close (?:the )?gap|gap closure|optimal allocation|allocate|allocation|optimi[sz]e)\b", p_low):
         plan["need_analyzer"] = True
@@ -1082,7 +1064,7 @@ def query_cancel():
 
 
 # =========================
-# NEW: Suggestion Endpoint (a0.0.7)
+# NEW: Suggestion Endpoint (a0.0.7)  — FIXED
 # =========================
 @app.post("/suggest")
 def suggest():
@@ -1106,15 +1088,48 @@ def suggest():
             return jsonify({"detail":"Missing 'domain'"}), 400
 
         domain = slug(domain_in)
+
+        # ✅ Parse dataset selection IDENTIK dengan /query
         if isinstance(dataset_field, list):
             datasets = [s.strip() for s in dataset_field if isinstance(s, str) and s.strip()]
             dataset_filters = set(datasets) if datasets else None
         elif isinstance(dataset_field, str) and dataset_field.strip():
-            dataset_filters = {dataset_field.strip()}
+            datasets = [dataset_field.strip()]
+            dataset_filters = {datasets[0]}
         else:
+            datasets = []
             dataset_filters = None
 
+        # Load data
         dfs, data_info, data_describe = _load_domain_dataframes(domain, dataset_filters)
+
+        # ✅ Jika tidak ada data, fail fast (hindari saran generik yang tidak relevan)
+        if not dfs:
+            if dataset_filters:
+                available = []
+                domain_dir = os.path.join(DATASETS_ROOT, domain)
+                if os.path.isdir(domain_dir):
+                    available.extend(sorted([f for f in os.listdir(domain_dir) if f.lower().endswith(".csv")]))
+                try:
+                    if GCS_BUCKET:
+                        available.extend(sorted({os.path.basename(b.name) for b in list_gcs_csvs(domain) if b.name.lower().endswith(".csv")}))
+                except Exception:
+                    pass
+                return jsonify({
+                    "code": "DATASET_NOT_FOUND",
+                    "detail": f"Requested datasets {sorted(list(dataset_filters))} not found in domain '{domain}'.",
+                    "domain": domain,
+                    "available": sorted(list(set(available))),
+                }), 404
+            return jsonify({
+                "code": "NEED_UPLOAD",
+                "detail": f"No CSV files found in domain '{domain}'",
+                "domain": domain
+            }), 409
+
+        # ✅ Kirim summary SEBAGAI JSON STRING agar tidak “kosong”
+        data_info_json = json.dumps(data_info, ensure_ascii=False)
+        data_describe_json = json.dumps(data_describe, ensure_ascii=False)
 
         # LLM: prompt suggester (from a0.0.7)
         r = completion(
@@ -1129,10 +1144,11 @@ def suggest():
                 {"role":"user","content":
                     f"""Make sure all of the information below is applied.
                     Datasets Domain name: {domain}.
+                    Selected datasets: {datasets if datasets else "ALL"}.
                     df.info of each dfs key(file name)-value pair:
-                    {data_info}.
+                    {data_info_json}
                     df.describe of each dfs key(file name)-value pair:
-                    {data_describe}."""
+                    {data_describe_json}"""
                 }
             ],
             seed=1, stream=False, verbosity="low", drop_params=True, reasoning_effort="high",
@@ -1171,7 +1187,6 @@ def query():
         prompt     = body.get("prompt")
         session_id = body.get("session_id") or str(uuid.uuid4())
 
-        # dataset selection (single or multi)
         dataset_field = body.get("dataset")
         if isinstance(dataset_field, list):
             datasets = [s.strip() for s in dataset_field if isinstance(s, str) and s.strip()]
@@ -1190,14 +1205,12 @@ def query():
 
         domain = slug(domain_in)
 
-        # state & history
         state = _get_conv_state(session_id)
         _append_history(state, "user", prompt)
         _save_conv_state(session_id, state)
 
         _cancel_if_needed(session_id)
 
-        # load data
         dfs, data_info, data_describe = _load_domain_dataframes(domain, dataset_filters)
         if not dfs:
             if dataset_filters:
@@ -1218,7 +1231,6 @@ def query():
                 }), 404
             return jsonify({"code":"NEED_UPLOAD", "detail": f"No CSV files found in domain '{domain}'", "domain": domain}), 409
 
-        # Router
         agent_plan = _run_router(prompt, data_info, data_describe, state)
         need_manip = bool(agent_plan.get("need_manipulator", True))
         need_visual = bool(agent_plan.get("need_visualizer", True))
@@ -1229,12 +1241,11 @@ def query():
         context_hint = {
             "router_plan": agent_plan,
             "last_visual_path": "",
-            "has_prev_df_processed": False,   # process fresh each call (stateless df)
+            "has_prev_df_processed": False,
             "last_analyzer_excerpt": (state.get("last_analyzer_text") or "")[:400],
             "dataset_filter": (sorted(datasets) if datasets else "ALL"),
         }
 
-        # Orchestrator
         _cancel_if_needed(session_id)
         spec = _run_orchestrator(prompt, domain, data_info, data_describe, visual_hint, context_hint)
         manipulator_prompt = spec.get("manipulator_prompt", "")
@@ -1242,11 +1253,9 @@ def query():
         analyzer_prompt    = spec.get("analyzer_prompt", "")
         compiler_instruction = spec.get("compiler_instruction", "")
 
-        # Shared LLM
         llm = LiteLLM(model="gemini/gemini-2.5-pro", api_key=GEMINI_API_KEY)
         pai.config.set({"llm": llm})
 
-        # Manipulator
         _cancel_if_needed(session_id)
         df_processed = None
         if need_manip or (need_visual or need_analyze):
@@ -1272,7 +1281,6 @@ def query():
             else:
                 df_processed = dm_resp
 
-        # Visualizer
         _cancel_if_needed(session_id)
         dv_resp = SimpleNamespace(value="")
         chart_url = None
@@ -1303,7 +1311,6 @@ def query():
             )
             dv_resp = data_visualizer.chat(visualizer_prompt)
 
-            # Move produced HTML to CHARTS_ROOT (local dev) + upload to GCS
             chart_path = getattr(dv_resp, "value", None)
             if isinstance(chart_path, str) and os.path.exists(chart_path):
                 out_dir = ensure_dir(os.path.join(CHARTS_ROOT, domain))
@@ -1325,7 +1332,6 @@ def query():
                     state["last_visual_signed_url"] = diagram_signed_url
                     state["last_visual_kind"]       = diagram_kind
 
-        # Analyzer
         _cancel_if_needed(session_id)
         da_resp = ""
         if need_analyze:
@@ -1351,7 +1357,6 @@ def query():
             da_resp = get_content(da_obj)
             state["last_analyzer_text"] = da_resp or ""
 
-        # Compiler
         _cancel_if_needed(session_id)
         data_info_runtime = data_info
         final_response = completion(
@@ -1371,7 +1376,6 @@ def query():
         )
         final_content = get_content(final_response)
 
-        # Persist summary
         _append_history(state, "assistant", {
             "plan": agent_plan,
             "visual_path": "",
@@ -1386,10 +1390,10 @@ def query():
         exec_time = time.time() - t0
         return jsonify({
             "session_id": session_id,
-            "response": final_content,        # HTML
-            "chart_url": chart_url,           # dev preview
-            "diagram_kind": diagram_kind,     # "charts" | "tables"
-            "diagram_gs_uri": diagram_gs_uri, # gs://...
+            "response": final_content,
+            "chart_url": chart_url,
+            "diagram_kind": diagram_kind,
+            "diagram_gs_uri": diagram_gs_uri,
             "diagram_signed_url": diagram_signed_url,
             "execution_time": exec_time,
             "need_visualizer": need_visual,

@@ -1,8 +1,10 @@
 # main.py — ConvoInsight BE (Flask, Cloud Run ready)
-# New core pipeline (a0.0.7) merged:
-# - Separate endpoints: /suggest and /query
-# - Router & Orchestrator system prompts from latest pipeline
-# - GCS/Firestore persistence, dataset CRUD, cancel, PDF export
+# Merged with latest ML pipeline (a0.0.7) using Polars + PandasAI wrappers:
+# - Polars throughout (no pandas DataFrames in pipeline path)
+# - Safe column normalization, info/describe helpers for Polars
+# - Router & Orchestrator configs from a0.0.7
+# - Manipulator/Visualizer/Analyzer now use pai.DataFrame wrappers on Polars
+# - GCS/Firestore persistence, dataset CRUD, cancel, PDF export preserved
 
 import os, io, json, time, uuid, re, html
 from datetime import datetime, timedelta
@@ -12,12 +14,16 @@ from types import SimpleNamespace
 from flask import Flask, request, jsonify, send_from_directory, send_file
 from flask_cors import CORS
 
-import pandas as pd
-from litellm import completion
+# --- Polars + PandasAI (Polars-first)
+import polars as pl
 import pandasai as pai
-from pandasai import SmartDataframe, SmartDatalake
+from litellm import completion
+from pandasai import SmartDataframe, SmartDatalake  # kept import for compatibility, not used in new path
 from pandasai_litellm.litellm import LiteLLM
 from pandasai.core.response.dataframe import DataFrameResponse
+
+# --- (pandas kept import for minimal surface compatibility, not used in pipeline)
+import pandas as pd  # not used for pipeline; retained to avoid non-pipeline breakages elsewhere
 
 # --- GCP clients ---
 from google.cloud import storage
@@ -240,15 +246,75 @@ def _save_bytes_local(domain: str, filename: str, data: bytes) -> dict:
     size = os.path.getsize(dest)
     return {"filename": filename, "gs_uri": "", "signed_url": "", "size_bytes": size, "local_path": dest}
 
-def _read_local_csv_to_df(path: str, sep_candidates: List[str] = (",", "|", ";", "\\t")) -> pd.DataFrame:
-    with open(path, "rb") as f:
-        data = f.read()
+# =========================
+# Polars DataFrame helpers (from latest pipeline)
+# =========================
+def _normalize_columns_to_str(df: pl.DataFrame) -> pl.DataFrame:
+    new_names = [str(c) for c in df.columns]
+    if new_names != df.columns:
+        df = df.set_column_names(new_names)
+    return df
+
+def _polars_info_string(df: pl.DataFrame) -> str:
+    lines = [f"shape: {df.shape[0]} rows x {df.shape[1]} columns", "dtypes/nulls:"]
+    try:
+        nulls = df.null_count()
+        nulls_map = {col: int(nulls[col][0]) for col in nulls.columns}
+    except Exception:
+        nulls_map = {c: None for c in df.columns}
+    for name, dtype in df.schema.items():
+        n = nulls_map.get(name, "n/a")
+        lines.append(f"  - {name}: {dtype} (nulls={n})")
+    return "\n".join(lines)
+
+def _to_polars_dataframe(obj):
+    if isinstance(obj, pl.DataFrame):
+        return _normalize_columns_to_str(obj)
+    try:
+        df = pl.from_dataframe(obj)
+        return _normalize_columns_to_str(df)
+    except Exception:
+        return None
+
+def _as_pai_df(df):
+    """
+    Return a PandasAI-compatible DataFrame wrapper:
+    1) Try Polars (preferred). If PandasAI raises TypeError due to non-string columns,
+    2) Fall back to pandas with stringified columns, then wrap.
+    """
+    if isinstance(df, pl.DataFrame):
+        df = _normalize_columns_to_str(df)
+    try:
+        return pai.DataFrame(df)
+    except TypeError:
+        if isinstance(df, pl.DataFrame):
+            pdf = df.to_pandas()
+        else:
+            pdf = df
+        if hasattr(pdf, "columns"):
+            pdf.columns = [str(c) for c in pdf.columns]
+        return pai.DataFrame(pdf)
+
+def _read_csv_bytes_to_polars(data: bytes, sep_candidates: List[str] = (",", "|", ";", "\t")) -> pl.DataFrame:
+    last_err = None
     for sep in sep_candidates:
         try:
-            return pd.read_csv(io.BytesIO(data), sep=sep if sep != "\\t" else "\t")
-        except Exception:
+            df = pl.read_csv(io.BytesIO(data), separator=sep)
+            return _normalize_columns_to_str(df)
+        except Exception as e:
+            last_err = e
             continue
-    return pd.read_csv(io.BytesIO(data))
+    # Final attempt: let Polars infer
+    try:
+        df = pl.read_csv(io.BytesIO(data))
+        return _normalize_columns_to_str(df)
+    except Exception as e:
+        raise last_err or e
+
+def _read_local_csv_to_polars(path: str, sep_candidates: List[str] = (",", "|", ";", "\t")) -> pl.DataFrame:
+    with open(path, "rb") as f:
+        data = f.read()
+    return _read_csv_bytes_to_polars(data, sep_candidates=sep_candidates)
 
 
 # ---- Upload (GCS when possible, safe local fallback otherwise) ----------------
@@ -292,7 +358,7 @@ def list_gcs_csvs(domain: str) -> List[storage.Blob]:
     prefix = f"{GCS_DATASETS_PREFIX}/{safe_domain}/"
     return list(_gcs_bucket().list_blobs(prefix=prefix))
 
-def read_gcs_csv_to_df(gs_uri_or_blobname: str, *, sep_candidates: List[str] = (",","|",";","\\t")) -> pd.DataFrame:
+def read_gcs_csv_to_pl_df(gs_uri_or_blobname: str, *, sep_candidates: List[str] = (",","|",";","\t")) -> pl.DataFrame:
     if gs_uri_or_blobname.startswith("gs://"):
         _, bucket_name, *rest = gs_uri_or_blobname.replace("gs://","").split("/")
         blob_name = "/".join(rest)
@@ -302,12 +368,7 @@ def read_gcs_csv_to_df(gs_uri_or_blobname: str, *, sep_candidates: List[str] = (
         blob_name = gs_uri_or_blobname
     blob = bucket.blob(blob_name)
     data = blob.download_as_bytes()
-    for sep in sep_candidates:
-        try:
-            return pd.read_csv(io.BytesIO(data), sep=sep if sep!="\\t" else "\t")
-        except Exception:
-            continue
-    return pd.read_csv(io.BytesIO(data))
+    return _read_csv_bytes_to_polars(data, sep_candidates=sep_candidates)
 
 def delete_gcs_object(blob_name_or_gs_uri: str):
     if blob_name_or_gs_uri.startswith("gs://"):
@@ -358,6 +419,7 @@ def upload_diagram_to_gcs(local_path: str, *, domain: str, session_id: str, run_
 # Latest Pipeline Configs
 # =========================
 
+# --- Router SYSTEM configuration (from a0.0.7) ---
 router_system_configuration = f"""Make sure all of the information below is applied.
 1. You are the Orchestration Router: decide which agents/LLMs to run for a business data prompt.
 2. Output must be STRICT one-line JSON with keys: need_manipulator, need_visualizer, need_analyzer, need_compiler, compiler_model, visual_hint, reason.
@@ -379,6 +441,7 @@ router_system_configuration = f"""Make sure all of the information below is appl
 18. In short: choose the most efficient set of agents/LLMs to answer the prompt well while respecting overrides.
 19. By default, Manipulator and Analyzer should always be used in most scenario, because response compiler did not have access to the complete detailed data."""
 
+# --- Orchestrator SYSTEM configuration (updated to Polars-first) ---
 orchestrator_system_configuration = f"""1. Honor precedence: direct user prompt > USER specific configuration > DOMAIN specific configuration > SYSTEM defaults.
 2. Think step by step.
 3. You orchestrate 3 LLM PandasAI Agents for business data analysis.
@@ -392,10 +455,11 @@ orchestrator_system_configuration = f"""1. Honor precedence: direct user prompt 
 11. Convert a short business question into three specialist prompts.
 12. Use the Router Context Hint and Visualization hint when applicable.
 13. Respect the user- and domain-level configurations injected below; overrides must not alter core process.
-14. All specialists operate in Python using PandasAI Semantic DataFrames (`pai.DataFrame`) backed by pandas or polars.
+14. All specialists operate in Python using PandasAI Semantic DataFrames (`pai.DataFrame`) backed by Polars DataFrames.
 15. Return STRICT JSON with keys: manipulator_prompt, visualizer_prompt, analyzer_prompt, compiler_instruction.
 16. Each value must be a single-line string. No extra keys, no prose, no markdown/code fences."""
 
+# --- Data Manipulator SYSTEM configuration (from a0.0.7) ---
 data_manipulator_system_configuration = f"""1. Honor precedence: direct user prompt > USER specific configuration > DOMAIN specific configuration > SYSTEM defaults.
 2. Enforce data hygiene before analysis.
 3. Parse dates to datetime; create explicit period columns (day/week/month).
@@ -408,6 +472,7 @@ data_manipulator_system_configuration = f"""1. Honor precedence: direct user pro
    result = {{"type":"dataframe","value": <THE_FINAL_DATAFRAME>}}
 10. Honor any user-level and domain-level instructions injected below."""
 
+# --- Data Visualizer SYSTEM configuration (from a0.0.7) ---
 data_visualizer_system_configuration = f"""1. Honor precedence: direct user prompt > USER specific configuration > DOMAIN specific configuration > SYSTEM defaults.
 2. Produce exactly ONE interactive visualization (a Plotly diagram or a table) per request.
 3. Choose the best form based on the user's question: Plotly diagrams for trends/comparisons; Table for discrete, plan, or allocation outputs.
@@ -416,19 +481,21 @@ data_visualizer_system_configuration = f"""1. Honor precedence: direct user prom
 6. For Plotly diagrams: insight-first formatting (clear title/subtitle, axis units, thousands separators, rich hover).
 7. Aggregate data to sensible granularity (day/week/month) and cap extreme outliers for readability (note in subtitle).
 8. Use bar, grouped bar, or line chart; apply a truncated monochromatic colorscale by sampling from 0.25–1.0 of a standard scale (e.g., Blues).
-9. Output Python code only (no prose/comments/markdown). Import os and datetime. Build an export dir and a run-scoped filename using globals()["_RUN_ID"].
+9. Output Python code only (no prose/comments/markdown). Import os and datetime. Build an export dir and a run-scoped timestamped filename using globals()["_RUN_ID"].
 10. Write the file exactly once using an atomic lock (.lock) to avoid duplicates across retries; write fig HTML or table HTML as appropriate.
 11. Ensure file_path is a plain Python string; do not print/return anything else.
 12. The last line of code MUST be exactly:
     result = {{"type": "string", "value": file_path}}
 13. DO NOT rely on pandas-specific styling; prefer Plotly Table when a table is needed."""
 
+# --- Data Analyzer SYSTEM configuration (from a0.0.7) ---
 data_analyzer_system_configuration = f"""1. Honor precedence: direct user prompt > USER configuration specific > DOMAIN specific configuration > SYSTEM defaults.
 2. Write like you’re speaking to a person; be concise and insight-driven.
 3. Quantify where possible (deltas, % contributions, time windows); reference exact columns/filters used.
 4. Return only:
    result = {{"type":"string","value":"<3–6 crisp bullets or 2 short paragraphs of insights>"}}"""
 
+# --- Response Compiler SYSTEM configuration (from a0.0.7) ---
 response_compiler_system_configuration = f"""1. Honor precedence: direct user prompt > USER specific configuration > DOMAIN specific configuration > SYSTEM defaults.
 2. Brevity: ≤180 words; bullets preferred; no code blocks, no JSON, no screenshots.
 3. Lead with the answer: 1–2 sentence “Bottom line” with main number, time window, and delta.
@@ -470,17 +537,26 @@ response_compiler_system_configuration = f"""1. Honor precedence: direct user pr
 39. Mention the data source of each statement.
 40. SHOULD BE STRICTLY ONLY respond in HTML format."""
 
-user_specific_configuration = """1. (no user-level instructions provided yet)."""
+# --- User/Domain configs (kept) ---
+user_specific_configuration = """1. (no user-specific instructions provided yet)."""
+
 domain_specific_configuration = """1. Use period labels like m0 (current month) and m1 (prior month); apply consistently.
 2. Use IDR as currency, for example: Rp93,000.00 or Rp354,500.00.
-3. Use blue themed chart and table colors."""
+3. Use blue themed chart and table colors.
+4. target should be in mn (million).
+5. %TUR is take up rate percentage.
+6. % Taker, % Transaction, and % Revenue squad is the percentage of each product of all product Revenue all is in bn which is billion idr.
+7. Revenue Squad is in mn wich is million idr.
+8. rev/subs and rev/trx should be in thousands of idr.
+9. MoM is month after month in percentage
+10. Subs is taker."""
 
 
 # =========================
-# Shared Data Loading
+# Shared Data Loading (Polars-first)
 # =========================
-def _load_domain_dataframes(domain: str, dataset_filters: Optional[set]) -> Tuple[Dict[str, pd.DataFrame], Dict[str, str], Dict[str, str]]:
-    dfs: Dict[str, pd.DataFrame] = {}
+def _load_domain_dataframes(domain: str, dataset_filters: Optional[set]) -> Tuple[Dict[str, pl.DataFrame], Dict[str, str], Dict[str, str]]:
+    dfs: Dict[str, pl.DataFrame] = {}
     data_info: Dict[str, str] = {}
     data_describe: Dict[str, str] = {}
 
@@ -493,14 +569,15 @@ def _load_domain_dataframes(domain: str, dataset_filters: Optional[set]) -> Tupl
                 key = os.path.basename(b.name)
                 if dataset_filters and key not in dataset_filters:
                     continue
-                df = read_gcs_csv_to_df(b.name)
+                df = read_gcs_csv_to_pl_df(b.name)
                 dfs[key] = df
-                buf = io.StringIO(); df.info(buf=buf)
-                data_info[key] = buf.getvalue()
+                info_str = _polars_info_string(df)
+                data_info[key] = info_str
                 try:
-                    data_describe[key] = df.describe(include="all").to_json()
+                    desc_df = df.describe()
+                    data_describe[key] = desc_df.to_pandas().to_json()
                 except Exception:
-                    data_describe[key] = "{}"
+                    data_describe[key] = ""
     except Exception:
         pass
 
@@ -515,14 +592,15 @@ def _load_domain_dataframes(domain: str, dataset_filters: Optional[set]) -> Tupl
             continue
         path = os.path.join(domain_dir, name)
         try:
-            df = _read_local_csv_to_df(path)
+            df = _read_local_csv_to_polars(path)
             dfs[name] = df
-            buf = io.StringIO(); df.info(buf=buf)
-            data_info[name] = buf.getvalue()
+            info_str = _polars_info_string(df)
+            data_info[name] = info_str
             try:
-                data_describe[name] = df.describe(include="all").to_json()
+                desc_df = df.describe()
+                data_describe[name] = desc_df.to_pandas().to_json()
             except Exception:
-                data_describe[name] = "{}"
+                data_describe[name] = ""
         except Exception:
             pass
 
@@ -559,7 +637,7 @@ def _run_router(user_prompt: str, data_info, data_describe, state: dict) -> dict
         optimize_terms = bool(re.search(r"\b(allocate|allocation|optimal|optimi[sz]e|plan|planning|min(?:imum)? number|minimum number|close (?:the )?gap|gap closure|takers?)\b", p))
         need_analyze = bool(re.search(r"\b(why|driver|explain|root cause|trend|surprise|reason)\b", p)) or optimize_terms
         follow_up = bool(re.search(r"\b(what about|and|how about|ok but|also)\b", p)) or len(p.split()) <= 8
-        need_manip = not follow_up
+        need_manip = not follow_up  # reuse if follow-up
         visual_hint = "bar" if "bar" in p else ("line" if "line" in p else ("table" if ("table" in p or optimize_terms) else "auto"))
         plan = {
             "need_manipulator": bool(need_manip),
@@ -571,6 +649,7 @@ def _run_router(user_prompt: str, data_info, data_describe, state: dict) -> dict
             "reason": "heuristic fallback",
         }
 
+    # Hard guard for allocation/gap prompts
     p_low = user_prompt.lower()
     if re.search(r"\b(min(?:imum)? number|minimum number of additional takers|additional takers|close (?:the )?gap|gap closure|optimal allocation|allocate|allocation|optimi[sz]e)\b", p_low):
         plan["need_analyzer"] = True
@@ -865,18 +944,19 @@ def datasets_read(domain, filename):
         as_fmt = request.args.get("as","json")
         if GCS_BUCKET:
             blob_name = f"{GCS_DATASETS_PREFIX}/{slug(domain)}/{filename}"
-            df = read_gcs_csv_to_df(blob_name)
+            df = read_gcs_csv_to_pl_df(blob_name)
         else:
             local_path = os.path.join(DATASETS_ROOT, slug(domain), filename)
             if not os.path.exists(local_path):
                 return jsonify({"detail": "File not found"}), 404
-            df = _read_local_csv_to_df(local_path)
+            df = _read_local_csv_to_polars(local_path)
         if n > 0:
             df = df.head(n)
         if as_fmt == "csv":
-            out = io.StringIO(); df.to_csv(out, index=False)
+            out = io.StringIO()
+            df.write_csv(out)
             return out.getvalue(), 200, {"Content-Type":"text/csv; charset=utf-8"}
-        return jsonify({"records": json.loads(df.to_json(orient="records"))})
+        return jsonify({"records": df.to_dicts()})
     except Exception as e:
         return jsonify({"detail": str(e)}), 500
 
@@ -1064,7 +1144,7 @@ def query_cancel():
 
 
 # =========================
-# NEW: Suggestion Endpoint (a0.0.7)  — FIXED
+# NEW: Suggestion Endpoint (a0.0.7)
 # =========================
 @app.post("/suggest")
 def suggest():
@@ -1088,48 +1168,15 @@ def suggest():
             return jsonify({"detail":"Missing 'domain'"}), 400
 
         domain = slug(domain_in)
-
-        # ✅ Parse dataset selection IDENTIK dengan /query
         if isinstance(dataset_field, list):
             datasets = [s.strip() for s in dataset_field if isinstance(s, str) and s.strip()]
             dataset_filters = set(datasets) if datasets else None
         elif isinstance(dataset_field, str) and dataset_field.strip():
-            datasets = [dataset_field.strip()]
-            dataset_filters = {datasets[0]}
+            dataset_filters = {dataset_field.strip()}
         else:
-            datasets = []
             dataset_filters = None
 
-        # Load data
         dfs, data_info, data_describe = _load_domain_dataframes(domain, dataset_filters)
-
-        # ✅ Jika tidak ada data, fail fast (hindari saran generik yang tidak relevan)
-        if not dfs:
-            if dataset_filters:
-                available = []
-                domain_dir = os.path.join(DATASETS_ROOT, domain)
-                if os.path.isdir(domain_dir):
-                    available.extend(sorted([f for f in os.listdir(domain_dir) if f.lower().endswith(".csv")]))
-                try:
-                    if GCS_BUCKET:
-                        available.extend(sorted({os.path.basename(b.name) for b in list_gcs_csvs(domain) if b.name.lower().endswith(".csv")}))
-                except Exception:
-                    pass
-                return jsonify({
-                    "code": "DATASET_NOT_FOUND",
-                    "detail": f"Requested datasets {sorted(list(dataset_filters))} not found in domain '{domain}'.",
-                    "domain": domain,
-                    "available": sorted(list(set(available))),
-                }), 404
-            return jsonify({
-                "code": "NEED_UPLOAD",
-                "detail": f"No CSV files found in domain '{domain}'",
-                "domain": domain
-            }), 409
-
-        # ✅ Kirim summary SEBAGAI JSON STRING agar tidak “kosong”
-        data_info_json = json.dumps(data_info, ensure_ascii=False)
-        data_describe_json = json.dumps(data_describe, ensure_ascii=False)
 
         # LLM: prompt suggester (from a0.0.7)
         r = completion(
@@ -1144,11 +1191,10 @@ def suggest():
                 {"role":"user","content":
                     f"""Make sure all of the information below is applied.
                     Datasets Domain name: {domain}.
-                    Selected datasets: {datasets if datasets else "ALL"}.
                     df.info of each dfs key(file name)-value pair:
-                    {data_info_json}
+                    {data_info}.
                     df.describe of each dfs key(file name)-value pair:
-                    {data_describe_json}"""
+                    {data_describe}."""
                 }
             ],
             seed=1, stream=False, verbosity="low", drop_params=True, reasoning_effort="high",
@@ -1167,7 +1213,7 @@ def suggest():
 
 
 # =========================
-# NEW: Query/Inferencing Endpoint (a0.0.7)
+# NEW: Query/Inferencing Endpoint (a0.0.7, Polars pipeline)
 # =========================
 @app.post("/query")
 def query():
@@ -1187,6 +1233,7 @@ def query():
         prompt     = body.get("prompt")
         session_id = body.get("session_id") or str(uuid.uuid4())
 
+        # dataset selection (single or multi)
         dataset_field = body.get("dataset")
         if isinstance(dataset_field, list):
             datasets = [s.strip() for s in dataset_field if isinstance(s, str) and s.strip()]
@@ -1205,19 +1252,22 @@ def query():
 
         domain = slug(domain_in)
 
+        # state & history
         state = _get_conv_state(session_id)
         _append_history(state, "user", prompt)
         _save_conv_state(session_id, state)
 
         _cancel_if_needed(session_id)
 
+        # load data (Polars)
         dfs, data_info, data_describe = _load_domain_dataframes(domain, dataset_filters)
         if not dfs:
             if dataset_filters:
                 available = []
                 domain_dir = os.path.join(DATASETS_ROOT, domain)
                 if os.path.isdir(domain_dir):
-                    available.extend(sorted([f for f in os.listdir(domain_dir) if f.lower().endswith(".csv")]))
+                    available.extend(sorted([f for f in os.listdir(domain_dir) if f.lower().endswith(".csv")])
+                    )
                 try:
                     if GCS_BUCKET:
                         available.extend(sorted({os.path.basename(b.name) for b in list_gcs_csvs(domain) if b.name.lower().endswith(".csv")}))
@@ -1231,6 +1281,7 @@ def query():
                 }), 404
             return jsonify({"code":"NEED_UPLOAD", "detail": f"No CSV files found in domain '{domain}'", "domain": domain}), 409
 
+        # Router
         agent_plan = _run_router(prompt, data_info, data_describe, state)
         need_manip = bool(agent_plan.get("need_manipulator", True))
         need_visual = bool(agent_plan.get("need_visualizer", True))
@@ -1241,11 +1292,12 @@ def query():
         context_hint = {
             "router_plan": agent_plan,
             "last_visual_path": "",
-            "has_prev_df_processed": False,
+            "has_prev_df_processed": False,   # process fresh each call (stateless df)
             "last_analyzer_excerpt": (state.get("last_analyzer_text") or "")[:400],
             "dataset_filter": (sorted(datasets) if datasets else "ALL"),
         }
 
+        # Orchestrator
         _cancel_if_needed(session_id)
         spec = _run_orchestrator(prompt, domain, data_info, data_describe, visual_hint, context_hint)
         manipulator_prompt = spec.get("manipulator_prompt", "")
@@ -1253,34 +1305,28 @@ def query():
         analyzer_prompt    = spec.get("analyzer_prompt", "")
         compiler_instruction = spec.get("compiler_instruction", "")
 
+        # Shared LLM
         llm = LiteLLM(model="gemini/gemini-2.5-pro", api_key=GEMINI_API_KEY)
         pai.config.set({"llm": llm})
 
+        # Manipulator (Polars-first via pai.DataFrame wrappers)
         _cancel_if_needed(session_id)
         df_processed = None
         if need_manip or (need_visual or need_analyze):
-            data_manipulator = SmartDatalake(
-                list(dfs.values()),
-                config={
-                    "llm": llm,
-                    "seed": 1,
-                    "stream": False,
-                    "verbosity": "low",
-                    "drop_params": True,
-                    "save_charts": False,
-                    "open_charts": False,
-                    "conversational": False,
-                    "enforce_privacy": True,
-                    "reasoning_effort": "high",
-                    "save_charts_path": "./charts"
-                }
-            )
-            dm_resp = data_manipulator.chat(manipulator_prompt)
-            if isinstance(dm_resp, DataFrameResponse):
-                df_processed = dm_resp.value
-            else:
-                df_processed = dm_resp
+            semantic_dfs = []
+            for key, d in dfs.items():
+                try:
+                    semantic_dfs.append(pai.DataFrame(d))
+                except TypeError:
+                    # fallback: pandas shim with string columns
+                    pdf = d.to_pandas()
+                    pdf.columns = [str(c) for c in pdf.columns]
+                    semantic_dfs.append(pai.DataFrame(pdf))
+            dm_resp = pai.chat(manipulator_prompt, *semantic_dfs)
+            val = getattr(dm_resp, "value", dm_resp)
+            df_processed = _to_polars_dataframe(val)
 
+        # Visualizer
         _cancel_if_needed(session_id)
         dv_resp = SimpleNamespace(value="")
         chart_url = None
@@ -1293,24 +1339,10 @@ def query():
         if need_visual:
             if df_processed is None:
                 return jsonify({"detail": "Visualization requested but no processed dataframe available."}), 500
-            data_visualizer = SmartDataframe(
-                df_processed,
-                config={
-                    "llm": llm,
-                    "seed": 1,
-                    "stream": False,
-                    "verbosity": "low",
-                    "drop_params": True,
-                    "save_charts": False,
-                    "open_charts": False,
-                    "conversational": False,
-                    "enforce_privacy": True,
-                    "reasoning_effort": "high",
-                    "save_charts_path": "./charts"
-                }
-            )
+            data_visualizer = _as_pai_df(df_processed)
             dv_resp = data_visualizer.chat(visualizer_prompt)
 
+            # Move produced HTML to CHARTS_ROOT (local dev) + upload to GCS
             chart_path = getattr(dv_resp, "value", None)
             if isinstance(chart_path, str) and os.path.exists(chart_path):
                 out_dir = ensure_dir(os.path.join(CHARTS_ROOT, domain))
@@ -1332,33 +1364,20 @@ def query():
                     state["last_visual_signed_url"] = diagram_signed_url
                     state["last_visual_kind"]       = diagram_kind
 
+        # Analyzer
         _cancel_if_needed(session_id)
         da_resp = ""
         if need_analyze:
             if df_processed is None:
                 return jsonify({"detail": "Analyzer requested but no processed dataframe available."}), 500
-            data_analyzer = SmartDataframe(
-                df_processed,
-                config={
-                    "llm": llm,
-                    "seed": 1,
-                    "stream": False,
-                    "verbosity": "low",
-                    "drop_params": True,
-                    "save_charts": False,
-                    "open_charts": False,
-                    "conversational": True,
-                    "enforce_privacy": False,
-                    "reasoning_effort": "high",
-                    "save_charts_path": "./charts"
-                }
-            )
+            data_analyzer = _as_pai_df(df_processed)
             da_obj = data_analyzer.chat(analyzer_prompt)
             da_resp = get_content(da_obj)
             state["last_analyzer_text"] = da_resp or ""
 
+        # Compiler
         _cancel_if_needed(session_id)
-        data_info_runtime = data_info
+        data_info_runtime = _polars_info_string(df_processed) if isinstance(df_processed, pl.DataFrame) else data_info
         final_response = completion(
             model=compiler_model or "gemini/gemini-2.5-pro",
             messages=[
@@ -1376,6 +1395,7 @@ def query():
         )
         final_content = get_content(final_response)
 
+        # Persist summary
         _append_history(state, "assistant", {
             "plan": agent_plan,
             "visual_path": "",
@@ -1390,10 +1410,10 @@ def query():
         exec_time = time.time() - t0
         return jsonify({
             "session_id": session_id,
-            "response": final_content,
-            "chart_url": chart_url,
-            "diagram_kind": diagram_kind,
-            "diagram_gs_uri": diagram_gs_uri,
+            "response": final_content,        # HTML
+            "chart_url": chart_url,           # dev preview
+            "diagram_kind": diagram_kind,     # "charts" | "tables"
+            "diagram_gs_uri": diagram_gs_uri, # gs://...
             "diagram_signed_url": diagram_signed_url,
             "execution_time": exec_time,
             "need_visualizer": need_visual,

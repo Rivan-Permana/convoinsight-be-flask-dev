@@ -405,7 +405,7 @@ data_manipulator_system_configuration = f"""1. Honor precedence: direct user pro
 7. Produce exactly the minimal, analysis-ready dataframe(s) needed for the user question, with stable, well-named columns.
 8. Include the percentage version of appropriate raw value columns (share-of-total where relevant).
 9. End by returning only:
-   result = {{"type":"dataframe","value": <THE_FINAL_DATAFRAME>}}
+   result = {"type":"dataframe","value": <THE_FINAL_DATAFRAME>}
 10. Honor any user-level and domain-level instructions injected below."""
 
 data_visualizer_system_configuration = f"""1. Honor precedence: direct user prompt > USER specific configuration > DOMAIN specific configuration > SYSTEM defaults.
@@ -420,14 +420,14 @@ data_visualizer_system_configuration = f"""1. Honor precedence: direct user prom
 10. Write the file exactly once using an atomic lock (.lock) to avoid duplicates across retries; write fig HTML or table HTML as appropriate.
 11. Ensure file_path is a plain Python string; do not print/return anything else.
 12. The last line of code MUST be exactly:
-    result = {{"type": "string", "value": file_path}}
+    result = {"type": "string", "value": file_path}
 13. DO NOT rely on pandas-specific styling; prefer Plotly Table when a table is needed."""
 
 data_analyzer_system_configuration = f"""1. Honor precedence: direct user prompt > USER configuration specific > DOMAIN specific configuration > SYSTEM defaults.
 2. Write like you’re speaking to a person; be concise and insight-driven.
 3. Quantify where possible (deltas, % contributions, time windows); reference exact columns/filters used.
 4. Return only:
-   result = {{"type":"string","value":"<3–6 crisp bullets or 2 short paragraphs of insights>"}}"""
+   result = {"type":"string","value":"<3–6 crisp bullets or 2 short paragraphs of insights>"}"""
 
 response_compiler_system_configuration = f"""1. Honor precedence: direct user prompt > USER specific configuration > DOMAIN specific configuration > SYSTEM defaults.
 2. Brevity: ≤180 words; bullets preferred; no code blocks, no JSON, no screenshots.
@@ -464,7 +464,7 @@ response_compiler_system_configuration = f"""1. Honor precedence: direct user pr
 33. Compiler user content will be: f"User Prompt:{{user_prompt}}. \nData Info:{{data_info}}. \nData Describe:{{data_describe}}. \nData Manipulator Response:{{data_manipulator_response}}. \nData Visualizer Response:{{data_visualizer_response}}. \nData Analyzer Response:{{data_analyzer_response}}".
 34. `data_info` is a string summary of dataframe types/shape.
 35. `data_manipulator_response` is a PandasAI DataFrameResponse.
-36. `data_visualizer_response` is a file path to an HTML/PNG inside {{"type":"string","value": ...}} with a plain Python string path.
+36. `data_visualizer_response` is a file path to an HTML/PNG inside {"type":"string","value": ...} with a plain Python string path.
 37. `data_analyzer_response` is a PandasAI StringResponse.
 38. Your goal in `compiler_instruction` is to force brevity, decisions, and insights.
 39. Mention the data source of each statement.
@@ -527,6 +527,102 @@ def _load_domain_dataframes(domain: str, dataset_filters: Optional[set]) -> Tupl
             pass
 
     return dfs, data_info, data_describe
+
+
+# =========================
+# Dataset selection resolver (robust, minimal & scoped)
+# =========================
+def _list_domain_dataset_filenames(domain: str) -> List[str]:
+    """List available CSV filenames (basename) in the domain from GCS + local."""
+    names = set()
+    try:
+        if GCS_BUCKET:
+            for b in list_gcs_csvs(domain):
+                bn = os.path.basename(b.name)
+                if bn.lower().endswith(".csv"):
+                    names.add(bn)
+    except Exception:
+        pass
+    try:
+        ddir = os.path.join(DATASETS_ROOT, slug(domain))
+        if os.path.isdir(ddir):
+            for n in os.listdir(ddir):
+                if n.lower().endswith(".csv"):
+                    names.add(n)
+    except Exception:
+        pass
+    return sorted(names)
+
+def _extract_requested_dataset_names(dataset_field) -> List[str]:
+    """Accept str | [str] | [{filename|name}] and return list[str] (raw tokens)."""
+    req = []
+    if isinstance(dataset_field, str):
+        if dataset_field.strip():
+            req.append(dataset_field.strip())
+    elif isinstance(dataset_field, list):
+        for item in dataset_field:
+            if isinstance(item, str) and item.strip():
+                req.append(item.strip())
+            elif isinstance(item, dict):
+                # common FE shapes: { filename }, { name }, { fileName }
+                for k in ("filename", "name", "fileName"):
+                    v = item.get(k)
+                    if isinstance(v, str) and v.strip():
+                        req.append(v.strip())
+                        break
+    elif isinstance(dataset_field, dict):
+        for k in ("filename", "name", "fileName"):
+            v = dataset_field.get(k)
+            if isinstance(v, str) and v.strip():
+                req.append(v.strip())
+                break
+    return req
+
+def _resolve_dataset_filters(domain: str, dataset_field) -> Tuple[Optional[set], List[str], List[str]]:
+    """
+    Produce a filename filter set that matches available CSVs.
+    - Accept tokens with or without .csv
+    - Accept basenames, partials, and arrays/objects
+    Returns: (dataset_filters or None, resolved_filenames, available_filenames)
+    """
+    available = _list_domain_dataset_filenames(domain)
+    if not dataset_field:
+        return None, [], available
+
+    requested_tokens = _extract_requested_dataset_names(dataset_field)
+    if not requested_tokens:
+        return None, [], available
+
+    # Build quick lookups
+    avail_set = set(available)
+    avail_noext_map = {os.path.splitext(n)[0].lower(): n for n in available}
+
+    matched = set()
+    for token in requested_tokens:
+        t = os.path.basename(token).strip()
+        t_csv = t if t.lower().endswith(".csv") else f"{t}.csv"
+        t_noext = os.path.splitext(t)[0].lower()
+
+        # 1) exact filename match (with/without .csv)
+        if t in avail_set:
+            matched.add(t); continue
+        if t_csv in avail_set:
+            matched.add(t_csv); continue
+
+        # 2) basename (no ext) match
+        if t_noext in avail_noext_map:
+            matched.add(avail_noext_map[t_noext]); continue
+
+        # 3) case-insensitive contains (last resort, picks the first deterministic match)
+        cand = [n for n in available if t_noext in os.path.splitext(n)[0].lower()]
+        if cand:
+            matched.add(sorted(cand)[0])
+
+    if not matched:
+        # No matches at all → caller can 404 with "available"
+        return set(), [], available
+
+    return matched, sorted(matched), available
 
 
 # =========================
@@ -1064,14 +1160,14 @@ def query_cancel():
 
 
 # =========================
-# NEW: Suggestion Endpoint (a0.0.7)  — FIXED
+# NEW: Suggestion Endpoint (a0.0.7) — robust dataset matching
 # =========================
 @app.post("/suggest")
 def suggest():
     """
     Body (JSON):
       - domain (str, required)
-      - dataset (str | [str], optional)  -> filter datasets
+      - dataset (str | [str] | [{filename|name}] , optional) -> filter datasets
     Returns:
       { suggestions: [s1,s2,s3,s4], elapsed: <sec>, data_info, data_describe }
     """
@@ -1089,49 +1185,34 @@ def suggest():
 
         domain = slug(domain_in)
 
-        # ✅ Parse dataset selection IDENTIK dengan /query
-        if isinstance(dataset_field, list):
-            datasets = [s.strip() for s in dataset_field if isinstance(s, str) and s.strip()]
-            dataset_filters = set(datasets) if datasets else None
-        elif isinstance(dataset_field, str) and dataset_field.strip():
-            datasets = [dataset_field.strip()]
-            dataset_filters = {datasets[0]}
-        else:
-            datasets = []
-            dataset_filters = None
+        # Resolve datasets robustly (strings, arrays, objects; with/without .csv)
+        dataset_filters, resolved_names, available = _resolve_dataset_filters(domain, dataset_field)
 
         # Load data
         dfs, data_info, data_describe = _load_domain_dataframes(domain, dataset_filters)
 
-        # ✅ Jika tidak ada data, fail fast (hindari saran generik yang tidak relevan)
+        # If dataset specified but none matched → 404 with available list
+        if dataset_field and (not dfs):
+            return jsonify({
+                "code": "DATASET_NOT_FOUND",
+                "detail": f"Requested datasets {resolved_names or _extract_requested_dataset_names(dataset_field)} not found in domain '{domain}'.",
+                "domain": domain,
+                "available": available,
+            }), 404
+
+        # If no data at all → ask to upload
         if not dfs:
-            if dataset_filters:
-                available = []
-                domain_dir = os.path.join(DATASETS_ROOT, domain)
-                if os.path.isdir(domain_dir):
-                    available.extend(sorted([f for f in os.listdir(domain_dir) if f.lower().endswith(".csv")]))
-                try:
-                    if GCS_BUCKET:
-                        available.extend(sorted({os.path.basename(b.name) for b in list_gcs_csvs(domain) if b.name.lower().endswith(".csv")}))
-                except Exception:
-                    pass
-                return jsonify({
-                    "code": "DATASET_NOT_FOUND",
-                    "detail": f"Requested datasets {sorted(list(dataset_filters))} not found in domain '{domain}'.",
-                    "domain": domain,
-                    "available": sorted(list(set(available))),
-                }), 404
             return jsonify({
                 "code": "NEED_UPLOAD",
                 "detail": f"No CSV files found in domain '{domain}'",
                 "domain": domain
             }), 409
 
-        # ✅ Kirim summary SEBAGAI JSON STRING agar tidak “kosong”
+        # Serialize summaries as JSON string to avoid empty-looking dict repr
         data_info_json = json.dumps(data_info, ensure_ascii=False)
         data_describe_json = json.dumps(data_describe, ensure_ascii=False)
 
-        # LLM: prompt suggester (from a0.0.7)
+        # LLM: prompt suggester
         r = completion(
             model="gemini/gemini-2.5-pro",
             messages=[
@@ -1144,7 +1225,7 @@ def suggest():
                 {"role":"user","content":
                     f"""Make sure all of the information below is applied.
                     Datasets Domain name: {domain}.
-                    Selected datasets: {datasets if datasets else "ALL"}.
+                    Selected datasets: {resolved_names if resolved_names else "ALL"}.
                     df.info of each dfs key(file name)-value pair:
                     {data_info_json}
                     df.describe of each dfs key(file name)-value pair:
@@ -1167,7 +1248,7 @@ def suggest():
 
 
 # =========================
-# NEW: Query/Inferencing Endpoint (a0.0.7)
+# NEW: Query/Inferencing Endpoint (a0.0.7) — same resolver for parity
 # =========================
 @app.post("/query")
 def query():
@@ -1176,7 +1257,7 @@ def query():
       - domain (str, required)
       - prompt (str, required)
       - session_id (str, optional)
-      - dataset (str | [str], optional)  -> filter datasets
+      - dataset (str | [str] | [{filename|name}], optional)  -> filter datasets
     Returns:
       - session_id, response (HTML), diagram_* fields, timing & flags
     """
@@ -1187,23 +1268,15 @@ def query():
         prompt     = body.get("prompt")
         session_id = body.get("session_id") or str(uuid.uuid4())
 
-        dataset_field = body.get("dataset")
-        if isinstance(dataset_field, list):
-            datasets = [s.strip() for s in dataset_field if isinstance(s, str) and s.strip()]
-            dataset_filters = set(datasets) if datasets else None
-        elif isinstance(dataset_field, str) and dataset_field.strip():
-            datasets = [dataset_field.strip()]
-            dataset_filters = {datasets[0]}
-        else:
-            datasets = []
-            dataset_filters = None
-
         if not domain_in or not prompt:
             return jsonify({"detail": "Missing 'domain' or 'prompt'"}), 400
         if not GEMINI_API_KEY:
             return jsonify({"detail": "No API key configured"}), 500
 
         domain = slug(domain_in)
+
+        # Resolve datasets robustly (keep /query behavior in lockstep with /suggest)
+        dataset_filters, resolved_names, available = _resolve_dataset_filters(domain, body.get("dataset"))
 
         state = _get_conv_state(session_id)
         _append_history(state, "user", prompt)
@@ -1213,21 +1286,12 @@ def query():
 
         dfs, data_info, data_describe = _load_domain_dataframes(domain, dataset_filters)
         if not dfs:
-            if dataset_filters:
-                available = []
-                domain_dir = os.path.join(DATASETS_ROOT, domain)
-                if os.path.isdir(domain_dir):
-                    available.extend(sorted([f for f in os.listdir(domain_dir) if f.lower().endswith(".csv")]))
-                try:
-                    if GCS_BUCKET:
-                        available.extend(sorted({os.path.basename(b.name) for b in list_gcs_csvs(domain) if b.name.lower().endswith(".csv")}))
-                except Exception:
-                    pass
+            if body.get("dataset"):
                 return jsonify({
                     "code": "DATASET_NOT_FOUND",
-                    "detail": f"Requested datasets {sorted(list(dataset_filters))} not found in domain '{domain}'.",
+                    "detail": f"Requested datasets {resolved_names or _extract_requested_dataset_names(body.get('dataset'))} not found in domain '{domain}'.",
                     "domain": domain,
-                    "available": sorted(list(set(available))),
+                    "available": available,
                 }), 404
             return jsonify({"code":"NEED_UPLOAD", "detail": f"No CSV files found in domain '{domain}'", "domain": domain}), 409
 
@@ -1243,7 +1307,7 @@ def query():
             "last_visual_path": "",
             "has_prev_df_processed": False,
             "last_analyzer_excerpt": (state.get("last_analyzer_text") or "")[:400],
-            "dataset_filter": (sorted(datasets) if datasets else "ALL"),
+            "dataset_filter": (resolved_names if resolved_names else "ALL"),
         }
 
         _cancel_if_needed(session_id)

@@ -1285,7 +1285,8 @@ def query():
         agent_plan = _run_router(prompt, data_info, data_describe, state)
         need_manip = bool(agent_plan.get("need_manipulator", True))
         need_visual = bool(agent_plan.get("need_visualizer", True))
-        need_analyze = bool(agent_plan.get("need_analyzer", True))
+        include_insight = body.get("includeInsight", True)
+        need_analyze = include_insight and bool(agent_plan.get("need_analyzer", True))
         compiler_model = agent_plan.get("compiler_model") or "gemini/gemini-2.5-pro"
         visual_hint = agent_plan.get("visual_hint", "auto")
 

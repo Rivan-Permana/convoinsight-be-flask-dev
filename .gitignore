@@ -1,4 +1,8 @@
 .env
 .venv
 __pycache__/
-"ml-bi-472208-1d314e4667d0.json" 
+"ml-bi-472208-1d314e4667d0.json"
+charts
+datasets
+charts\Campaign
+datasets\Campaign

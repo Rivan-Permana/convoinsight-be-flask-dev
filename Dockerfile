@@ -1,12 +1,11 @@
 # Python slim + non-root, siap Cloud Run
 FROM python:3.11-slim
 
-# Sysdeps minimal utk pandas/grpc + tini buat signal handling
+# Sysdeps minimal utk pandas/grpc + tini + TLS certs
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential curl tini git && \
-    rm -rf /var/lib/apt/lists/*
+    build-essential curl tini git ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 
-# Default ENV (bisa dioverride di Cloud Run)
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
@@ -15,7 +14,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     CHARTS_ROOT=/tmp/charts
 
 # Non-root user
-RUN useradd -m -u 1001 -s /bin/bash appuser
+RUN useradd -m -u 1001 -s /bin/sh appuser
 WORKDIR /app
 
 # Install deps
@@ -31,6 +30,6 @@ RUN mkdir -p /tmp/datasets /tmp/charts && \
 USER appuser
 
 EXPOSE 8080
-
 ENTRYPOINT ["/usr/bin/tini","--"]
-CMD ["gunicorn","--bind","0.0.0.0:8080","--workers","2","--threads","8","--timeout","240","main:app"]
+# Pakai $PORT dari env (Cloud Run akan set ini)
+CMD ["sh","-c","gunicorn --bind 0.0.0.0:${PORT:-8080} --workers 2 --threads 8 --timeout 240 main:app"]

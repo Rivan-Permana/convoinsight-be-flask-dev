@@ -27,3 +27,12 @@ reportlab>=3.6
 # --- validate api and it's security
 requests==2.32.3
 cryptography==43.0.3
+
+# --- PostgreSQL (Supabase) ---
+SQLAlchemy>=2.0.31,<3.0     # untuk create_engine, NullPool, dll.
+psycopg2-binary==2.9.9      # driver PG untuk SQLAlchemy (mudah dipakai di container)
+
+# (opsional, untuk pl.read_database langsung tanpa fallback pandas)
+connectorx>=0.3.3
+# atau via ADBC:
+adbc-driver-postgresql>=1.0.0

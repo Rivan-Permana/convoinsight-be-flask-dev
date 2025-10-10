@@ -19,16 +19,14 @@ substitutions:
   _GCS_DATASETS_PREFIX: "datasets"
   _GCS_DIAGRAMS_PREFIX: "diagrams"
   _GCS_SIGNED_URL_TTL_SECONDS: "604800"
-  _FIRESTORE_COLLECTION: "convo_sessions"         # dipakai utk sessions & providers (main.py)
-  _FIRESTORE_DATASETS_COLLECTION: "datasets_meta"  # meta datasets
 
-# (Opsional) Secret hanya diperlukan jika butuh di build step.
-# Untuk runtime (Cloud Run), kita pakai --set-secrets di step deploy.
-# Kalau tidak dipakai di build, blok ini boleh dihapus.
-# availableSecrets:
-#   secretManager:
-#     - versionName: projects/$PROJECT_ID/secrets/GEMINI_API_KEY/versions/latest
-#       env: GEMINI_API_KEY_SECRET
+  # Koleksi untuk sessions (tetap)
+  _FIRESTORE_COLLECTION: "convo_sessions"
+  _FIRESTORE_DATASETS_COLLECTION: "datasets_meta"
+
+  # (Opsional) Pisahkan koleksi utk penyimpanan API key LLM user
+  # Hanya efektif kalau kodenya membaca FIRESTORE_PROVIDERS_COLLECTION.
+  _FIRESTORE_PROVIDERS_COLLECTION: "convo_providers"
 
 steps:
   # 1) Build image
@@ -77,8 +75,8 @@ steps:
           --set-env-vars "PYTHONUNBUFFERED=1,PYTHONDONTWRITEBYTECODE=1" \
           --set-env-vars "CORS_ORIGINS=${_CORS_ORIGINS}" \
           --set-env-vars "GCS_BUCKET=${_GCS_BUCKET},GCS_DATASETS_PREFIX=${_GCS_DATASETS_PREFIX},GCS_DIAGRAMS_PREFIX=${_GCS_DIAGRAMS_PREFIX},GCS_SIGNED_URL_TTL_SECONDS=${_GCS_SIGNED_URL_TTL_SECONDS}" \
-          --set-env-vars "FIRESTORE_COLLECTION=${_FIRESTORE_COLLECTION},FIRESTORE_DATASETS_COLLECTION=${_FIRESTORE_DATASETS_COLLECTION}" \
-          --set-secrets "GEMINI_API_KEY=GEMINI_API_KEY:latest"
+          --set-env-vars "FIRESTORE_COLLECTION=${_FIRESTORE_COLLECTION},FIRESTORE_DATASETS_COLLECTION=${_FIRESTORE_DATASETS_COLLECTION},FIRESTORE_PROVIDERS_COLLECTION=${_FIRESTORE_PROVIDERS_COLLECTION}" \
+          --set-secrets "GEMINI_API_KEY=GEMINI_API_KEY:latest,FERNET_KEY=FERNET_KEY:latest"
 
 images:
   - "${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:$SHORT_SHA"

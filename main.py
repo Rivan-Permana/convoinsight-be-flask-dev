@@ -1106,7 +1106,7 @@ def compat_list_domain_datasets(domain: str):
         return jsonify({"detail": str(e)}), 500
 
 # (Legacy path fallback if FE lama pernah manggil path typo—optional)
-@app.get("/domains/<domain>/datasets>")
+@app.get("/domains/<domain>/datasets")
 def compat_list_domain_datasets_trailing(domain: str):
     return compat_list_domain_datasets(domain)
 

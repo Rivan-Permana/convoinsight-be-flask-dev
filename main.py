@@ -267,14 +267,56 @@ def _polars_info_string(df: pl.DataFrame) -> str:
         lines.append(f"  - {name}: {dtype} (nulls={n})")
     return "\n".join(lines)
 
+# === FIX: Robustly convert many possible return types into Polars DF ===
 def _to_polars_dataframe(obj):
+    if obj is None:
+        return None
+    # PandasAI response wrapper
+    if isinstance(obj, DataFrameResponse):
+        obj = obj.value
+    # Already polars
     if isinstance(obj, pl.DataFrame):
         return _normalize_columns_to_str(obj)
+    # pandas.DataFrame
+    if isinstance(obj, pd.DataFrame):
+        try:
+            df = pl.from_pandas(obj)  # preferred
+        except Exception:
+            try:
+                df = pl.DataFrame(obj.to_dict(orient="records"))
+            except Exception:
+                return None
+        return _normalize_columns_to_str(df)
+    # {"type":"dataframe","value": ...}
+    if isinstance(obj, dict) and obj.get("type") == "dataframe":
+        return _to_polars_dataframe(obj.get("value"))
+    # Generic dict/list-of-records
+    if isinstance(obj, dict) or isinstance(obj, list):
+        try:
+            df = pl.DataFrame(obj)
+            return _normalize_columns_to_str(df)
+        except Exception:
+            try:
+                df = pl.from_dicts(obj if isinstance(obj, list) else [obj])
+                return _normalize_columns_to_str(df)
+            except Exception:
+                return None
+    # Last-chance: polars convenience
     try:
         df = pl.from_dataframe(obj)
         return _normalize_columns_to_str(df)
     except Exception:
-        return None
+        # Some semantic frames expose converters
+        try:
+            if hasattr(obj, "to_polars"):
+                df = obj.to_polars()
+                return _normalize_columns_to_str(df)
+            if hasattr(obj, "to_pandas"):
+                return _to_polars_dataframe(obj.to_pandas())
+        except Exception:
+            pass
+    return None
+# === END FIX ===
 
 def _as_pai_df(df):
     """
@@ -315,6 +357,18 @@ def _read_local_csv_to_polars(path: str, sep_candidates: List[str] = (",", "|", 
     with open(path, "rb") as f:
         data = f.read()
     return _read_csv_bytes_to_polars(data, sep_candidates=sep_candidates)
+
+# === FIX: choose a default DF if manipulator fails ===
+def _pick_default_df(dfs: Dict[str, pl.DataFrame]) -> Optional[pl.DataFrame]:
+    if not dfs:
+        return None
+    try:
+        return max(dfs.values(), key=lambda d: getattr(d, "height", d.shape[0]))
+    except Exception:
+        for d in dfs.values():
+            return d
+    return None
+# === END FIX ===
 
 
 # ---- Upload (GCS when possible, safe local fallback otherwise) ----------------
@@ -1323,8 +1377,12 @@ def query():
                     pdf.columns = [str(c) for c in pdf.columns]
                     semantic_dfs.append(pai.DataFrame(pdf))
             dm_resp = pai.chat(manipulator_prompt, *semantic_dfs)
-            val = getattr(dm_resp, "value", dm_resp)
-            df_processed = _to_polars_dataframe(val)
+
+            # === FIX: try to extract DF from manipulator; else pick a default DF ===
+            df_processed = _to_polars_dataframe(dm_resp)
+            if df_processed is None:
+                df_processed = _pick_default_df(dfs)
+            # === END FIX ===
 
         # Visualizer
         _cancel_if_needed(session_id)

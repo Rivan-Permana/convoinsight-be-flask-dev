@@ -1,5 +1,10 @@
 # main.py — ConvoInsight BE (Flask, Cloud Run ready)
-# Polars + PandasAI wrappers; GCS/Firestore persistence; provider keys via Firestore (encrypted)
+# Merged with latest ML pipeline (a0.0.7) using Polars + PandasAI wrappers:
+# - Polars throughout (no pandas DataFrames in pipeline path)
+# - Safe column normalization, info/describe helpers for Polars
+# - Router & Orchestrator configs from a0.0.7
+# - Manipulator/Visualizer/Analyzer now use pai.DataFrame wrappers on Polars
+# - GCS/Firestore persistence, dataset CRUD, cancel, PDF export preserved
 
 import os, io, json, time, uuid, re, html
 from datetime import datetime, timedelta
@@ -12,9 +17,9 @@ from flask_cors import CORS
 # --- Polars + PandasAI (Polars-first)
 import polars as pl
 import pandasai as pai
-from pandasai_litellm.litellm import LiteLLM
 from litellm import completion
 from pandasai import SmartDataframe, SmartDatalake  # kept import for compatibility, not used in new path
+from pandasai_litellm.litellm import LiteLLM
 from pandasai.core.response.dataframe import DataFrameResponse
 
 # --- (pandas kept import for minimal surface compatibility, not used in pipeline)
@@ -23,10 +28,6 @@ import pandas as pd  # not used for pipeline; retained to avoid non-pipeline bre
 # --- GCP clients ---
 from google.cloud import storage
 from google.cloud import firestore
-
-# === GCP auth imports (for signed URLs on Cloud Run) ===
-import google.auth
-from google.auth.transport.requests import Request as GoogleAuthRequest
 
 import requests
 from cryptography.fernet import Fernet
@@ -71,16 +72,14 @@ GCS_BUCKET                  = os.getenv("GCS_BUCKET")
 GCS_DATASETS_PREFIX         = os.getenv("GCS_DATASETS_PREFIX", "datasets")
 GCS_DIAGRAMS_PREFIX         = os.getenv("GCS_DIAGRAMS_PREFIX", "diagrams")
 GCS_SIGNED_URL_TTL_SECONDS  = int(os.getenv("GCS_SIGNED_URL_TTL_SECONDS", "604800"))  # 7 days
-GOOGLE_SERVICE_ACCOUNT_EMAIL = os.getenv("GOOGLE_SERVICE_ACCOUNT_EMAIL")  # optional but useful on Cloud Run
 
-# 🔧 FIX: pakai env var koleksi yang berbeda-beda (tidak ketuker)
-FIRESTORE_COLLECTION_SESSIONS  = os.getenv("FIRESTORE_SESSIONS_COLLECTION", "convo_sessions")
+FIRESTORE_COLLECTION_SESSIONS  = os.getenv("FIRESTORE_COLLECTION", "convo_sessions")
 FIRESTORE_COLLECTION_DATASETS  = os.getenv("FIRESTORE_DATASETS_COLLECTION", "datasets_meta")
-FIRESTORE_COLLECTION_PROVIDERS = os.getenv("FIRESTORE_PROVIDERS_COLLECTION", "convo_providers")
+FIRESTORE_COLLECTION_PROVIDERS = os.getenv("FIRESTORE_COLLECTION", "convo_providers")
 
 # --- Init Flask ---
 app = Flask(__name__)
-CORS(app, origins=[o.strip() for o in CORS_ORIGINS if o.strip()], supports_credentials=True)
+CORS(app, origins=CORS_ORIGINS, supports_credentials=True)
 
 # --- Init GCP clients ---
 _storage_client = storage.Client(project=GCP_PROJECT_ID) if GCP_PROJECT_ID else storage.Client()
@@ -88,6 +87,7 @@ _firestore_client = firestore.Client(project=GCP_PROJECT_ID) if GCP_PROJECT_ID e
 
 # --- Cancel flags ---
 _CANCEL_FLAGS = set()  # holds session_id
+
 
 # =========================
 # Utilities & Helpers
@@ -158,8 +158,7 @@ def save_provider_key(user_id: str, provider: str, encrypted_key: str, models: l
             "token": encrypted_key,
             "models": models,
             "is_active": True,
-            # 🔧 gunakan server timestamp biar konsisten di multi instance
-            "updated_at": firestore.SERVER_TIMESTAMP,
+            "updated_at": datetime.utcnow(),
             "created_at": firestore.SERVER_TIMESTAMP,
         }
         doc_ref.set(data, merge=True)
@@ -167,6 +166,7 @@ def save_provider_key(user_id: str, provider: str, encrypted_key: str, models: l
     except Exception as e:
         print("Firestore save error:", e)
         return False
+
 
 # --- Firestore-backed conversation state -----------
 def _fs_default_state():
@@ -190,7 +190,7 @@ def _get_conv_state(session_id: str) -> dict:
         data = doc.to_dict() or {}
         for k, v in _fs_default_state().items():
             if k not in data:
-                data[k] = v
+                data[k] = v if k not in ("created_at","updated_at") else firestore.SERVER_TIMESTAMP
         return data
     else:
         state = _fs_default_state()
@@ -210,53 +210,14 @@ def _append_history(state: dict, role: str, content: str, max_len=10_000, keep_l
     hist.append({"role": role, "content": content, "ts": time.time()})
     state["history"] = hist[-keep_last:]
 
+
 # --- GCS helpers -----------------------------------
 def _gcs_bucket():
     if not GCS_BUCKET:
         raise RuntimeError("GCS_BUCKET is not set")
     return _storage_client.bucket(GCS_BUCKET)
 
-def _metadata_sa_email() -> Optional[str]:
-    """Fetch the service account email from GCE metadata (Cloud Run)."""
-    try:
-        r = requests.get(
-            "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/email",
-            headers={"Metadata-Flavor": "Google"},
-            timeout=1.5,
-        )
-        if r.status_code == 200:
-            return r.text.strip()
-    except Exception:
-        pass
-    return None
-
 def _signed_url(blob, filename: str, content_type: str, ttl_seconds: int) -> str:
-    """
-    Generate V4 signed URL. On Cloud Run (no private key), delegate signing to IAM by
-    supplying a valid service_account_email + access_token.
-    """
-    credentials, _ = google.auth.default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
-    try:
-        credentials.refresh(GoogleAuthRequest())
-    except Exception:
-        pass
-
-    sa_email = getattr(credentials, "service_account_email", None)
-    if not sa_email or sa_email.lower() == "default":
-        sa_email = GOOGLE_SERVICE_ACCOUNT_EMAIL or _metadata_sa_email()
-
-    if sa_email and getattr(credentials, "token", None):
-        return blob.generate_signed_url(
-            version="v4",
-            expiration=timedelta(seconds=ttl_seconds),
-            method="GET",
-            response_disposition=f'inline; filename="{filename}"',
-            response_type=content_type,
-            service_account_email=sa_email,
-            access_token=credentials.token,
-        )
-
-    # Fallback: dev local with keyfile
     return blob.generate_signed_url(
         version="v4",
         expiration=timedelta(seconds=ttl_seconds),
@@ -264,6 +225,7 @@ def _signed_url(blob, filename: str, content_type: str, ttl_seconds: int) -> str
         response_disposition=f'inline; filename="{filename}"',
         response_type=content_type,
     )
+
 
 # ---- Local helpers / robust dev mode --------------
 def _upload_dataset_file_local(file_storage, *, domain: str) -> dict:
@@ -342,6 +304,7 @@ def _read_csv_bytes_to_polars(data: bytes, sep_candidates: List[str] = (",", "|"
         except Exception as e:
             last_err = e
             continue
+    # Final attempt: let Polars infer
     try:
         df = pl.read_csv(io.BytesIO(data))
         return _normalize_columns_to_str(df)
@@ -353,8 +316,14 @@ def _read_local_csv_to_polars(path: str, sep_candidates: List[str] = (",", "|", 
         data = f.read()
     return _read_csv_bytes_to_polars(data, sep_candidates=sep_candidates)
 
+
 # ---- Upload (GCS when possible, safe local fallback otherwise) ----------------
 def upload_dataset_file(file_storage, *, domain: str) -> dict:
+    """
+    Upload a Werkzeug FileStorage.
+    - If GCS_BUCKET is set → try GCS (and write Firestore meta).
+    - If GCS upload/meta fails (or not set) → automatically fall back to local save.
+    """
     if not GCS_BUCKET:
         return _upload_dataset_file_local(file_storage, domain=domain)
 
@@ -383,6 +352,7 @@ def upload_dataset_file(file_storage, *, domain: str) -> dict:
     except Exception:
         return _upload_dataset_file_local(file_storage, domain=domain)
 
+
 def list_gcs_csvs(domain: str) -> List[storage.Blob]:
     safe_domain = slug(domain)
     prefix = f"{GCS_DATASETS_PREFIX}/{safe_domain}/"
@@ -409,6 +379,7 @@ def delete_gcs_object(blob_name_or_gs_uri: str):
         bucket = _gcs_bucket()
         blob_name = blob_name_or_gs_uri
     bucket.blob(blob_name).delete()
+
 
 # ---- Diagrams (charts|tables) helper ------------
 def _detect_diagram_kind(local_html_path: str, visual_hint: str) -> str:
@@ -443,10 +414,13 @@ def upload_diagram_to_gcs(local_path: str, *, domain: str, session_id: str, run_
         "kind": kind,
     }
 
+
 # =========================
-# Latest Pipeline Configs (router/orchestrator/agents)
+# Latest Pipeline Configs
 # =========================
-router_system_configuration = """Make sure all of the information below is applied.
+
+# --- Router SYSTEM configuration (from a0.0.7) ---
+router_system_configuration = f"""Make sure all of the information below is applied.
 1. You are the Orchestration Router: decide which agents/LLMs to run for a business data prompt.
 2. Output must be STRICT one-line JSON with keys: need_manipulator, need_visualizer, need_analyzer, need_compiler, compiler_model, visual_hint, reason.
 3. Precedence & overrides: Direct user prompt > Router USER config > Router DOMAIN config > Router SYSTEM defaults.
@@ -462,12 +436,13 @@ router_system_configuration = """Make sure all of the information below is appli
 13. Rules of thumb: if prompt mentions allocation, optimization, plan, gap-closure, “minimum number of additional takers”, set need_analyzer=true and set visual_hint="table".
 14. If follow-up with no new data ops implied and a processed df exists, set need_manipulator=false to reuse the previous dataframe.
 15. Compiler always runs; default compiler_model="gemini/gemini-2.5-pro" unless the domain/user requires otherwise.
-16. visual_hint ∈ {"bar","line","table","auto"}; pick the closest fit and prefer "table" for plan/allocation outputs.
+16. visual_hint ∈ {"{"}bar","line","table","auto"{"}"}; pick the closest fit and prefer "table" for plan/allocation outputs.
 17. Keep the reason short (≤120 chars). No prose beyond the JSON.
 18. In short: choose the most efficient set of agents/LLMs to answer the prompt well while respecting overrides.
 19. By default, Manipulator and Analyzer should always be used in most scenario, because response compiler did not have access to the complete detailed data."""
 
-orchestrator_system_configuration = """1. Honor precedence: direct user prompt > USER specific configuration > DOMAIN specific configuration > SYSTEM defaults.
+# --- Orchestrator SYSTEM configuration (updated to Polars-first) ---
+orchestrator_system_configuration = f"""1. Honor precedence: direct user prompt > USER specific configuration > DOMAIN specific configuration > SYSTEM defaults.
 2. Think step by step.
 3. You orchestrate 3 LLM PandasAI Agents for business data analysis.
 4. The 3 agents are: Data Manipulator, Data Visualizer, Data Analyser.
@@ -480,11 +455,12 @@ orchestrator_system_configuration = """1. Honor precedence: direct user prompt >
 11. Convert a short business question into three specialist prompts.
 12. Use the Router Context Hint and Visualization hint when applicable.
 13. Respect the user- and domain-level configurations injected below; overrides must not alter core process.
-14. All specialists operate in Python using PandasAI Semantic DataFrames (pai.DataFrame) backed by Polars DataFrames.
+14. All specialists operate in Python using PandasAI Semantic DataFrames (`pai.DataFrame`) backed by Polars DataFrames.
 15. Return STRICT JSON with keys: manipulator_prompt, visualizer_prompt, analyzer_prompt, compiler_instruction.
 16. Each value must be a single-line string. No extra keys, no prose, no markdown/code fences."""
 
-data_manipulator_system_configuration = """1. Honor precedence: direct user prompt > USER specific configuration > DOMAIN specific configuration > SYSTEM defaults.
+# --- Data Manipulator SYSTEM configuration (from a0.0.7) ---
+data_manipulator_system_configuration = f"""1. Honor precedence: direct user prompt > USER specific configuration > DOMAIN specific configuration > SYSTEM defaults.
 2. Enforce data hygiene before analysis.
 3. Parse dates to datetime; create explicit period columns (day/week/month).
 4. Set consistent dtypes for numeric fields; strip/normalize categorical labels; standardize currency units if present.
@@ -493,10 +469,11 @@ data_manipulator_system_configuration = """1. Honor precedence: direct user prom
 7. Produce exactly the minimal, analysis-ready dataframe(s) needed for the user question, with stable, well-named columns.
 8. Include the percentage version of appropriate raw value columns (share-of-total where relevant).
 9. End by returning only:
-    result = {"type":"dataframe","value": <THE_FINAL_DATAFRAME>}
+   result = {{"type":"dataframe","value": <THE_FINAL_DATAFRAME>}}
 10. Honor any user-level and domain-level instructions injected below."""
 
-data_visualizer_system_configuration = """1. Honor precedence: direct user prompt > USER specific configuration > DOMAIN specific configuration > SYSTEM defaults.
+# --- Data Visualizer SYSTEM configuration (from a0.0.7) ---
+data_visualizer_system_configuration = f"""1. Honor precedence: direct user prompt > USER specific configuration > DOMAIN specific configuration > SYSTEM defaults.
 2. Produce exactly ONE interactive visualization (a Plotly diagram or a table) per request.
 3. Choose the best form based on the user's question: Plotly diagrams for trends/comparisons; Table for discrete, plan, or allocation outputs.
 4. For explicit user preference: if prompt says “plotly table” use Plotly Table.
@@ -508,16 +485,18 @@ data_visualizer_system_configuration = """1. Honor precedence: direct user promp
 10. Write the file exactly once using an atomic lock (.lock) to avoid duplicates across retries; write fig HTML or table HTML as appropriate.
 11. Ensure file_path is a plain Python string; do not print/return anything else.
 12. The last line of code MUST be exactly:
-    result = {"type": "string", "value": file_path}
+    result = {{"type": "string", "value": file_path}}
 13. DO NOT rely on pandas-specific styling; prefer Plotly Table when a table is needed."""
 
-data_analyzer_system_configuration = """1. Honor precedence: direct user prompt > USER configuration specific > DOMAIN specific configuration > SYSTEM defaults.
+# --- Data Analyzer SYSTEM configuration (from a0.0.7) ---
+data_analyzer_system_configuration = f"""1. Honor precedence: direct user prompt > USER configuration specific > DOMAIN specific configuration > SYSTEM defaults.
 2. Write like you’re speaking to a person; be concise and insight-driven.
 3. Quantify where possible (deltas, % contributions, time windows); reference exact columns/filters used.
 4. Return only:
-    result = {"type":"string","value":"<3–6 crisp bullets or 2 short paragraphs of insights>"}"""
+   result = {{"type":"string","value":"<3–6 crisp bullets or 2 short paragraphs of insights>"}}"""
 
-response_compiler_system_configuration = """1. Honor precedence: direct user prompt > USER specific configuration > DOMAIN specific configuration > SYSTEM defaults.
+# --- Response Compiler SYSTEM configuration (from a0.0.7) ---
+response_compiler_system_configuration = f"""1. Honor precedence: direct user prompt > USER specific configuration > DOMAIN specific configuration > SYSTEM defaults.
 2. Brevity: ≤180 words; bullets preferred; no code blocks, no JSON, no screenshots.
 3. Lead with the answer: 1–2 sentence “Bottom line” with main number, time window, and delta.
 4. Quantified drivers: top 3 with magnitude, direction, and approx contribution (absolute and % where possible).
@@ -549,10 +528,10 @@ response_compiler_system_configuration = """1. Honor precedence: direct user pro
 30. compiler_instruction must contain clear, step-by-step instructions to assemble the final response.
 31. The final response must be decision-ready and insight-first, not raw data.
 32. The compiler_instruction is used as the compiler LLM’s system content.
-33. Compiler user content will be: f"User Prompt:{user_prompt}. \nData Info:{data_info}. \nData Describe:{data_describe}. \nData Manipulator Response:{data_manipulator_response}. \nData Visualizer Response:{data_visualizer_response}. \nData Analyzer Response:{data_analyzer_response}".
+33. Compiler user content will be: f"User Prompt:{{user_prompt}}. \nData Info:{{data_info}}. \nData Describe:{{data_describe}}. \nData Manipulator Response:{{data_manipulator_response}}. \nData Visualizer Response:{{data_visualizer_response}}. \nData Analyzer Response:{{data_analyzer_response}}".
 34. `data_info` is a string summary of dataframe types/shape.
 35. `data_manipulator_response` is a PandasAI DataFrameResponse.
-36. `data_visualizer_response` is a file path to an HTML/PNG inside {"type":"string","value": ...} with a plain Python string path.
+36. `data_visualizer_response` is a file path to an HTML/PNG inside {{"type":"string","value": ...}} with a plain Python string path.
 37. `data_analyzer_response` is a PandasAI StringResponse.
 38. Your goal in `compiler_instruction` is to force brevity, decisions, and insights.
 39. Mention the data source of each statement.
@@ -562,7 +541,7 @@ response_compiler_system_configuration = """1. Honor precedence: direct user pro
 user_specific_configuration = """1. (no user-specific instructions provided yet)."""
 
 domain_specific_configuration = """1. Use period labels like m0 (current month) and m1 (prior month); apply consistently.
-2. Use IDR as currency, for example: Rp93,000.00 atau Rp354,500.00.
+2. Use IDR as currency, for example: Rp93,000.00 or Rp354,500.00.
 3. Use blue themed chart and table colors.
 4. target should be in mn (million).
 5. %TUR is take up rate percentage.
@@ -571,6 +550,7 @@ domain_specific_configuration = """1. Use period labels like m0 (current month) 
 8. rev/subs and rev/trx should be in thousands of idr.
 9. MoM is month after month in percentage
 10. Subs is taker."""
+
 
 # =========================
 # Shared Data Loading (Polars-first)
@@ -625,6 +605,7 @@ def _load_domain_dataframes(domain: str, dataset_filters: Optional[set]) -> Tupl
             pass
 
     return dfs, data_info, data_describe
+
 
 # =========================
 # Router (a0.0.7)
@@ -681,6 +662,7 @@ def _run_router(user_prompt: str, data_info, data_describe, state: dict) -> dict
     plan["_elapsed"] = float(router_end - router_start)
     return plan
 
+
 # =========================
 # Orchestrate (a0.0.7)
 # =========================
@@ -734,17 +716,13 @@ def _run_orchestrator(user_prompt: str, domain: str, data_info, data_describe, v
         spec = {"manipulator_prompt":"", "visualizer_prompt":"", "analyzer_prompt":"", "compiler_instruction":""}
     return spec
 
+
 # =========================
 # Health & Static
 # =========================
 @app.get("/health")
 def health():
     return jsonify({"status": "healthy", "ts": datetime.utcnow().isoformat()})
-
-# 🔧 Tambah root route biar gak 404 pas akses domain dasar Cloud Run
-@app.get("/")
-def root():
-    return jsonify({"ok": True, "service": "ConvoInsight BE", "health": "/health"})
 
 @app.route("/charts/<path:relpath>")
 def serve_chart(relpath):
@@ -753,13 +731,10 @@ def serve_chart(relpath):
     filename = os.path.basename(full)
     return send_from_directory(base, filename)
 
+
 # =========================
 # Provider key management
 # =========================
-def _require_fernet():
-    if not fernet:
-        raise RuntimeError("FERNET_KEY is not configured on server")
-
 @app.route("/validate-key", methods=["POST"])
 def validate_key():
     try:
@@ -770,8 +745,6 @@ def validate_key():
         if not provider or not api_key or not user_id:
             return jsonify({"valid": False, "error": "Missing provider, apiKey, or userId"}), 400
 
-        _require_fernet()
-
         cfg = get_provider_config(provider, api_key)
         res = requests.get(cfg["url"], headers=cfg["headers"], timeout=6)
         if res.status_code == 200:
@@ -781,7 +754,7 @@ def validate_key():
                 models = [m.get("id") for m in j["data"] if "id" in m]
             elif "models" in j:
                 models = [m.get("name") or m.get("id") for m in j["models"]]
-            encrypted_key = fernet.encrypt(api_key.encode()).decode()
+            encrypted_key = fernet.encrypt(api_key.encode()).decode() if fernet else None
             save_provider_key(user_id, provider, encrypted_key, models)
             return jsonify({"valid": True, "provider": provider, "models": models, "token": encrypted_key})
         else:
@@ -802,17 +775,12 @@ def get_provider_keys():
         items = []
         for doc in docs:
             d = doc.to_dict()
-            raw_updated = d.get("updated_at")
-            if hasattr(raw_updated, "isoformat"):
-                updated_at = raw_updated.isoformat()
-            else:
-                updated_at = str(raw_updated) if raw_updated else None
             items.append({
                 "id": doc.id,
                 "provider": d.get("provider"),
                 "models": d.get("models", []),
                 "is_active": d.get("is_active", True),
-                "updated_at": updated_at,
+                "updated_at": d.get("updated_at").isoformat() if d.get("updated_at") else None,
             })
         return jsonify({"items": items, "count": len(items)})
     except Exception as e:
@@ -828,8 +796,6 @@ def update_provider_key():
         if not user_id or not provider or not api_key:
             return jsonify({"updated": False, "error": "Missing fields"}), 400
 
-        _require_fernet()
-
         cfg = get_provider_config(provider, api_key)
         res = requests.get(cfg["url"], headers=cfg["headers"], timeout=6)
         if res.status_code != 200:
@@ -841,16 +807,11 @@ def update_provider_key():
             models = [m.get("id") for m in j["data"] if "id" in m]
         elif "models" in j:
             models = [m.get("name") or m.get("id") for m in j["models"]]
-        encrypted_key = fernet.encrypt(api_key.encode()).decode()
+        encrypted_key = fernet.encrypt(api_key.encode()).decode() if fernet else None
 
         doc_ref = _firestore_client.collection(FIRESTORE_COLLECTION_PROVIDERS).document(f"{user_id}_{provider}")
-        doc_ref.set({
-            "user_id": user_id,
-            "provider": provider,
-            "token": encrypted_key,
-            "models": models,
-            "updated_at": firestore.SERVER_TIMESTAMP
-        }, merge=True)
+        doc_ref.set({"user_id": user_id, "provider": provider, "token": encrypted_key, "models": models,
+                     "updated_at": datetime.utcnow().isoformat()}, merge=True)
 
         return jsonify({"updated": True, "models": models})
     except Exception as e:
@@ -874,6 +835,7 @@ def delete_provider_key():
         return jsonify({"deleted": True})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
 
 # =========================
 # Datasets CRUD + Domain listing
@@ -1043,6 +1005,10 @@ def compat_upload_datasets(domain: str):
     except Exception as e:
         return jsonify({"detail": str(e)}), 500
 
+@app.get("/domains/<domain>/datasets>")
+def compat_list_domain_datasets_trailing(domain: str):
+    return compat_list_domain_datasets(domain)
+
 @app.get("/domains/<domain>/datasets")
 def compat_list_domain_datasets(domain: str):
     try:
@@ -1079,10 +1045,6 @@ def compat_list_domain_datasets(domain: str):
     except Exception as e:
         return jsonify({"detail": str(e)}), 500
 
-# (Legacy path fallback if FE lama pernah manggil path typo—optional)
-@app.get("/domains/<domain>/datasets>")
-def compat_list_domain_datasets_trailing(domain: str):
-    return compat_list_domain_datasets(domain)
 
 # =========================
 # Sessions / PDF Export / Cancel
@@ -1180,6 +1142,7 @@ def query_cancel():
     except Exception as e:
         return jsonify({"detail": str(e)}), 500
 
+
 # =========================
 # NEW: Suggestion Endpoint (a0.0.7)
 # =========================
@@ -1188,7 +1151,7 @@ def suggest():
     """
     Body (JSON):
       - domain (str, required)
-      - dataset (str | [str], optional)
+      - dataset (str | [str], optional)  -> filter datasets
     Returns:
       { suggestions: [s1,s2,s3,s4], elapsed: <sec>, data_info, data_describe }
     """
@@ -1215,6 +1178,7 @@ def suggest():
 
         dfs, data_info, data_describe = _load_domain_dataframes(domain, dataset_filters)
 
+        # LLM: prompt suggester (from a0.0.7)
         r = completion(
             model="gemini/gemini-2.5-pro",
             messages=[
@@ -1247,6 +1211,7 @@ def suggest():
     except Exception as e:
         return jsonify({"detail": str(e)}), 500
 
+
 # =========================
 # NEW: Query/Inferencing Endpoint (a0.0.7, Polars pipeline)
 # =========================
@@ -1257,7 +1222,7 @@ def query():
       - domain (str, required)
       - prompt (str, required)
       - session_id (str, optional)
-      - dataset (str | [str], optional)
+      - dataset (str | [str], optional)  -> filter datasets
     Returns:
       - session_id, response (HTML), diagram_* fields, timing & flags
     """
@@ -1268,6 +1233,7 @@ def query():
         prompt     = body.get("prompt")
         session_id = body.get("session_id") or str(uuid.uuid4())
 
+        # dataset selection (single or multi)
         dataset_field = body.get("dataset")
         if isinstance(dataset_field, list):
             datasets = [s.strip() for s in dataset_field if isinstance(s, str) and s.strip()]
@@ -1300,7 +1266,8 @@ def query():
                 available = []
                 domain_dir = os.path.join(DATASETS_ROOT, domain)
                 if os.path.isdir(domain_dir):
-                    available.extend(sorted([f for f in os.listdir(domain_dir) if f.lower().endswith(".csv")]))
+                    available.extend(sorted([f for f in os.listdir(domain_dir) if f.lower().endswith(".csv")])
+                    )
                 try:
                     if GCS_BUCKET:
                         available.extend(sorted({os.path.basename(b.name) for b in list_gcs_csvs(domain) if b.name.lower().endswith(".csv")}))
@@ -1326,7 +1293,7 @@ def query():
         context_hint = {
             "router_plan": agent_plan,
             "last_visual_path": "",
-            "has_prev_df_processed": False,
+            "has_prev_df_processed": False,   # process fresh each call (stateless df)
             "last_analyzer_excerpt": (state.get("last_analyzer_text") or "")[:400],
             "dataset_filter": (sorted(datasets) if datasets else "ALL"),
         }
@@ -1352,6 +1319,7 @@ def query():
                 try:
                     semantic_dfs.append(pai.DataFrame(d))
                 except TypeError:
+                    # fallback: pandas shim with string columns
                     pdf = d.to_pandas()
                     pdf.columns = [str(c) for c in pdf.columns]
                     semantic_dfs.append(pai.DataFrame(pdf))
@@ -1443,9 +1411,9 @@ def query():
         exec_time = time.time() - t0
         return jsonify({
             "session_id": session_id,
-            "response": final_content,       # HTML
-            "chart_url": chart_url,          # dev preview
-            "diagram_kind": diagram_kind,    # "charts" | "tables"
+            "response": final_content,        # HTML
+            "chart_url": chart_url,           # dev preview
+            "diagram_kind": diagram_kind,     # "charts" | "tables"
             "diagram_gs_uri": diagram_gs_uri, # gs://...
             "diagram_signed_url": diagram_signed_url,
             "execution_time": exec_time,
@@ -1459,6 +1427,7 @@ def query():
         return jsonify({"detail": str(rexc)}), 500
     except Exception as e:
         return jsonify({"detail": str(e)}), 500
+
 
 # --- Entry point ---------------------------------------------------------------
 if __name__ == "__main__":

@@ -29,6 +29,12 @@ import pandas as pd  # not used for pipeline; retained to avoid non-pipeline bre
 from google.cloud import storage
 from google.cloud import firestore
 
+# === NEW: imports for IAM-based signing (fix for "need a private key to sign") ===
+import google.auth
+from google.auth.transport.requests import Request as GoogleAuthRequest
+from google.auth.iam import Signer as GoogleIAMSigner
+from google.oauth2 import service_account as google_service_account
+
 import requests
 from cryptography.fernet import Fernet
 
@@ -87,6 +93,49 @@ _firestore_client = firestore.Client(project=GCP_PROJECT_ID) if GCP_PROJECT_ID e
 
 # --- Cancel flags ---
 _CANCEL_FLAGS = set()  # holds session_id
+
+# === NEW: cache for signing credentials (IAM Signer) ===
+_SIGNING_CREDS_CACHE = None
+
+def _get_iam_signing_credentials():
+    """
+    Build credentials that can SIGN using IAM Credentials API (works on Cloud Run
+    where default creds don't have a local private key). Cached for reuse.
+    """
+    global _SIGNING_CREDS_CACHE
+    if _SIGNING_CREDS_CACHE is not None:
+        return _SIGNING_CREDS_CACHE
+
+    # Acquire ADC with cloud-platform scope
+    adc, project_id = google.auth.default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
+    sa_email = getattr(adc, "service_account_email", None) or os.getenv("GOOGLE_SERVICE_ACCOUNT_EMAIL")
+
+    # Optional: try metadata if email absent
+    if not sa_email:
+        try:
+            m = requests.get(
+                "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/email",
+                headers={"Metadata-Flavor": "Google"},
+                timeout=1.5,
+            )
+            if m.status_code == 200:
+                sa_email = m.text.strip()
+        except Exception:
+            pass
+
+    if not sa_email:
+        # Fallback: return None to let library try local signing (useful for local dev with keyfile)
+        _SIGNING_CREDS_CACHE = (None, project_id)
+        return _SIGNING_CREDS_CACHE
+
+    signer = GoogleIAMSigner(GoogleAuthRequest(), adc, sa_email)
+    signing_credentials = google_service_account.Credentials(
+        signer=signer,
+        service_account_email=sa_email,
+        token_uri="https://oauth2.googleapis.com/token",
+    )
+    _SIGNING_CREDS_CACHE = (signing_credentials, project_id)
+    return _SIGNING_CREDS_CACHE
 
 
 # =========================
@@ -218,13 +267,38 @@ def _gcs_bucket():
     return _storage_client.bucket(GCS_BUCKET)
 
 def _signed_url(blob, filename: str, content_type: str, ttl_seconds: int) -> str:
-    return blob.generate_signed_url(
-        version="v4",
-        expiration=timedelta(seconds=ttl_seconds),
-        method="GET",
-        response_disposition=f'inline; filename="{filename}"',
-        response_type=content_type,
-    )
+    """
+    Generate V4 signed URL. On Cloud Run (no private key), use IAM Signer.
+    Falls back to default behavior for local dev with keyfiles.
+    """
+    try:
+        signing_credentials, _ = _get_iam_signing_credentials()
+        if signing_credentials is not None:
+            return blob.generate_signed_url(
+                version="v4",
+                expiration=timedelta(seconds=ttl_seconds),
+                method="GET",
+                response_disposition=f'inline; filename="{filename}"',
+                response_type=content_type,
+                credentials=signing_credentials,  # <-- key fix
+            )
+        # Fallback (e.g., local dev with keyfile)
+        return blob.generate_signed_url(
+            version="v4",
+            expiration=timedelta(seconds=ttl_seconds),
+            method="GET",
+            response_disposition=f'inline; filename="{filename}"',
+            response_type=content_type,
+        )
+    except Exception:
+        # Last resort fallback to default path (avoids breaking local flows)
+        return blob.generate_signed_url(
+            version="v4",
+            expiration=timedelta(seconds=ttl_seconds),
+            method="GET",
+            response_disposition=f'inline; filename="{filename}"',
+            response_type=content_type,
+        )
 
 
 # ---- Local helpers / robust dev mode --------------

@@ -29,11 +29,9 @@ import pandas as pd  # not used for pipeline; retained to avoid non-pipeline bre
 from google.cloud import storage
 from google.cloud import firestore
 
-# === NEW: imports for IAM-based signing (fix for "need a private key to sign") ===
+# === GCP auth imports (for signed URLs on Cloud Run) ===
 import google.auth
 from google.auth.transport.requests import Request as GoogleAuthRequest
-from google.auth.iam import Signer as GoogleIAMSigner
-from google.oauth2 import service_account as google_service_account
 
 import requests
 from cryptography.fernet import Fernet
@@ -74,9 +72,9 @@ os.makedirs(DATASETS_ROOT, exist_ok=True)
 os.makedirs(CHARTS_ROOT,   exist_ok=True)
 
 # GCS / Firestore
-GCS_BUCKET                  = os.getenv("GCS_BUCKET")
-GCS_DATASETS_PREFIX         = os.getenv("GCS_DATASETS_PREFIX", "datasets")
-GCS_DIAGRAMS_PREFIX         = os.getenv("GCS_DIAGRAMS_PREFIX", "diagrams")
+GCS_BUCKET                = os.getenv("GCS_BUCKET")
+GCS_DATASETS_PREFIX       = os.getenv("GCS_DATASETS_PREFIX", "datasets")
+GCS_DIAGRAMS_PREFIX       = os.getenv("GCS_DIAGRAMS_PREFIX", "diagrams")
 GCS_SIGNED_URL_TTL_SECONDS  = int(os.getenv("GCS_SIGNED_URL_TTL_SECONDS", "604800"))  # 7 days
 
 FIRESTORE_COLLECTION_SESSIONS  = os.getenv("FIRESTORE_COLLECTION", "convo_sessions")
@@ -93,50 +91,6 @@ _firestore_client = firestore.Client(project=GCP_PROJECT_ID) if GCP_PROJECT_ID e
 
 # --- Cancel flags ---
 _CANCEL_FLAGS = set()  # holds session_id
-
-# === NEW: cache for signing credentials (IAM Signer) ===
-_SIGNING_CREDS_CACHE = None
-
-def _get_iam_signing_credentials():
-    """
-    Build credentials that can SIGN using IAM Credentials API (works on Cloud Run
-    where default creds don't have a local private key). Cached for reuse.
-    """
-    global _SIGNING_CREDS_CACHE
-    if _SIGNING_CREDS_CACHE is not None:
-        return _SIGNING_CREDS_CACHE
-
-    # Acquire ADC with cloud-platform scope
-    adc, project_id = google.auth.default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
-    sa_email = getattr(adc, "service_account_email", None) or os.getenv("GOOGLE_SERVICE_ACCOUNT_EMAIL")
-
-    # Optional: try metadata if email absent
-    if not sa_email:
-        try:
-            m = requests.get(
-                "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/email",
-                headers={"Metadata-Flavor": "Google"},
-                timeout=1.5,
-            )
-            if m.status_code == 200:
-                sa_email = m.text.strip()
-        except Exception:
-            pass
-
-    if not sa_email:
-        # Fallback: return None to let library try local signing (useful for local dev with keyfile)
-        _SIGNING_CREDS_CACHE = (None, project_id)
-        return _SIGNING_CREDS_CACHE
-
-    signer = GoogleIAMSigner(GoogleAuthRequest(), adc, sa_email)
-    signing_credentials = google_service_account.Credentials(
-        signer=signer,
-        service_account_email=sa_email,
-        token_uri="https://oauth2.googleapis.com/token",
-    )
-    _SIGNING_CREDS_CACHE = (signing_credentials, project_id)
-    return _SIGNING_CREDS_CACHE
-
 
 # =========================
 # Utilities & Helpers
@@ -268,37 +222,41 @@ def _gcs_bucket():
 
 def _signed_url(blob, filename: str, content_type: str, ttl_seconds: int) -> str:
     """
-    Generate V4 signed URL. On Cloud Run (no private key), use IAM Signer.
-    Falls back to default behavior for local dev with keyfiles.
+    Generate V4 signed URL. On Cloud Run (no private key), delegates signing to IAM.
+    Falls back to default private key signing for local dev with keyfiles.
     """
-    try:
-        signing_credentials, _ = _get_iam_signing_credentials()
-        if signing_credentials is not None:
-            return blob.generate_signed_url(
-                version="v4",
-                expiration=timedelta(seconds=ttl_seconds),
-                method="GET",
-                response_disposition=f'inline; filename="{filename}"',
-                response_type=content_type,
-                credentials=signing_credentials,  # <-- key fix
-            )
-        # Fallback (e.g., local dev with keyfile)
+    # Get Application Default Credentials. These are available in GCP environments.
+    credentials, project_id = google.auth.default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
+
+    # In a GCP environment like Cloud Run, the credentials will have the service account email
+    # but no private key. In a local environment with a key file, it will have a private key.
+    service_account_email = getattr(credentials, "service_account_email", None)
+
+    # If we have a service account email, it means we're likely in a GCP environment
+    # and need to delegate signing to the IAM Credentials API.
+    if service_account_email:
+        # Ensure the credentials (access token) are up to date before making the call.
+        credentials.refresh(GoogleAuthRequest())
+
         return blob.generate_signed_url(
             version="v4",
             expiration=timedelta(seconds=ttl_seconds),
             method="GET",
             response_disposition=f'inline; filename="{filename}"',
             response_type=content_type,
+            service_account_email=service_account_email,
+            access_token=credentials.token, # Pass the fresh token
         )
-    except Exception:
-        # Last resort fallback to default path (avoids breaking local flows)
-        return blob.generate_signed_url(
-            version="v4",
-            expiration=timedelta(seconds=ttl_seconds),
-            method="GET",
-            response_disposition=f'inline; filename="{filename}"',
-            response_type=content_type,
-        )
+
+    # If there's no service_account_email on the credential, we assume it's a local
+    # credential file that contains a private key for signing. The library will find and use it.
+    return blob.generate_signed_url(
+        version="v4",
+        expiration=timedelta(seconds=ttl_seconds),
+        method="GET",
+        response_disposition=f'inline; filename="{filename}"',
+        response_type=content_type,
+    )
 
 
 # ---- Local helpers / robust dev mode --------------
@@ -510,7 +468,7 @@ router_system_configuration = f"""Make sure all of the information below is appl
 13. Rules of thumb: if prompt mentions allocation, optimization, plan, gap-closure, “minimum number of additional takers”, set need_analyzer=true and set visual_hint="table".
 14. If follow-up with no new data ops implied and a processed df exists, set need_manipulator=false to reuse the previous dataframe.
 15. Compiler always runs; default compiler_model="gemini/gemini-2.5-pro" unless the domain/user requires otherwise.
-16. visual_hint ∈ {"{"}bar","line","table","auto"{"}"}; pick the closest fit and prefer "table" for plan/allocation outputs.
+16. visual_hint ∈ {{"bar","line","table","auto"}}; pick the closest fit and prefer "table" for plan/allocation outputs.
 17. Keep the reason short (≤120 chars). No prose beyond the JSON.
 18. In short: choose the most efficient set of agents/LLMs to answer the prompt well while respecting overrides.
 19. By default, Manipulator and Analyzer should always be used in most scenario, because response compiler did not have access to the complete detailed data."""
@@ -543,7 +501,7 @@ data_manipulator_system_configuration = f"""1. Honor precedence: direct user pro
 7. Produce exactly the minimal, analysis-ready dataframe(s) needed for the user question, with stable, well-named columns.
 8. Include the percentage version of appropriate raw value columns (share-of-total where relevant).
 9. End by returning only:
-   result = {{"type":"dataframe","value": <THE_FINAL_DATAFRAME>}}
+    result = {{"type":"dataframe","value": <THE_FINAL_DATAFRAME>}}
 10. Honor any user-level and domain-level instructions injected below."""
 
 # --- Data Visualizer SYSTEM configuration (from a0.0.7) ---
@@ -567,7 +525,7 @@ data_analyzer_system_configuration = f"""1. Honor precedence: direct user prompt
 2. Write like you’re speaking to a person; be concise and insight-driven.
 3. Quantify where possible (deltas, % contributions, time windows); reference exact columns/filters used.
 4. Return only:
-   result = {{"type":"string","value":"<3–6 crisp bullets or 2 short paragraphs of insights>"}}"""
+    result = {{"type":"string","value":"<3–6 crisp bullets or 2 short paragraphs of insights>"}}"""
 
 # --- Response Compiler SYSTEM configuration (from a0.0.7) ---
 response_compiler_system_configuration = f"""1. Honor precedence: direct user prompt > USER specific configuration > DOMAIN specific configuration > SYSTEM defaults.
@@ -1485,9 +1443,9 @@ def query():
         exec_time = time.time() - t0
         return jsonify({
             "session_id": session_id,
-            "response": final_content,        # HTML
-            "chart_url": chart_url,           # dev preview
-            "diagram_kind": diagram_kind,     # "charts" | "tables"
+            "response": final_content,       # HTML
+            "chart_url": chart_url,          # dev preview
+            "diagram_kind": diagram_kind,    # "charts" | "tables"
             "diagram_gs_uri": diagram_gs_uri, # gs://...
             "diagram_signed_url": diagram_signed_url,
             "execution_time": exec_time,

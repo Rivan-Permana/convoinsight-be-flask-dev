@@ -279,7 +279,7 @@ def _signed_url(blob, filename: str, content_type: str, ttl_seconds: int) -> str
                 credentials=signing_creds,  # <-- key fix
             )
         except Exception:
-            # If IAM fails (e.g., missing permission), continue to fallback
+            # If IAM fails (e.g., missing permission or API disabled), continue to fallback
             pass
 
     # Fallback: dev local with keyfile / creds that already include a private key
@@ -384,6 +384,7 @@ def upload_dataset_file(file_storage, *, domain: str) -> dict:
     if not GCS_BUCKET:
         return _upload_dataset_file_local(file_storage, domain=domain)
 
+    # Upload to GCS (do not fail whole upload just because signed URL fails)
     try:
         safe_domain = slug(domain)
         filename = file_storage.filename
@@ -400,13 +401,19 @@ def upload_dataset_file(file_storage, *, domain: str) -> dict:
             _save_dataset_meta(domain, filename, gs_uri, size)
         except Exception:
             pass
+        # Try to make signed URL; tolerate failures
+        try:
+            signed = _signed_url(blob, filename, "text/csv", GCS_SIGNED_URL_TTL_SECONDS)
+        except Exception:
+            signed = ""
         return {
             "filename": filename,
             "gs_uri": gs_uri,
-            "signed_url": _signed_url(blob, filename, "text/csv", GCS_SIGNED_URL_TTL_SECONDS),
+            "signed_url": signed,
             "size_bytes": size,
         }
     except Exception:
+        # Only if upload to GCS itself fails, fallback to local
         return _upload_dataset_file_local(file_storage, domain=domain)
 
 def list_gcs_csvs(domain: str) -> List[storage.Blob]:
@@ -979,13 +986,20 @@ def datasets_list():
             items = _list_dataset_meta(domain=domain)
             if add_signed:
                 for it in items:
-                    gs_uri = it.get("gs_uri","")
-                    if not gs_uri: continue
-                    _, bucket_name, *rest = gs_uri.replace("gs://","").split("/")
-                    blob_name = "/".join(rest)
-                    blob = _storage_client.bucket(bucket_name).blob(blob_name)
-                    it["signed_url"] = _signed_url(blob, it["filename"], "text/csv", GCS_SIGNED_URL_TTL_SECONDS)
+                    try:
+                        gs_uri = it.get("gs_uri","")
+                        if not gs_uri:
+                            it.setdefault("signed_url","")
+                            continue
+                        _, bucket_name, *rest = gs_uri.replace("gs://","").split("/")
+                        blob_name = "/".join(rest)
+                        blob = _storage_client.bucket(bucket_name).blob(blob_name)
+                        it["signed_url"] = _signed_url(blob, it["filename"], "text/csv", GCS_SIGNED_URL_TTL_SECONDS)
+                    except Exception:
+                        # Tolerate per-item signed URL error without dropping entire list
+                        it.setdefault("signed_url","")
         except Exception:
+            # Keep items empty but don't throw; we'll still merge local files below
             items = []
 
         if domain:

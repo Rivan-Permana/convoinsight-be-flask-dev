@@ -31,9 +31,7 @@ from google.cloud import firestore
 
 # === GCP auth imports (for signed URLs on Cloud Run) ===
 import google.auth
-from google.auth import iam as google_auth_iam
 from google.auth.transport.requests import Request as GoogleAuthRequest
-from google.oauth2 import service_account as google_service_account
 
 import requests
 from cryptography.fernet import Fernet
@@ -222,10 +220,8 @@ def _gcs_bucket():
         raise RuntimeError("GCS_BUCKET is not set")
     return _storage_client.bucket(GCS_BUCKET)
 
-# === NEW: cache + helper to build a signing credential on Cloud Run ===
-_SIGNING_CREDS_CACHE = None
-
 def _metadata_sa_email() -> Optional[str]:
+    """Fetch the service account email from GCE metadata (Cloud Run)."""
     try:
         r = requests.get(
             "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/email",
@@ -238,60 +234,43 @@ def _metadata_sa_email() -> Optional[str]:
         pass
     return None
 
-def _get_signing_credentials():
-    """
-    Build credentials that can sign via IAM Credentials API (no local private key required).
-    Returns (credentials_or_None, project_id). Cached for reuse.
-    """
-    global _SIGNING_CREDS_CACHE
-    if _SIGNING_CREDS_CACHE is not None:
-        return _SIGNING_CREDS_CACHE
-
-    adc, project_id = google.auth.default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
-
-    # Determine the service account email robustly
-    sa_email = (
-        getattr(adc, "service_account_email", None)
-        or os.getenv("GOOGLE_SERVICE_ACCOUNT_EMAIL")
-        or _metadata_sa_email()
-    )
-
-    if not sa_email:
-        # Local dev with a keyfile (private key present): let library sign directly.
-        _SIGNING_CREDS_CACHE = (None, project_id)
-        return _SIGNING_CREDS_CACHE
-
-    # Create an IAM Signer backed by ADC and wrap it as service_account.Credentials
-    signer = google_auth_iam.Signer(GoogleAuthRequest(), adc, sa_email)
-    signing_credentials = google_service_account.Credentials(
-        signer=signer,
-        service_account_email=sa_email,
-        token_uri="https://oauth2.googleapis.com/token",
-    )
-    _SIGNING_CREDS_CACHE = (signing_credentials, project_id)
-    return _SIGNING_CREDS_CACHE
-
 def _signed_url(blob, filename: str, content_type: str, ttl_seconds: int) -> str:
     """
-    Generate V4 signed URL. On Cloud Run (no private key), uses IAM Credentials API.
-    Falls back to default private-key signing for local dev with keyfiles.
+    Generate V4 signed URL. On Cloud Run (no private key), delegate signing to IAM by
+    supplying a valid service_account_email + access_token. Avoid passing the literal
+    'default' as account ID (causes INVALID_ARGUMENT).
     """
-    signing_creds, _ = _get_signing_credentials()
+    credentials, _ = google.auth.default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
+    # Ensure token is fresh before reading properties
+    try:
+        credentials.refresh(GoogleAuthRequest())
+    except Exception:
+        pass
 
-    common_kwargs = dict(
+    # Determine SA email robustly (post-refresh), and avoid the 'default' placeholder
+    sa_email = getattr(credentials, "service_account_email", None)
+    if not sa_email or sa_email.lower() == "default":
+        sa_email = os.getenv("GOOGLE_SERVICE_ACCOUNT_EMAIL") or _metadata_sa_email()
+
+    if sa_email and getattr(credentials, "token", None):
+        return blob.generate_signed_url(
+            version="v4",
+            expiration=timedelta(seconds=ttl_seconds),
+            method="GET",
+            response_disposition=f'inline; filename="{filename}"',
+            response_type=content_type,
+            service_account_email=sa_email,
+            access_token=credentials.token,
+        )
+
+    # Fallback: try library default (works if a local key is present, e.g., dev with keyfile)
+    return blob.generate_signed_url(
         version="v4",
         expiration=timedelta(seconds=ttl_seconds),
         method="GET",
         response_disposition=f'inline; filename="{filename}"',
         response_type=content_type,
     )
-
-    if signing_creds is not None:
-        # Explicitly provide signing credentials (IAM Signer)
-        return blob.generate_signed_url(credentials=signing_creds, **common_kwargs)
-
-    # Fallback: use whatever credentials the library has (e.g., local keyfile with private key)
-    return blob.generate_signed_url(**common_kwargs)
 
 
 # ---- Local helpers / robust dev mode --------------
@@ -487,7 +466,7 @@ def upload_diagram_to_gcs(local_path: str, *, domain: str, session_id: str, run_
 # =========================
 
 # --- Router SYSTEM configuration (from a0.0.7) ---
-router_system_configuration = f"""Make sure all of the information below is applied.
+router_system_configuration = """Make sure all of the information below is applied.
 1. You are the Orchestration Router: decide which agents/LLMs to run for a business data prompt.
 2. Output must be STRICT one-line JSON with keys: need_manipulator, need_visualizer, need_analyzer, need_compiler, compiler_model, visual_hint, reason.
 3. Precedence & overrides: Direct user prompt > Router USER config > Router DOMAIN config > Router SYSTEM defaults.
@@ -503,13 +482,13 @@ router_system_configuration = f"""Make sure all of the information below is appl
 13. Rules of thumb: if prompt mentions allocation, optimization, plan, gap-closure, “minimum number of additional takers”, set need_analyzer=true and set visual_hint="table".
 14. If follow-up with no new data ops implied and a processed df exists, set need_manipulator=false to reuse the previous dataframe.
 15. Compiler always runs; default compiler_model="gemini/gemini-2.5-pro" unless the domain/user requires otherwise.
-16. visual_hint ∈ {"{"}bar","line","table","auto"{"}"}; pick the closest fit and prefer "table" for plan/allocation outputs.
+16. visual_hint ∈ {"bar","line","table","auto"}; pick the closest fit and prefer "table" for plan/allocation outputs.
 17. Keep the reason short (≤120 chars). No prose beyond the JSON.
 18. In short: choose the most efficient set of agents/LLMs to answer the prompt well while respecting overrides.
 19. By default, Manipulator and Analyzer should always be used in most scenario, because response compiler did not have access to the complete detailed data."""
 
 # --- Orchestrator SYSTEM configuration (updated to Polars-first) ---
-orchestrator_system_configuration = f"""1. Honor precedence: direct user prompt > USER specific configuration > DOMAIN specific configuration > SYSTEM defaults.
+orchestrator_system_configuration = """1. Honor precedence: direct user prompt > USER specific configuration > DOMAIN specific configuration > SYSTEM defaults.
 2. Think step by step.
 3. You orchestrate 3 LLM PandasAI Agents for business data analysis.
 4. The 3 agents are: Data Manipulator, Data Visualizer, Data Analyser.
@@ -527,7 +506,7 @@ orchestrator_system_configuration = f"""1. Honor precedence: direct user prompt 
 16. Each value must be a single-line string. No extra keys, no prose, no markdown/code fences."""
 
 # --- Data Manipulator SYSTEM configuration (from a0.0.7) ---
-data_manipulator_system_configuration = f"""1. Honor precedence: direct user prompt > USER specific configuration > DOMAIN specific configuration > SYSTEM defaults.
+data_manipulator_system_configuration = """1. Honor precedence: direct user prompt > USER specific configuration > DOMAIN specific configuration > SYSTEM defaults.
 2. Enforce data hygiene before analysis.
 3. Parse dates to datetime; create explicit period columns (day/week/month).
 4. Set consistent dtypes for numeric fields; strip/normalize categorical labels; standardize currency units if present.
@@ -536,11 +515,11 @@ data_manipulator_system_configuration = f"""1. Honor precedence: direct user pro
 7. Produce exactly the minimal, analysis-ready dataframe(s) needed for the user question, with stable, well-named columns.
 8. Include the percentage version of appropriate raw value columns (share-of-total where relevant).
 9. End by returning only:
-    result = {{"type":"dataframe","value": <THE_FINAL_DATAFRAME>}}
+    result = {"type":"dataframe","value": <THE_FINAL_DATAFRAME>}
 10. Honor any user-level and domain-level instructions injected below."""
 
 # --- Data Visualizer SYSTEM configuration (from a0.0.7) ---
-data_visualizer_system_configuration = f"""1. Honor precedence: direct user prompt > USER specific configuration > DOMAIN specific configuration > SYSTEM defaults.
+data_visualizer_system_configuration = """1. Honor precedence: direct user prompt > USER specific configuration > DOMAIN specific configuration > SYSTEM defaults.
 2. Produce exactly ONE interactive visualization (a Plotly diagram or a table) per request.
 3. Choose the best form based on the user's question: Plotly diagrams for trends/comparisons; Table for discrete, plan, or allocation outputs.
 4. For explicit user preference: if prompt says “plotly table” use Plotly Table.
@@ -552,18 +531,18 @@ data_visualizer_system_configuration = f"""1. Honor precedence: direct user prom
 10. Write the file exactly once using an atomic lock (.lock) to avoid duplicates across retries; write fig HTML or table HTML as appropriate.
 11. Ensure file_path is a plain Python string; do not print/return anything else.
 12. The last line of code MUST be exactly:
-    result = {{"type": "string", "value": file_path}}
+    result = {"type": "string", "value": file_path}
 13. DO NOT rely on pandas-specific styling; prefer Plotly Table when a table is needed."""
 
 # --- Data Analyzer SYSTEM configuration (from a0.0.7) ---
-data_analyzer_system_configuration = f"""1. Honor precedence: direct user prompt > USER configuration specific > DOMAIN specific configuration > SYSTEM defaults.
+data_analyzer_system_configuration = """1. Honor precedence: direct user prompt > USER configuration specific > DOMAIN specific configuration > SYSTEM defaults.
 2. Write like you’re speaking to a person; be concise and insight-driven.
 3. Quantify where possible (deltas, % contributions, time windows); reference exact columns/filters used.
 4. Return only:
-    result = {{"type":"string","value":"<3–6 crisp bullets or 2 short paragraphs of insights>"}}"""
+    result = {"type":"string","value":"<3–6 crisp bullets or 2 short paragraphs of insights>"}"""
 
 # --- Response Compiler SYSTEM configuration (from a0.0.7) ---
-response_compiler_system_configuration = f"""1. Honor precedence: direct user prompt > USER specific configuration > DOMAIN specific configuration > SYSTEM defaults.
+response_compiler_system_configuration = """1. Honor precedence: direct user prompt > USER specific configuration > DOMAIN specific configuration > SYSTEM defaults.
 2. Brevity: ≤180 words; bullets preferred; no code blocks, no JSON, no screenshots.
 3. Lead with the answer: 1–2 sentence “Bottom line” with main number, time window, and delta.
 4. Quantified drivers: top 3 with magnitude, direction, and approx contribution (absolute and % where possible).
@@ -595,10 +574,10 @@ response_compiler_system_configuration = f"""1. Honor precedence: direct user pr
 30. compiler_instruction must contain clear, step-by-step instructions to assemble the final response.
 31. The final response must be decision-ready and insight-first, not raw data.
 32. The compiler_instruction is used as the compiler LLM’s system content.
-33. Compiler user content will be: f"User Prompt:{{user_prompt}}. \nData Info:{{data_info}}. \nData Describe:{{data_describe}}. \nData Manipulator Response:{{data_manipulator_response}}. \nData Visualizer Response:{{data_visualizer_response}}. \nData Analyzer Response:{{data_analyzer_response}}".
+33. Compiler user content will be: f"User Prompt:{user_prompt}. \nData Info:{data_info}. \nData Describe:{data_describe}. \nData Manipulator Response:{data_manipulator_response}. \nData Visualizer Response:{data_visualizer_response}. \nData Analyzer Response:{data_analyzer_response}".
 34. `data_info` is a string summary of dataframe types/shape.
 35. `data_manipulator_response` is a PandasAI DataFrameResponse.
-36. `data_visualizer_response` is a file path to an HTML/PNG inside {{"type":"string","value": ...}} with a plain Python string path.
+36. `data_visualizer_response` is a file path to an HTML/PNG inside {"type":"string","value": ...} with a plain Python string path.
 37. `data_analyzer_response` is a PandasAI StringResponse.
 38. Your goal in `compiler_instruction` is to force brevity, decisions, and insights.
 39. Mention the data source of each statement.
@@ -608,7 +587,7 @@ response_compiler_system_configuration = f"""1. Honor precedence: direct user pr
 user_specific_configuration = """1. (no user-specific instructions provided yet)."""
 
 domain_specific_configuration = """1. Use period labels like m0 (current month) and m1 (prior month); apply consistently.
-2. Use IDR as currency, for example: Rp93,000.00 or Rp354,500.00.
+2. Use IDR as currency, for example: Rp93,000.00 atau Rp354,500.00.
 3. Use blue themed chart and table colors.
 4. target should be in mn (million).
 5. %TUR is take up rate percentage.
@@ -780,7 +759,7 @@ def _run_orchestrator(user_prompt: str, domain: str, data_info, data_describe, v
     try:
         spec = _safe_json_loads(content)
     except Exception:
-        spec = {"manipulator_prompt":"", "visualizer_prompt":"","analyzer_prompt":"","compiler_instruction":""}
+        spec = {"manipulator_prompt":"", "visualizer_prompt":"", "analyzer_prompt":"", "compiler_instruction":""}
     return spec
 
 

@@ -212,19 +212,59 @@ def _append_history(state: dict, role: str, content: str, max_len=10_000, keep_l
 
 
 # --- GCS helpers -----------------------------------
+
+# === FIX: resolve signing credentials if available; otherwise allow graceful fallback
+def _get_signing_credentials():
+    """
+    Prefer an explicit service account JSON via env `GCS_SIGNING_SERVICE_ACCOUNT_JSON`.
+    Otherwise try to use the storage client's credentials (may be a service account on Cloud Run).
+    Returns None if no signer available.
+    """
+    sa_json = os.getenv("GCS_SIGNING_SERVICE_ACCOUNT_JSON")
+    if sa_json:
+        try:
+            from google.oauth2 import service_account
+            info = json.loads(sa_json)
+            return service_account.Credentials.from_service_account_info(info)
+        except Exception as e:
+            print("WARN: failed to load GCS_SIGNING_SERVICE_ACCOUNT_JSON:", e)
+    try:
+        return getattr(_storage_client, "_credentials", None)
+    except Exception:
+        return None
+# === END FIX
+
 def _gcs_bucket():
     if not GCS_BUCKET:
         raise RuntimeError("GCS_BUCKET is not set")
     return _storage_client.bucket(GCS_BUCKET)
 
 def _signed_url(blob, filename: str, content_type: str, ttl_seconds: int) -> str:
-    return blob.generate_signed_url(
-        version="v4",
-        expiration=timedelta(seconds=ttl_seconds),
-        method="GET",
-        response_disposition=f'inline; filename="{filename}"',
-        response_type=content_type,
-    )
+    """
+    Try to generate a signed URL. If the environment lacks a private key signer (common on
+    user ADC or certain Compute Engine creds), fall back to public URL or empty string
+    so the request does not 500.
+    """
+    creds = _get_signing_credentials()
+    try:
+        return blob.generate_signed_url(
+            version="v4",
+            expiration=timedelta(seconds=ttl_seconds),
+            method="GET",
+            response_disposition=f'inline; filename="{filename}"',
+            response_type=content_type,
+            credentials=creds,
+        )
+    except Exception as e:
+        print("WARN: signed URL generation failed:", e)
+        # best-effort: try make public (may fail if UBLA enabled)
+        try:
+            blob.make_public()
+            return blob.public_url
+        except Exception as e2:
+            print("WARN: make_public failed:", e2)
+            # final fallback: return empty string (frontend can use public_url elsewhere)
+            return ""
 
 
 # ---- Local helpers / robust dev mode --------------
@@ -267,30 +307,25 @@ def _polars_info_string(df: pl.DataFrame) -> str:
         lines.append(f"  - {name}: {dtype} (nulls={n})")
     return "\n".join(lines)
 
-# === FIX: Robustly convert many possible return types into Polars DF ===
+# === FIX: robust conversions from PandasAI/io outputs into Polars
 def _to_polars_dataframe(obj):
     if obj is None:
         return None
-    # PandasAI response wrapper
     if isinstance(obj, DataFrameResponse):
         obj = obj.value
-    # Already polars
     if isinstance(obj, pl.DataFrame):
         return _normalize_columns_to_str(obj)
-    # pandas.DataFrame
     if isinstance(obj, pd.DataFrame):
         try:
-            df = pl.from_pandas(obj)  # preferred
+            df = pl.from_pandas(obj)
         except Exception:
             try:
                 df = pl.DataFrame(obj.to_dict(orient="records"))
             except Exception:
                 return None
         return _normalize_columns_to_str(df)
-    # {"type":"dataframe","value": ...}
     if isinstance(obj, dict) and obj.get("type") == "dataframe":
         return _to_polars_dataframe(obj.get("value"))
-    # Generic dict/list-of-records
     if isinstance(obj, dict) or isinstance(obj, list):
         try:
             df = pl.DataFrame(obj)
@@ -301,12 +336,10 @@ def _to_polars_dataframe(obj):
                 return _normalize_columns_to_str(df)
             except Exception:
                 return None
-    # Last-chance: polars convenience
     try:
         df = pl.from_dataframe(obj)
         return _normalize_columns_to_str(df)
     except Exception:
-        # Some semantic frames expose converters
         try:
             if hasattr(obj, "to_polars"):
                 df = obj.to_polars()
@@ -316,7 +349,7 @@ def _to_polars_dataframe(obj):
         except Exception:
             pass
     return None
-# === END FIX ===
+# === END FIX
 
 def _as_pai_df(df):
     """
@@ -346,7 +379,6 @@ def _read_csv_bytes_to_polars(data: bytes, sep_candidates: List[str] = (",", "|"
         except Exception as e:
             last_err = e
             continue
-    # Final attempt: let Polars infer
     try:
         df = pl.read_csv(io.BytesIO(data))
         return _normalize_columns_to_str(df)
@@ -358,7 +390,7 @@ def _read_local_csv_to_polars(path: str, sep_candidates: List[str] = (",", "|", 
         data = f.read()
     return _read_csv_bytes_to_polars(data, sep_candidates=sep_candidates)
 
-# === FIX: choose a default DF if manipulator fails ===
+# helper to pick a default df if manipulator fails
 def _pick_default_df(dfs: Dict[str, pl.DataFrame]) -> Optional[pl.DataFrame]:
     if not dfs:
         return None
@@ -368,7 +400,6 @@ def _pick_default_df(dfs: Dict[str, pl.DataFrame]) -> Optional[pl.DataFrame]:
         for d in dfs.values():
             return d
     return None
-# === END FIX ===
 
 
 # ---- Upload (GCS when possible, safe local fallback otherwise) ----------------
@@ -397,10 +428,11 @@ def upload_dataset_file(file_storage, *, domain: str) -> dict:
             _save_dataset_meta(domain, filename, gs_uri, size)
         except Exception:
             pass
+        signed = _signed_url(blob, filename, "text/csv", GCS_SIGNED_URL_TTL_SECONDS)
         return {
             "filename": filename,
             "gs_uri": gs_uri,
-            "signed_url": _signed_url(blob, filename, "text/csv", GCS_SIGNED_URL_TTL_SECONDS),
+            "signed_url": signed,
             "size_bytes": size,
         }
     except Exception:
@@ -460,10 +492,11 @@ def upload_diagram_to_gcs(local_path: str, *, domain: str, session_id: str, run_
     blob.cache_control = "public, max-age=86400"
     blob.content_type = "text/html; charset=utf-8"
     blob.upload_from_filename(local_path)
+    signed = _signed_url(blob, filename, "text/html", GCS_SIGNED_URL_TTL_SECONDS)
     return {
         "blob_name": blob_name,
         "gs_uri": f"gs://{GCS_BUCKET}/{blob_name}",
-        "signed_url": _signed_url(blob, filename, "text/html", GCS_SIGNED_URL_TTL_SECONDS),
+        "signed_url": signed,
         "public_url": f"https://storage.googleapis.com/{GCS_BUCKET}/{blob_name}",
         "kind": kind,
     }
@@ -1372,17 +1405,13 @@ def query():
                 try:
                     semantic_dfs.append(pai.DataFrame(d))
                 except TypeError:
-                    # fallback: pandas shim with string columns
                     pdf = d.to_pandas()
                     pdf.columns = [str(c) for c in pdf.columns]
                     semantic_dfs.append(pai.DataFrame(pdf))
             dm_resp = pai.chat(manipulator_prompt, *semantic_dfs)
-
-            # === FIX: try to extract DF from manipulator; else pick a default DF ===
             df_processed = _to_polars_dataframe(dm_resp)
             if df_processed is None:
                 df_processed = _pick_default_df(dfs)
-            # === END FIX ===
 
         # Visualizer
         _cancel_if_needed(session_id)
@@ -1400,7 +1429,6 @@ def query():
             data_visualizer = _as_pai_df(df_processed)
             dv_resp = data_visualizer.chat(visualizer_prompt)
 
-            # Move produced HTML to CHARTS_ROOT (local dev) + upload to GCS
             chart_path = getattr(dv_resp, "value", None)
             if isinstance(chart_path, str) and os.path.exists(chart_path):
                 out_dir = ensure_dir(os.path.join(CHARTS_ROOT, domain))

@@ -5,6 +5,7 @@ import os, io, json, time, uuid, re, html
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 from types import SimpleNamespace
+from collections import defaultdict
 
 from flask import Flask, request, jsonify, send_from_directory, send_file
 from flask_cors import CORS
@@ -13,7 +14,7 @@ from flask_cors import CORS
 import polars as pl
 import pandasai as pai
 from pandasai_litellm.litellm import LiteLLM
-from litellm import completion
+from litellm import completion, model_list as LITELLM_MODEL_LIST
 from pandasai import SmartDataframe, SmartDatalake  # kept import for compatibility, not used in new path
 from pandasai.core.response.dataframe import DataFrameResponse
 
@@ -83,6 +84,8 @@ GOOGLE_SERVICE_ACCOUNT_EMAIL = os.getenv("GOOGLE_SERVICE_ACCOUNT_EMAIL")  # opti
 FIRESTORE_COLLECTION_SESSIONS  = os.getenv("FIRESTORE_SESSIONS_COLLECTION", "convo_sessions")
 FIRESTORE_COLLECTION_DATASETS  = os.getenv("FIRESTORE_DATASETS_COLLECTION", "datasets_meta")
 FIRESTORE_COLLECTION_PROVIDERS = os.getenv("FIRESTORE_PROVIDERS_COLLECTION", "convo_providers")
+# NEW: collection for PG/Supabase connections
+FIRESTORE_COLLECTION_PG        = os.getenv("FIRESTORE_PG_COLLECTION", "pg_connections")
 
 # --- Init Flask ---
 app = Flask(__name__)
@@ -173,6 +176,42 @@ def save_provider_key(user_id: str, provider: str, encrypted_key: str, models: l
     except Exception as e:
         print("Firestore save error:", e)
         return False
+
+# --- NEW: Resolve user-selected provider/model + decrypt token (used by /query) ---
+def _compose_model_id(provider: str, model: Optional[str]) -> str:
+    """
+    Compose a litellm model id like 'gemini/gemini-2.5-pro' or 'openai/gpt-4o-mini'.
+    If model already includes '/', return as-is.
+    """
+    if model and "/" in model:
+        return model
+    prefix_map = {"google": "gemini", "gemini": "gemini", "openai": "openai", "anthropic": "anthropic", "groq": "groq"}
+    prefix = prefix_map.get((provider or "").lower(), "gemini")
+    default_model_map = {
+        "gemini": "gemini-2.5-pro",
+        "openai": "gpt-4o-mini",
+        "anthropic": "claude-3-5-sonnet-20241022",
+        "groq": "llama-3.1-70b-versatile",
+    }
+    chosen = model or default_model_map.get(prefix, "gemini-2.5-pro")
+    return f"{prefix}/{chosen}"
+
+def _get_user_provider_token(user_id: str, provider: str) -> Optional[str]:
+    """
+    Fetch encrypted token from Firestore and decrypt with Fernet.
+    Returns plaintext token or None if not found/cannot decrypt.
+    """
+    try:
+        doc_id = f"{user_id}_{provider}"
+        doc = _firestore_client.collection(FIRESTORE_COLLECTION_PROVIDERS).document(doc_id).get()
+        if not doc.exists:
+            return None
+        enc = (doc.to_dict() or {}).get("token")
+        if not enc or not fernet:
+            return None
+        return fernet.decrypt(enc.encode()).decode()
+    except Exception:
+        return None
 
 # --- Firestore-backed conversation state -----------
 def _fs_default_state():
@@ -588,7 +627,7 @@ response_compiler_system_configuration = """1. Honor precedence: direct user pro
 36. `data_visualizer_response` is a file path to an HTML/PNG inside {"type":"string","value": ...} with a plain Python string path.
 37. `data_analyzer_response` is a PandasAI StringResponse.
 38. Your goal in `compiler_instruction` is to force brevity, decisions, and insights.
-39. Mention the data source of each statement.
+39. Mention the dataset name involved of each statement.
 40. SHOULD BE STRICTLY ONLY respond in HTML format."""
 
 # --- User/Domain configs (kept) ---
@@ -660,14 +699,14 @@ def _load_domain_dataframes(domain: str, dataset_filters: Optional[set]) -> Tupl
     return dfs, data_info, data_describe
 
 # =========================
-# Router (a0.0.7)
+# Router (a0.0.7) - UPDATED: accept llm model & api_key
 # =========================
-def _run_router(user_prompt: str, data_info, data_describe, state: dict) -> dict:
+def _run_router(user_prompt: str, data_info, data_describe, state: dict, *, llm_model: str, llm_api_key: Optional[str]) -> dict:
     router_start = time.time()
     recent_context = json.dumps(state.get("history", [])[-6:], ensure_ascii=False)
 
     router_response = completion(
-        model="gemini/gemini-2.5-pro",
+        model=llm_model,
         messages=[
             {"role": "system", "content": router_system_configuration.strip()},
             {"role": "user", "content":
@@ -679,6 +718,7 @@ def _run_router(user_prompt: str, data_info, data_describe, state: dict) -> dict
             },
         ],
         seed=1, stream=False, verbosity="low", drop_params=True, reasoning_effort="high",
+        api_key=llm_api_key
     )
     router_content = get_content(router_response)
     try:
@@ -696,7 +736,7 @@ def _run_router(user_prompt: str, data_info, data_describe, state: dict) -> dict
             "need_visualizer": bool(need_visual or optimize_terms),
             "need_analyzer": bool(need_analyze or not need_visual),
             "need_compiler": True,
-            "compiler_model": "gemini/gemini-2.5-pro",
+            "compiler_model": llm_model,
             "visual_hint": visual_hint,
             "reason": "heuristic fallback",
         }
@@ -715,11 +755,11 @@ def _run_router(user_prompt: str, data_info, data_describe, state: dict) -> dict
     return plan
 
 # =========================
-# Orchestrate (a0.0.7)
+# Orchestrate (a0.0.7) - UPDATED: accept llm model & api_key
 # =========================
-def _run_orchestrator(user_prompt: str, domain: str, data_info, data_describe, visual_hint: str, context_hint: dict):
+def _run_orchestrator(user_prompt: str, domain: str, data_info, data_describe, visual_hint: str, context_hint: dict, *, llm_model: str, llm_api_key: Optional[str]):
     resp = completion(
-        model="gemini/gemini-2.5-pro",
+        model=llm_model,
         messages=[
             {"role": "system", "content": f"""
             You are the Orchestrator.
@@ -759,6 +799,7 @@ def _run_orchestrator(user_prompt: str, domain: str, data_info, data_describe, v
             }
         ],
         seed=1, stream=False, verbosity="low", drop_params=True, reasoning_effort="high",
+        api_key=llm_api_key
     )
     content = get_content(resp)
     try:
@@ -905,6 +946,114 @@ def delete_provider_key():
             return jsonify({"error": "Key not found"}), 404
         doc_ref.delete()
         return jsonify({"deleted": True})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# =============== NEW: LiteLLM full model list (grouped) =================
+def _infer_provider_from_model_id(model_id: str) -> str:
+    """Heuristic grouping for LiteLLM model IDs."""
+    low = model_id.lower()
+
+    # Path-style: take first segment
+    if "/" in low:
+        first = low.split("/")[0]
+        if first in ("gemini", "google"): return "google"
+        if first in ("openai", "anthropic", "groq", "mistral", "cohere"): return first
+        if first in ("azure", "azure_ai"): return first
+        return first
+
+    # Region-prefixed dotted forms: us.anthropic.claude-... → anthropic
+    if "." in low:
+        toks = low.split(".")
+        if toks[0] in ("us", "eu", "apac", "global") and len(toks) > 1:
+            return toks[1]
+        return toks[0]
+
+    # Heuristics by common prefixes
+    starts = lambda *pfx: any(low.startswith(p) for p in pfx)
+    if starts("gpt-", "o1", "o3", "omni-", "chatgpt-", "text-embedding", "babbage", "davinci", "whisper", "ft:", "tts-", "gpt-5"):
+        return "openai"
+    if starts("gemini", "palm", "chat-bison", "text-bison", "learnlm", "veo", "imagen", "gemma"):
+        return "google"
+    if starts("claude", "anthropic"):
+        return "anthropic"
+    if starts("groq"):
+        return "groq"
+    if starts("mistral", "codestral"):
+        return "mistral"
+    if starts("perplexity"):
+        return "perplexity"
+    if starts("cohere"):
+        return "cohere"
+    if starts("stability"):
+        return "stabilityai"
+    if starts("recraft"):
+        return "recraft"
+    if starts("replicate"):
+        return "replicate"
+    if starts("databricks"):
+        return "databricks"
+    if starts("togethercomputer"):
+        return "together"
+    if starts("anyscale"):
+        return "anyscale"
+    if starts("deepinfra"):
+        return "deepinfra"
+    if starts("openrouter"):
+        return "openrouter"
+    if starts("vercel_ai_gateway"):
+        return "vercel_ai_gateway"
+    if starts("snowflake"):
+        return "snowflake"
+    if starts("xai"):
+        return "xai"
+    if starts("voyage"):
+        return "voyage"
+    if starts("deepgram"):
+        return "deepgram"
+    if starts("dashscope"):
+        return "dashscope"
+    if starts("sambanova"):
+        return "sambanova"
+    if starts("ovhcloud"):
+        return "ovhcloud"
+    if starts("oci"):
+        return "oci"
+    if starts("cloudflare"):
+        return "cloudflare"
+    if starts("watsonx"):
+        return "watsonx"
+    if starts("amazon", "bedrock"):
+        return "amazon"
+    if "twelvelabs" in low:
+        return "twelvelabs"
+    if starts("lambda_ai"):
+        return "lambda_ai"
+    if starts("gradient_ai"):
+        return "gradient_ai"
+    if starts("friendliai"):
+        return "friendliai"
+    if starts("wandb"):
+        return "wandb"
+    if starts("meta-llama", "meta_llama", "meta.llama") or "llama" in low:
+        return "meta"
+    return "other"
+
+def _group_litellm_models():
+    groups = defaultdict(set)
+    for mid in LITELLM_MODEL_LIST:
+        prov = _infer_provider_from_model_id(mid)
+        groups[prov].add(mid)
+    return {k: sorted(list(v)) for k, v in sorted(groups.items(), key=lambda kv: kv[0])}
+
+@app.get("/litellm/models")
+def litellm_models():
+    """Return full LiteLLM model list grouped by provider."""
+    try:
+        groups = _group_litellm_models()
+        # flat count (unique models)
+        total = sum(len(v) for v in groups.values())
+        return jsonify({"count": total, "groups": groups})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -1152,7 +1301,6 @@ def compat_list_domain_datasets(domain: str):
     except Exception as e:
         return jsonify({"detail": str(e)}), 500
 
-# (Legacy path fallback if FE lama pernah manggil path typo—optional)
 @app.get("/domains/<domain>/datasets")
 def compat_list_domain_datasets_trailing(domain: str):
     return compat_list_domain_datasets(domain)
@@ -1322,6 +1470,7 @@ def suggest():
 
 # =========================
 # NEW: Query/Inferencing Endpoint (a0.0.7, Polars pipeline)
+# UPDATED: honors provider/model/userId with Firestore key decryption
 # =========================
 @app.post("/query")
 def query():
@@ -1331,6 +1480,10 @@ def query():
       - prompt (str, required)
       - session_id (str, optional)
       - dataset (str | [str], optional)
+      - provider (str, optional)          # e.g., "google"|"gemini"|"openai"|"anthropic"|"groq"
+      - model (str, optional)             # e.g., "gemini-2.5-pro", "gpt-4o-mini", ...
+      - userId (str, optional)            # used to fetch provider token from Firestore
+      - includeInsight (bool, optional)
     Returns:
       - session_id, response (HTML), diagram_* fields, timing & flags
     """
@@ -1340,6 +1493,20 @@ def query():
         domain_in  = body.get("domain")
         prompt     = body.get("prompt")
         session_id = body.get("session_id") or str(uuid.uuid4())
+
+        # NEW: provider/model/userId for multi-provider support
+        provider_in = body.get("provider") or "google"
+        model_in    = body.get("model")
+        user_id_in  = body.get("userId")
+
+        # Compose model id + API key resolution
+        chosen_model_id = _compose_model_id(provider_in, model_in)
+        chosen_api_key  = None
+        if user_id_in and provider_in:
+            chosen_api_key = _get_user_provider_token(user_id_in, provider_in)
+        # Fallback to GEMINI_API_KEY when no user token
+        if not chosen_api_key and chosen_model_id.startswith("gemini/"):
+            chosen_api_key = GEMINI_API_KEY
 
         dataset_field = body.get("dataset")
         if isinstance(dataset_field, list):
@@ -1354,8 +1521,8 @@ def query():
 
         if not domain_in or not prompt:
             return jsonify({"detail": "Missing 'domain' or 'prompt'"}), 400
-        if not GEMINI_API_KEY:
-            return jsonify({"detail": "No API key configured"}), 500
+        if not chosen_api_key:
+            return jsonify({"detail": "No API key available for the selected provider. Save a key first or send userId/provider."}), 400
 
         domain = slug(domain_in)
 
@@ -1388,12 +1555,12 @@ def query():
             return jsonify({"code":"NEED_UPLOAD", "detail": f"No CSV files found in domain '{domain}'", "domain": domain}), 409
 
         # Router
-        agent_plan = _run_router(prompt, data_info, data_describe, state)
+        agent_plan = _run_router(prompt, data_info, data_describe, state, llm_model=chosen_model_id, llm_api_key=chosen_api_key)
         need_manip = bool(agent_plan.get("need_manipulator", True))
         need_visual = bool(agent_plan.get("need_visualizer", True))
         include_insight = body.get("includeInsight", True)
         need_analyze = include_insight and bool(agent_plan.get("need_analyzer", True))
-        compiler_model = agent_plan.get("compiler_model") or "gemini/gemini-2.5-pro"
+        compiler_model = agent_plan.get("compiler_model") or chosen_model_id
         visual_hint = agent_plan.get("visual_hint", "auto")
 
         context_hint = {
@@ -1406,14 +1573,14 @@ def query():
 
         # Orchestrator
         _cancel_if_needed(session_id)
-        spec = _run_orchestrator(prompt, domain, data_info, data_describe, visual_hint, context_hint)
+        spec = _run_orchestrator(prompt, domain, data_info, data_describe, visual_hint, context_hint, llm_model=chosen_model_id, llm_api_key=chosen_api_key)
         manipulator_prompt = spec.get("manipulator_prompt", "")
         visualizer_prompt  = spec.get("visualizer_prompt", "")
         analyzer_prompt    = spec.get("analyzer_prompt", "")
         compiler_instruction = spec.get("compiler_instruction", "")
 
-        # Shared LLM
-        llm = LiteLLM(model="gemini/gemini-2.5-pro", api_key=GEMINI_API_KEY)
+        # Shared LLM (PandasAI via LiteLLM) - use chosen model & user key
+        llm = LiteLLM(model=chosen_model_id, api_key=chosen_api_key)
         pai.config.set({"llm": llm})
 
         # Manipulator (Polars-first via pai.DataFrame wrappers)
@@ -1481,11 +1648,11 @@ def query():
             da_resp = get_content(da_obj)
             state["last_analyzer_text"] = da_resp or ""
 
-        # Compiler
+        # Compiler (use chosen model & key)
         _cancel_if_needed(session_id)
         data_info_runtime = _polars_info_string(df_processed) if isinstance(df_processed, pl.DataFrame) else data_info
         final_response = completion(
-            model=compiler_model or "gemini/gemini-2.5-pro",
+            model=compiler_model or chosen_model_id,
             messages=[
                 {"role": "system", "content": compiler_instruction},
                 {"role": "user", "content":
@@ -1498,6 +1665,7 @@ def query():
                 },
             ],
             seed=1, stream=False, verbosity="medium", drop_params=True, reasoning_effort="high",
+            api_key=chosen_api_key
         )
         final_content = get_content(final_response)
 
@@ -1525,6 +1693,8 @@ def query():
             "need_visualizer": need_visual,
             "need_analyzer": need_analyze,
             "need_manipulator": need_manip,
+            "llm_model_used": chosen_model_id,
+            "provider": provider_in
         })
     except RuntimeError as rexc:
         if "CANCELLED_BY_USER" in str(rexc):
@@ -1532,6 +1702,102 @@ def query():
         return jsonify({"detail": str(rexc)}), 500
     except Exception as e:
         return jsonify({"detail": str(e)}), 500
+
+# =========================
+# NEW: Supabase/Postgre credentials management (password encrypted)
+# =========================
+@app.post("/pg/save")
+def pg_save():
+    """
+    Save Supabase/Postgres credentials (password encrypted).
+    Body JSON:
+      - userId (required)
+      - host, port, dbname, user, password (all required)
+      - name (optional; defaults to 'default')
+    """
+    try:
+        _require_fernet()
+        body = request.get_json(force=True)
+        user_id = body.get("userId")
+        host = body.get("host")
+        port = body.get("port")
+        dbname = body.get("dbname")
+        user = body.get("user")
+        password = body.get("password")
+        name = body.get("name") or "default"
+        if not all([user_id, host, port, dbname, user, password]):
+            return jsonify({"saved": False, "error": "Missing one of required fields"}), 400
+        enc_pw = fernet.encrypt(password.encode()).decode()
+        doc_id = f"{user_id}_{slug(name)}"
+        _firestore_client.collection(FIRESTORE_COLLECTION_PG).document(doc_id).set({
+            "user_id": user_id,
+            "name": name,
+            "host": host,
+            "port": str(port),
+            "dbname": dbname,
+            "user": user,
+            "password_enc": enc_pw,
+            "updated_at": firestore.SERVER_TIMESTAMP,
+            "created_at": firestore.SERVER_TIMESTAMP,
+        }, merge=True)
+        return jsonify({"saved": True, "id": doc_id})
+    except Exception as e:
+        return jsonify({"saved": False, "error": str(e)}), 500
+
+@app.get("/pg/get")
+def pg_get():
+    """
+    Get saved connection meta (password not revealed).
+    Query:
+      - userId (required)
+    """
+    try:
+        user_id = request.args.get("userId")
+        if not user_id:
+            return jsonify({"error": "Missing userId"}), 400
+        docs = (_firestore_client.collection(FIRESTORE_COLLECTION_PG)
+                .where("user_id", "==", user_id).stream())
+        items = []
+        for d in docs:
+            rec = d.to_dict() or {}
+            items.append({
+                "id": d.id,
+                "name": rec.get("name"),
+                "host": rec.get("host"),
+                "port": rec.get("port"),
+                "dbname": rec.get("dbname"),
+                "user": rec.get("user"),
+                "updated_at": str(rec.get("updated_at","")),
+            })
+        return jsonify({"items": items, "count": len(items)})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.post("/pg/test")
+def pg_test():
+    """
+    Test connectivity to Postgres using provided credentials (not persisted).
+    Body JSON: { host, port, dbname, user, password }
+    Returns 200 if connect succeeds, otherwise 400/501.
+    """
+    try:
+        body = request.get_json(force=True)
+        host = body.get("host"); port = body.get("port"); dbname = body.get("dbname")
+        user = body.get("user"); password = body.get("password")
+        if not all([host, port, dbname, user, password]):
+            return jsonify({"ok": False, "error":"Missing fields"}), 400
+        try:
+            import psycopg2  # optional dependency
+        except Exception:
+            return jsonify({"ok": False, "error": "psycopg2 not installed on server"}), 501
+        try:
+            conn = psycopg2.connect(host=host, port=port, dbname=dbname, user=user, password=password, connect_timeout=5)
+            conn.close()
+            return jsonify({"ok": True})
+        except Exception as e:
+            return jsonify({"ok": False, "error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 # --- Entry point ---------------------------------------------------------------
 if __name__ == "__main__":

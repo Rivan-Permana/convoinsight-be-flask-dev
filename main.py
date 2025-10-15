@@ -68,7 +68,7 @@ CORS_ORIGINS = os.getenv(
 ).split(",")
 
 DATASETS_ROOT = os.getenv("DATASETS_ROOT", os.path.abspath("./datasets"))
-CHARTS_ROOT   = os.path.abspath("./charts")
+CHARTS_ROOT   = os.getenv("CHARTS_ROOT",   os.path.abspath("./charts"))
 os.makedirs(DATASETS_ROOT, exist_ok=True)
 os.makedirs(CHARTS_ROOT,   exist_ok=True)
 
@@ -86,7 +86,6 @@ FIRESTORE_COLLECTION_PROVIDERS = os.getenv("FIRESTORE_PROVIDERS_COLLECTION", "co
 FIRESTORE_COLLECTION_PG        = os.getenv("FIRESTORE_PG_COLLECTION", "pg_connections")  # new
 
 # --- PostgreSQL (transaction pooler) ---
-# Users may POST /pg/save to store their connection in Firestore; we connect with NullPool + sslmode=require
 from sqlalchemy import create_engine, inspect
 from sqlalchemy.pool import NullPool
 PG_SSLMODE = "require"  # a0.0.8
@@ -380,7 +379,6 @@ def _sniff_csv_separator_text(sample: str, default: str = "|") -> str:
         return default
 
 def _read_csv_bytes_to_polars(data: bytes, sep_candidates: List[str] = (",","|",";","\t")) -> pl.DataFrame:
-    # Try candidate list quickly; if all fail, let Polars auto-detect
     last_err = None
     for sep in sep_candidates:
         try:
@@ -452,7 +450,6 @@ def upload_dataset_file(file_storage, *, domain: str) -> dict:
         blob_name = f"{GCS_DATASETS_PREFIX}/{safe_domain}/{filename}"
         bucket = _gcs_bucket()
         blob = bucket.blob(blob_name)
-        # content-type best effort
         content_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" if _is_excel_file(filename) else "text/csv"
         blob.cache_control = "private, max-age=0"
         blob.content_type = content_type
@@ -460,30 +457,22 @@ def upload_dataset_file(file_storage, *, domain: str) -> dict:
         blob.upload_from_file(file_storage.stream, rewind=True, size=None, content_type=content_type)
         size = blob.size or 0
         gs_uri = f"gs://{GCS_BUCKET}/{blob_name}"
-
-        # Signed URL (best effort)
         try:
             signed = _signed_url(blob, filename, content_type, GCS_SIGNED_URL_TTL_SECONDS)
         except Exception:
             signed = ""
-
-        # Save meta
         try:
             _save_dataset_meta(domain, filename, gs_uri, size)
         except Exception:
             pass
-
         return {"filename": filename, "gs_uri": gs_uri, "signed_url": signed, "size_bytes": size}
     except Exception:
-        # fallback local
         return _upload_dataset_file_local(file_storage, domain=domain)
 
 def list_gcs_csvs(domain: str) -> List[storage.Blob]:
-    # kept for compatibility with older callers
     return [b for b in list_gcs_tabular(domain) if b.name.lower().endswith(".csv")]
 
 def read_gcs_csv_to_pl_df(gs_uri_or_blobname: str) -> pl.DataFrame:
-    # kept for compatibility with older callers
     if gs_uri_or_blobname.startswith("gs://"):
         _, bucket_name, *rest = gs_uri_or_blobname.replace("gs://","").split("/")
         blob_name = "/".join(rest)
@@ -824,7 +813,6 @@ def _run_router(user_prompt: str, data_info, data_describe, state: dict, *, llm_
     try:
         plan = _safe_json_loads(router_content)
     except Exception:
-        # minimal heuristic fallback
         p = user_prompt.lower()
         need_visual = bool(re.search(r"\b(chart|plot|graph|visual|bar|line|table)\b", p))
         need_analyzer = bool(re.search(r"\b(why|driver|explain|root cause|trend|surprise|allocate|allocation|optimi[sz]e|min(?:imum)? number|gap closure|takers?)\b", p))
@@ -931,7 +919,6 @@ def validate_key():
         cfg = get_provider_config(provider, api_key)
         res = requests.get(cfg["url"], headers=cfg["headers"], timeout=6)
         if res.status_code == 200:
-            # best-effort model names extraction (varies per provider)
             try:
                 models_json = res.json()
                 if isinstance(models_json, dict) and "data" in models_json:
@@ -990,31 +977,6 @@ def upload_datasets(domain: str):
     except Exception as e:
         return jsonify({"detail": str(e)}), 500
 
-# NEW: Backward-compatible endpoint for clients posting to /datasets/upload
-@app.post("/datasets/upload")
-def upload_datasets_compat():
-    """
-    Compatibility shim for older clients that POST to /datasets/upload.
-    Domain is taken from ?domain=..., form field 'domain', JSON body 'domain', or 'X-Domain' header. Defaults to 'default'.
-    """
-    try:
-        domain = (
-            request.args.get("domain")
-            or request.form.get("domain")
-            or ((request.get_json() or {}).get("domain") if request.is_json else None)
-            or request.headers.get("X-Domain")
-            or "default"
-        )
-        items = []
-        if not request.files:
-            return jsonify({"detail": "No files found in request. Send multipart/form-data with at least one file field."}), 400
-        for _, file in request.files.items():
-            meta = upload_dataset_file(file, domain=domain)
-            items.append(meta)
-        return jsonify({"items": items, "domain": slug(domain)})
-    except Exception as e:
-        return jsonify({"detail": str(e)}), 500
-
 @app.get("/domains/<domain>/datasets")
 def list_domain_datasets(domain: str):
     try:
@@ -1030,7 +992,6 @@ def list_domain_datasets(domain: str):
                         _, bucket_name, *rest = gs_uri.replace("gs://","").split("/")
                         blob_name = "/".join(rest)
                         blob = _storage_client.bucket(bucket_name).blob(blob_name)
-                        # pick a content type based on ext
                         fn = it.get("filename","")
                         ctype = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" if _is_excel_file(fn) else "text/csv"
                         it["signed_url"] = _signed_url(blob, fn, ctype, GCS_SIGNED_URL_TTL_SECONDS)
@@ -1057,10 +1018,54 @@ def list_domain_datasets(domain: str):
     except Exception as e:
         return jsonify({"detail": str(e)}), 500
 
-# Backward-compat duplicate
+# Backward-compat duplicate (existing)
 @app.get("/domains/<domain>/datasets/")
 def list_domain_datasets_trailing(domain: str):
     return list_domain_datasets(domain)
+
+# ---------- Compat route aliases (to avoid 404 from frontend) ----------
+# 1) GET /datasets?domain=Campaign:1
+@app.get("/datasets")
+def list_datasets_qs():
+    domain = request.args.get("domain")
+    if not domain:
+        return jsonify({"detail": "Missing query param 'domain'"}), 400
+    return list_domain_datasets(domain)
+
+# 2) GET /datasets/<domain>
+@app.get("/datasets/<path:domain>")
+def list_datasets_path(domain):
+    return list_domain_datasets(domain)
+
+# 3) GET /domains/datasets?domain=Campaign:1
+@app.get("/domains/datasets")
+def list_datasets_domains_qs():
+    domain = request.args.get("domain")
+    if not domain:
+        return jsonify({"detail": "Missing query param 'domain'"}), 400
+    return list_domain_datasets(domain)
+
+# 4) POST /datasets/upload?domain=Campaign:1
+@app.post("/datasets/upload")
+def upload_datasets_qs():
+    domain = request.args.get("domain")
+    if not domain:
+        return jsonify({"detail": "Missing query param 'domain'"}), 400
+    return upload_datasets(domain)
+
+# 5) POST /datasets/<domain>/upload
+@app.post("/datasets/<path:domain>/upload")
+def upload_datasets_path(domain):
+    return upload_datasets(domain)
+
+# 6) POST /domains/datasets/upload?domain=Campaign:1
+@app.post("/domains/datasets/upload")
+def upload_datasets_domains_qs():
+    domain = request.args.get("domain")
+    if not domain:
+        return jsonify({"detail": "Missing query param 'domain'"}), 400
+    return upload_datasets(domain)
+# ----------------------------------------------------------------------
 
 # =========================
 # Sessions / History / Export
@@ -1254,7 +1259,6 @@ def query():
         # Load dataframes
         dfs, data_info, data_describe = _load_domain_dataframes(domain, dataset_filters)
         if not dfs:
-            # Offer available names (GCS + local) to help client UX
             available = []
             if GCS_BUCKET:
                 try:
@@ -1269,17 +1273,14 @@ def query():
                 pass
             return jsonify({"code":"NEED_UPLOAD", "detail": f"No datasets found in domain '{domain}'", "domain": domain, "available": available}), 409
 
-        # Filter validation
         if dataset_filters:
             missing = dataset_filters.difference(set(dfs.keys()))
             if missing:
                 available = sorted(list(dfs.keys()))
                 return jsonify({"code":"DATASET_NOT_FOUND", "detail": f"Requested datasets {sorted(list(missing))} not found in domain '{domain}'.", "domain": domain, "available": available}), 404
 
-        # Conversation state
         state = _get_conv_state(session_id)
 
-        # Router
         agent_plan = _run_router(prompt, data_info, data_describe, state, llm_model=chosen_model_id, llm_api_key=chosen_api_key)
         need_manip = bool(agent_plan.get("need_manipulator", True))
         need_visual = bool(agent_plan.get("need_visualizer", True))
@@ -1296,7 +1297,6 @@ def query():
             "dataset_filter": (sorted(datasets) if datasets else "ALL"),
         }
 
-        # Orchestrator
         _cancel_if_needed(session_id)
         spec = _run_orchestrator(prompt, domain, data_info, data_describe, visual_hint, context_hint, llm_model=chosen_model_id, llm_api_key=chosen_api_key)
         manipulator_prompt = spec.get("manipulator_prompt", "")
@@ -1304,7 +1304,6 @@ def query():
         analyzer_prompt    = spec.get("analyzer_prompt", "")
         compiler_instruction = spec.get("compiler_instruction", "")
 
-        # Optional plan explainer for UX
         thinking = ""
         if want_thinking:
             pe = completion(
@@ -1324,11 +1323,9 @@ def query():
             )
             thinking = re.sub(r"\s+"," ", get_content(pe) or "").strip()
 
-        # Shared LLM for PandasAI agents
         llm = LiteLLM(model=chosen_model_id, api_key=chosen_api_key)
         pai.config.set({"llm": llm, "seed": 1, "stream": False, "verbosity": "low", "drop_params": True, "save_charts": False, "open_charts": False, "conversational": False, "enforce_privacy": True, "reasoning_effort": "high", "save_charts_path": "./charts"})
 
-        # Manipulator (Polars-first)
         _cancel_if_needed(session_id)
         df_processed = None
         dm_resp = None
@@ -1345,7 +1342,6 @@ def query():
             val = getattr(dm_resp, "value", dm_resp)
             df_processed = _to_polars_dataframe(val)
 
-        # Visualizer
         _cancel_if_needed(session_id)
         dv_resp = SimpleNamespace(value="")
         diagram_signed_url = None
@@ -1359,12 +1355,10 @@ def query():
             semantic_df = _as_pai_df(df_processed)
             dv_resp = semantic_df.chat(visualizer_prompt)
 
-            # The visualizer may return .save(...) or {"type":"string","value":"<path>"}
             local_path = ""
             try:
                 export_dir = "./charts"; os.makedirs(export_dir, exist_ok=True)
                 if hasattr(dv_resp, "save"):
-                    # image fallback (png)
                     img_path = os.path.join(export_dir, f"viz_{int(time.time())}.png")
                     dv_resp.save(img_path)
                     local_path = img_path
@@ -1382,7 +1376,6 @@ def query():
                 state["last_visual_gcs_path"] = up["gs_uri"]
                 state["last_visual_kind"] = up["kind"]
 
-        # Analyzer
         _cancel_if_needed(session_id)
         pai.config.set({"llm": llm, "conversational": True, "enforce_privacy": False})
         da_resp_text = ""
@@ -1393,7 +1386,6 @@ def query():
             da_resp_text = str(da_resp)
             state["last_analyzer_text"] = da_resp_text or ""
 
-        # Compiler (strict HTML)
         final_content = ""
         if need_compile:
             if isinstance(df_processed, pl.DataFrame):
@@ -1423,7 +1415,6 @@ def query():
         else:
             final_content = _force_strict_html("<div><p>Compiler skipped by router decision.</p></div>")
 
-        # Persist & respond
         _append_history(state, "user", prompt)
         _append_history(state, "assistant", final_content[:600])
         state["last_plan"] = agent_plan

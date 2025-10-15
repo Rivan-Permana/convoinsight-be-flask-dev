@@ -1197,6 +1197,136 @@ def datasets_list():
     except Exception as e:
         return jsonify({"detail": str(e)}), 500
 
+# ✅ NEW: Return all datasets for a given domain (path-based)
+@app.get("/datasets/<domain>/all")
+def datasets_list_all(domain):
+    """
+    List all datasets within a given domain (Firestore + GCS + Local fallback).
+    Returns:
+      {
+        "items": [ { domain, filename, gs_uri, size_bytes, signed_url } ],
+        "datasets": same_as_items
+      }
+    """
+    try:
+        add_signed = request.args.get("signed", "false").lower() in ("1", "true", "yes")
+        items = []
+
+        # 1️⃣ Firestore metadata
+        try:
+            items = _list_dataset_meta(domain=domain)
+            if add_signed:
+                for it in items:
+                    try:
+                        gs_uri = it.get("gs_uri", "")
+                        if not gs_uri:
+                            it.setdefault("signed_url", "")
+                            continue
+                        _, bucket_name, *rest = gs_uri.replace("gs://", "").split("/")
+                        blob_name = "/".join(rest)
+                        blob = _storage_client.bucket(bucket_name).blob(blob_name)
+                        it["signed_url"] = _signed_url(
+                            blob, it["filename"], "text/csv", GCS_SIGNED_URL_TTL_SECONDS
+                        )
+                    except Exception:
+                        it.setdefault("signed_url", "")
+        except Exception:
+            items = []
+
+        # 2️⃣ Fallback: read directly from GCS if Firestore miss
+        try:
+            if GCS_BUCKET:
+                known = {(i.get("domain"), i.get("filename")) for i in items}
+                for b in list_gcs_csvs(domain):
+                    fname = os.path.basename(b.name)
+                    key = (slug(domain), fname)
+                    if key in known:
+                        continue
+                    rec = {
+                        "domain": slug(domain),
+                        "filename": fname,
+                        "gs_uri": f"gs://{GCS_BUCKET}/{b.name}",
+                        "size_bytes": b.size or 0,
+                        "signed_url": "",
+                    }
+                    if add_signed:
+                        try:
+                            rec["signed_url"] = _signed_url(
+                                b, fname, "text/csv", GCS_SIGNED_URL_TTL_SECONDS
+                            )
+                        except Exception:
+                            pass
+                    items.append(rec)
+        except Exception:
+            pass
+
+        # 3️⃣ Local fallback
+        domain_dir = os.path.join(DATASETS_ROOT, slug(domain))
+        if os.path.isdir(domain_dir):
+            known = {(i.get("domain"), i.get("filename")) for i in items}
+            for name in sorted(os.listdir(domain_dir)):
+                if name.lower().endswith(".csv") and (slug(domain), name) not in known:
+                    path = os.path.join(domain_dir, name)
+                    size = os.path.getsize(path)
+                    items.append({
+                        "domain": slug(domain),
+                        "filename": name,
+                        "gs_uri": "",
+                        "size_bytes": size,
+                        "signed_url": "",
+                    })
+
+        return jsonify({"items": items, "datasets": items})
+    except Exception as e:
+        return jsonify({"detail": str(e)}), 500
+
+@app.delete("/datasets/<domain>/all")
+def datasets_delete_all(domain):
+    """
+    Delete ALL datasets under a given domain (from GCS, Firestore, and local fallback).
+    Returns: { deleted: [filename1, filename2, ...] }
+    """
+    deleted = []
+    try:
+        safe_domain = slug(domain)
+
+        # 1️⃣ GCS delete
+        try:
+            if GCS_BUCKET:
+                blobs = list_gcs_csvs(safe_domain)
+                for b in blobs:
+                    if not b.name.lower().endswith(".csv"):
+                        continue
+                    fname = os.path.basename(b.name)
+                    try:
+                        b.delete()
+                        deleted.append(fname)
+                        try:
+                            _delete_dataset_meta(safe_domain, fname)
+                        except Exception:
+                            pass
+                    except Exception as e:
+                        print(f"[WARN] Failed to delete {b.name} from GCS:", e)
+        except Exception as e:
+            print("GCS deletion skipped:", e)
+
+        # 2️⃣ Local fallback delete
+        local_dir = os.path.join(DATASETS_ROOT, safe_domain)
+        if os.path.isdir(local_dir):
+            for name in sorted(os.listdir(local_dir)):
+                if not name.lower().endswith(".csv"):
+                    continue
+                path = os.path.join(local_dir, name)
+                try:
+                    os.remove(path)
+                    deleted.append(name)
+                except Exception as e:
+                    print(f"[WARN] Failed to delete {name} from local:", e)
+
+        return jsonify({"deleted": deleted, "count": len(deleted)})
+    except Exception as e:
+        return jsonify({"detail": str(e)}), 500
+
 @app.get("/datasets/<domain>/<path:filename>")
 def datasets_read(domain, filename):
     try:

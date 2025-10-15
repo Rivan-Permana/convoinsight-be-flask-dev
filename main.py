@@ -65,7 +65,7 @@ fernet = Fernet(FERNET_KEY.encode()) if FERNET_KEY else None
 
 CORS_ORIGINS = os.getenv(
     "CORS_ORIGINS",
-    "http://localhost:5173,http://127.0.0.1:5173,https://convoinsight.vercel.app"
+    "http://127.0.0.1:5500,http://localhost:5500,http://localhost:5173,http://127.0.0.1:5173,https://convoinsight.vercel.app"
 ).split(",")
 
 DATASETS_ROOT = os.getenv("DATASETS_ROOT", os.path.abspath("./datasets"))
@@ -460,114 +460,6 @@ def list_gcs_csvs(domain: str) -> List[storage.Blob]:
     prefix = f"{GCS_DATASETS_PREFIX}/{safe_domain}/"
     return list(_gcs_bucket().list_blobs(prefix=prefix))
 
-
-# ---- Universal tabular readers (CSV with multi-separator; Excel) ----
-def _sniff_separator(sample_bytes: bytes, candidates=(",", "|", ";", "\t")) -> str:
-    head = sample_bytes[:4096].decode("utf-8", errors="ignore")
-    counts = {sep: head.count(sep if sep != "\t" else "\t") for sep in candidates}
-    # prefer '|' when tied to avoid commas in text columns dominating
-    return max(counts, key=lambda k: (counts[k], 1 if k == "|" else 0))
-
-def _read_csv_bytes_to_polars(data: bytes, sep_candidates=(",", "|", ";", "\t")):
-    import io, polars as pl
-    sep = _sniff_separator(data, sep_candidates)
-    return pl.read_csv(io.BytesIO(data), separator=sep, infer_schema_length=1000, ignore_errors=True)
-
-def _read_excel_bytes_to_polars(data: bytes):
-    # polars.read_excel exists but not always available; safely fallback to pandas then convert
-    import io, polars as pl
-    try:
-        return pl.read_excel(io.BytesIO(data))
-    except Exception:
-        import pandas as pd
-        xls = pd.read_excel(io.BytesIO(data))
-        if hasattr(xls, "columns"):
-            xls.columns = [str(c) for c in xls.columns]
-        return pl.from_pandas(xls)
-
-def read_gcs_any_tabular_to_pl_df(gs_uri_or_blobname: str) -> tuple[str, "pl.DataFrame"]:
-    """Return (detected_ext, df) where ext is '.csv'|'.xlsx'|'.xls'"""
-    if gs_uri_or_blobname.startswith("gs://"):
-        _, bucket_name, *rest = gs_uri_or_blobname.replace("gs://","").split("/")
-        blob_name = "/".join(rest)
-        bucket = _storage_client.bucket(bucket_name)
-    else:
-        bucket = _gcs_bucket()
-        blob_name = gs_uri_or_blobname
-    blob = bucket.blob(blob_name)
-    data = blob.download_as_bytes()
-    name = blob_name.lower()
-    if name.endswith(".csv"):
-        return ".csv", _read_csv_bytes_to_polars(data)
-    if name.endswith(".xlsx") or name.endswith(".xls"):
-        return ".xlsx", _read_excel_bytes_to_polars(data)
-    # default: try CSV
-    return ".csv", _read_csv_bytes_to_polars(data)
-
-def _read_local_any_tabular(path: str):
-    import polars as pl, pandas as pd
-    lower = path.lower()
-    if lower.endswith(".csv"):
-        with open(path, "rb") as f:
-            data = f.read()
-        return _read_csv_bytes_to_polars(data)
-    if lower.endswith(".xlsx") or lower.endswith(".xls"):
-        try:
-            return pl.read_excel(path)
-        except Exception:
-            pdf = pd.read_excel(path)
-            if hasattr(pdf, "columns"):
-                pdf.columns = [str(c) for c in pdf.columns]
-            return pl.from_pandas(pdf)
-    # unknown -> try CSV
-    with open(path, "rb") as f:
-        data = f.read()
-    return _read_csv_bytes_to_polars(data)
-
-# ---- Postgres loaders (NullPool + sslmode=require) ----
-def _build_pg_engine_url(host: str, port: str|int, dbname: str, user: str, password: str, sslmode: str = "require") -> str:
-    return f"postgresql+psycopg2://{user}:{password}@{host}:{port}/{dbname}?sslmode={sslmode}"
-
-def _resolve_pg_secret_doc(user_id: str, name: str = "default") -> dict|None:
-    try:
-        doc_id = f"{user_id}_{slug(name)}"
-        doc_ref = _firestore_client.collection(FIRESTORE_COLLECTION_PG).document(doc_id).get()
-        if not doc_ref.exists:
-            return None
-        rec = doc_ref.to_dict() or {}
-        return rec
-    except Exception:
-        return None
-
-def _pg_load_into_dfs(engine_url: str, *, tables: list[str]|None=None, schema: str="public", limit: int|None=None, key_prefix: str="pg") -> tuple[dict, dict]:
-    """Return (dfs_additions, data_info_additions) loaded from PG."""
-    from sqlalchemy import create_engine, inspect
-    from sqlalchemy.pool import NullPool
-    import polars as pl, pandas as pd
-    dfs_add = {}; info_add = {}
-    engine = create_engine(engine_url, poolclass=NullPool, connect_args={"sslmode":"require"})
-    with engine.connect() as conn:
-        insp = inspect(conn)
-        available = set(insp.get_table_names(schema=schema))
-        target = tables or sorted(list(available))
-        for t in target:
-            if t not in available:
-                continue
-            q = f'SELECT * FROM "{schema}"."{t}"'
-            if limit is not None:
-                q += f" LIMIT {int(limit)}"
-            try:
-                df = pl.read_database(q, conn)  # native if supported
-            except Exception:
-                import pandas as pd
-                pdf = pd.read_sql(q, conn)
-                df = pl.from_pandas(pdf)
-            key = f"{key_prefix}:{schema}.{t}"
-            # normalize cols to str
-            df = df.rename({c: str(c) for c in df.columns})
-            dfs_add[key] = df
-            info_add[key] = _polars_info_string(df)
-    return dfs_add, info_add
 def read_gcs_csv_to_pl_df(gs_uri_or_blobname: str, *, sep_candidates: List[str] = (",","|",";","\t")) -> pl.DataFrame:
     if gs_uri_or_blobname.startswith("gs://"):
         _, bucket_name, *rest = gs_uri_or_blobname.replace("gs://","").split("/")
@@ -628,7 +520,7 @@ def upload_diagram_to_gcs(local_path: str, *, domain: str, session_id: str, run_
 # =========================
 router_system_configuration = """Make sure all of the information below is applied.
 1. You are the Orchestration Router: decide which agents/LLMs to run for a business data prompt.
-2. Output must be STRICT one-line JSON with keys: need_manipulator, need_visualizer, need_analyzer, need_compiler, need_plan_explainer, compiler_model, visual_hint, reason.
+2. Output must be STRICT one-line JSON with keys: need_manipulator, need_visualizer, need_analyzer, need_compiler, compiler_model, visual_hint, reason.
 3. Precedence & overrides: Direct user prompt > Router USER config > Router DOMAIN config > Router SYSTEM defaults.
 4. Flexibility: treat system defaults as fallbacks (e.g., default colors, currency, timezone). If the user or domain requests a different value, obey that without changing core routing logic.
 5. Use recent conversation context when deciding (short follow-ups may reuse prior data/visual).
@@ -755,43 +647,36 @@ domain_specific_configuration = """1. Use period labels like m0 (current month) 
 # =========================
 # Shared Data Loading (Polars-first)
 # =========================
-
 def _load_domain_dataframes(domain: str, dataset_filters: Optional[set]) -> Tuple[Dict[str, pl.DataFrame], Dict[str, str], Dict[str, str]]:
     dfs: Dict[str, pl.DataFrame] = {}
     data_info: Dict[str, str] = {}
     data_describe: Dict[str, str] = {}
 
-    # --- GCS (CSV + Excel) ---
+    # GCS first
     try:
         if GCS_BUCKET:
-            prefix = f"{GCS_DATASETS_PREFIX}/{slug(domain)}/"
-            for b in list_gcs_files(prefix):
-                name_lower = b.name.lower()
-                if not (name_lower.endswith(".csv") or name_lower.endswith(".xlsx") or name_lower.endswith(".xls")):
+            for b in list_gcs_csvs(domain):
+                if not b.name.lower().endswith(".csv"):
                     continue
                 key = os.path.basename(b.name)
                 if dataset_filters and key not in dataset_filters:
                     continue
+                df = read_gcs_csv_to_pl_df(b.name)
+                dfs[key] = df
+                info_str = _polars_info_string(df)
+                data_info[key] = info_str
                 try:
-                    _, df = read_gcs_any_tabular_to_pl_df(b.name)
-                    dfs[key] = df
-                    info_str = _polars_info_string(df)
-                    data_info[key] = info_str
-                    try:
-                        desc_df = df.describe()
-                        data_describe[key] = desc_df.to_pandas().to_json()
-                    except Exception:
-                        data_describe[key] = ""
+                    desc_df = df.describe()
+                    data_describe[key] = desc_df.to_pandas().to_json()
                 except Exception:
-                    pass
+                    data_describe[key] = ""
     except Exception:
         pass
 
-    # --- Local (CSV + Excel) ---
+    # Local fallback
     domain_dir = ensure_dir(os.path.join(DATASETS_ROOT, slug(domain)))
     for name in sorted(os.listdir(domain_dir)):
-        name_lower = name.lower()
-        if not (name_lower.endswith(".csv") or name_lower.endswith(".xlsx") or name_lower.endswith(".xls")):
+        if not name.lower().endswith(".csv"):
             continue
         if dataset_filters and name not in dataset_filters:
             continue
@@ -799,7 +684,7 @@ def _load_domain_dataframes(domain: str, dataset_filters: Optional[set]) -> Tupl
             continue
         path = os.path.join(domain_dir, name)
         try:
-            df = _read_local_any_tabular(path)
+            df = _read_local_csv_to_polars(path)
             dfs[name] = df
             info_str = _polars_info_string(df)
             data_info[name] = info_str
@@ -1509,7 +1394,6 @@ def query_cancel():
     try:
         body = request.get_json(force=True) if request.data else {}
         session_id = body.get("session_id")
-        plan_explainer_text = ""
         if not session_id:
             return jsonify({"detail":"Missing 'session_id'"}), 400
         _CANCEL_FLAGS.add(session_id)
@@ -1524,7 +1408,6 @@ def query_cancel():
 def suggest():
     """
     Body (JSON):
-      - pg (object, optional)            # { connectionName, userId, tables[], schema, limit, sql }
       - domain (str, required)
       - dataset (str | [str], optional)
     Returns:
@@ -1552,55 +1435,6 @@ def suggest():
             dataset_filters = None
 
         dfs, data_info, data_describe = _load_domain_dataframes(domain, dataset_filters)
-        # Optional: load Postgres sources (multi-source dataset)
-        pg_spec = body.get("pg") or {}
-        try:
-            if isinstance(pg_spec, dict) and (pg_spec.get("tables") or pg_spec.get("sql")):
-                pg_user_id = pg_spec.get("userId") or user_id_in
-                pg_name    = pg_spec.get("connectionName") or "default"
-                if pg_user_id:
-                    secret = _resolve_pg_secret_doc(pg_user_id, pg_name)
-                else:
-                    secret = None
-                if secret:
-                    dec_pw = fernet.decrypt(secret.get("password_enc","").encode()).decode() if fernet else None
-                    if not dec_pw:
-                        raise RuntimeError("No PG password stored.")
-                    engine_url = _build_pg_engine_url(secret.get("host",""), secret.get("port",""), secret.get("dbname",""), secret.get("user",""), dec_pw, sslmode="require")
-                    if pg_spec.get("sql"):
-                        # one-off query result
-                        from sqlalchemy import create_engine
-                        from sqlalchemy.pool import NullPool
-                        import polars as pl, pandas as pd
-                        engine = create_engine(engine_url, poolclass=NullPool, connect_args={"sslmode":"require"})
-                        with engine.connect() as conn:
-                            try:
-                                dfq = pl.read_database(pg_spec["sql"], conn)
-                            except Exception:
-                                import pandas as pd
-                                pdf = pd.read_sql(pg_spec["sql"], conn)
-                                dfq = pl.from_pandas(pdf)
-                        key = pg_spec.get("name") or "pg:query"
-                        dfq = dfq.rename({c: str(c) for c in dfq.columns})
-                        dfs[key] = dfq
-                        data_info[key] = _polars_info_string(dfq)
-                        try:
-                            data_describe[key] = dfq.describe().to_pandas().to_json()
-                        except Exception:
-                            data_describe[key] = ""
-                    if pg_spec.get("tables"):
-                        df_add, info_add = _pg_load_into_dfs(engine_url, tables=list(pg_spec.get("tables") or []), schema=pg_spec.get("schema") or "public", limit=pg_spec.get("limit"))
-                        dfs.update(df_add)
-                        data_info.update(info_add)
-                        for k, d in df_add.items():
-                            try:
-                                data_describe[k] = d.describe().to_pandas().to_json()
-                            except Exception:
-                                data_describe[k] = ""
-        except Exception as _pg_e:
-            # non-fatal
-            pass
-
 
         r = completion(
             model="gemini/gemini-2.5-pro",
@@ -1642,7 +1476,6 @@ def suggest():
 def query():
     """
     Body (JSON):
-      - pg (object, optional)            # { connectionName, userId, tables[], schema, limit, sql }
       - domain (str, required)
       - prompt (str, required)
       - session_id (str, optional)
@@ -1660,7 +1493,6 @@ def query():
         domain_in  = body.get("domain")
         prompt     = body.get("prompt")
         session_id = body.get("session_id") or str(uuid.uuid4())
-        plan_explainer_text = ""
 
         # NEW: provider/model/userId for multi-provider support
         provider_in = body.get("provider") or "google"
@@ -1701,70 +1533,8 @@ def query():
 
         _cancel_if_needed(session_id)
 
-        # optional: plan explainer per a0.0.8
-        try:
-            need_plan = True
-            # if router returns structured need_plan_explainer flag inside agent_plan
-            if isinstance(agent_plan := state.get('last_plan', agent_plan if 'agent_plan' in locals() else {}), dict):
-                if 'need_plan_explainer' in agent_plan:
-                    need_plan = bool(agent_plan.get('need_plan_explainer'))
-            if need_plan:
-                plan_explainer_text = _run_plan_explainer(agent_plan, llm_model=chosen_model_id, llm_api_key=chosen_api_key)
-        except Exception:
-            plan_explainer_text = plan_explainer_text or ''
-
-
         # load data (Polars)
         dfs, data_info, data_describe = _load_domain_dataframes(domain, dataset_filters)
-        # Optional: load Postgres sources (multi-source dataset)
-        pg_spec = body.get("pg") or {}
-        try:
-            if isinstance(pg_spec, dict) and (pg_spec.get("tables") or pg_spec.get("sql")):
-                pg_user_id = pg_spec.get("userId") or user_id_in
-                pg_name    = pg_spec.get("connectionName") or "default"
-                if pg_user_id:
-                    secret = _resolve_pg_secret_doc(pg_user_id, pg_name)
-                else:
-                    secret = None
-                if secret:
-                    dec_pw = fernet.decrypt(secret.get("password_enc","").encode()).decode() if fernet else None
-                    if not dec_pw:
-                        raise RuntimeError("No PG password stored.")
-                    engine_url = _build_pg_engine_url(secret.get("host",""), secret.get("port",""), secret.get("dbname",""), secret.get("user",""), dec_pw, sslmode="require")
-                    if pg_spec.get("sql"):
-                        # one-off query result
-                        from sqlalchemy import create_engine
-                        from sqlalchemy.pool import NullPool
-                        import polars as pl, pandas as pd
-                        engine = create_engine(engine_url, poolclass=NullPool, connect_args={"sslmode":"require"})
-                        with engine.connect() as conn:
-                            try:
-                                dfq = pl.read_database(pg_spec["sql"], conn)
-                            except Exception:
-                                import pandas as pd
-                                pdf = pd.read_sql(pg_spec["sql"], conn)
-                                dfq = pl.from_pandas(pdf)
-                        key = pg_spec.get("name") or "pg:query"
-                        dfq = dfq.rename({c: str(c) for c in dfq.columns})
-                        dfs[key] = dfq
-                        data_info[key] = _polars_info_string(dfq)
-                        try:
-                            data_describe[key] = dfq.describe().to_pandas().to_json()
-                        except Exception:
-                            data_describe[key] = ""
-                    if pg_spec.get("tables"):
-                        df_add, info_add = _pg_load_into_dfs(engine_url, tables=list(pg_spec.get("tables") or []), schema=pg_spec.get("schema") or "public", limit=pg_spec.get("limit"))
-                        dfs.update(df_add)
-                        data_info.update(info_add)
-                        for k, d in df_add.items():
-                            try:
-                                data_describe[k] = d.describe().to_pandas().to_json()
-                            except Exception:
-                                data_describe[k] = ""
-        except Exception as _pg_e:
-            # non-fatal
-            pass
-
         if not dfs:
             if dataset_filters:
                 available = []
@@ -1898,7 +1668,6 @@ def query():
             api_key=chosen_api_key
         )
         final_content = get_content(final_response)
-        final_content = _force_strict_html(final_content)
 
         # Persist summary
         _append_history(state, "assistant", {
@@ -1915,7 +1684,6 @@ def query():
         exec_time = time.time() - t0
         return jsonify({
             "session_id": session_id,
-            "thinking": plan_explainer_text,
             "response": final_content,       # HTML
             "chart_url": chart_url,          # dev preview
             "diagram_kind": diagram_kind,    # "charts" | "tables"
@@ -2036,64 +1804,3 @@ if __name__ == "__main__":
     host = os.getenv("HOST", "127.0.0.1")
     port = int(os.getenv("PORT", "8000"))
     app.run(host=host, port=port, debug=True)
-
-def _force_strict_html(s: str) -> str:
-    import re
-    if not isinstance(s, str):
-        s = str(s)
-    # strip code fences
-    s = re.sub(r"```(?:html)?\s*(.*?)```", r"\1", s, flags=re.IGNORECASE | re.DOTALL)
-    # bold/italics
-    s = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", s)
-    s = re.sub(r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)", r"<em>\1</em>", s)
-    # clean <li>
-    s = re.sub(r"<li>\s*[\*\-\u2022]\s+", "<li>", s)
-    # wrap orphan lis
-    if "<li" in s and not re.search(r"<(ul|ol)\b", s, flags=re.IGNORECASE):
-        s = re.sub(r"((?:\s*<li>.*?</li>\s*)+)", r"<ul>\1</ul>", s, flags=re.DOTALL)
-    # naive markdown -> HTML if no tags
-    has_html = bool(re.search(r"<[a-zA-Z]+(?:\s|>)", s))
-    if not has_html:
-        lines = [ln.rstrip() for ln in s.splitlines() if ln.strip()]
-        out, in_ul, in_ol = [], False, False
-        for raw in lines:
-            m_ul = re.match(r"^\s*[\-\*\u2022]\s+(.*)", raw)
-            m_ol = re.match(r"^\s*(\d+)[\.\)]\s+(.*)", raw)
-            if m_ul:
-                if in_ol:
-                    out.append("</ol>"); in_ol = False
-                if not in_ul:
-                    out.append("<ul>"); in_ul = True
-                out.append(f"<li>{m_ul.group(1).strip()}</li>"); continue
-            if m_ol:
-                if in_ul:
-                    out.append("</ul>"); in_ul = False
-                if not in_ol:
-                    out.append("<ol>"); in_ol = True
-                out.append(f"<li>{m_ol.group(2).strip()}</li>"); continue
-            if in_ul: out.append("</ul>"); in_ul = False
-            if in_ol: out.append("</ol>"); in_ol = False
-            out.append(f"<p>{raw}</p>")
-        if in_ul: out.append("</ul>")
-        if in_ol: out.append("</ol>")
-        s = "\n".join(out)
-    s = re.sub(r"<\s*/?\s*b\s*>", lambda m: "<strong>" if "/" not in m.group(0) else "</strong>", s, flags=re.IGNORECASE)
-    if not re.search(r"^\s*<(div|section|article|main|html)\b", s, flags=re.IGNORECASE):
-        s = f'<div class="ai-response">\n{s}\n</div>'
-    return s
-
-
-
-def _run_plan_explainer(agent_plan: dict, *, llm_model: str, llm_api_key: Optional[str]) -> str:
-    try:
-        resp = completion(
-            model=llm_model,
-            messages=[
-                {"role":"system","content":"You are Response Explainer. Explain the agent_plan to a business user in 2–3 concise sentences. No JSON, no code. Keep it plain and helpful."},
-                {"role":"user","content": json.dumps({"agent_plan": agent_plan}, ensure_ascii=False)}
-            ],
-            seed=1, stream=False, verbosity="low", drop_params=True, reasoning_effort="medium", api_key=llm_api_key
-        )
-        return get_content(resp).strip()
-    except Exception as e:
-        return ""

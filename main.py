@@ -68,7 +68,7 @@ CORS_ORIGINS = os.getenv(
 ).split(",")
 
 DATASETS_ROOT = os.getenv("DATASETS_ROOT", os.path.abspath("./datasets"))
-CHARTS_ROOT   = os.getenv("CHARTS_ROOT",   os.path.abspath("./charts"))
+CHARTS_ROOT   = os.path.abspath("./charts")
 os.makedirs(DATASETS_ROOT, exist_ok=True)
 os.makedirs(CHARTS_ROOT,   exist_ok=True)
 
@@ -987,6 +987,31 @@ def upload_datasets(domain: str):
             meta = upload_dataset_file(file, domain=domain)
             items.append(meta)
         return jsonify({"items": items})
+    except Exception as e:
+        return jsonify({"detail": str(e)}), 500
+
+# NEW: Backward-compatible endpoint for clients posting to /datasets/upload
+@app.post("/datasets/upload")
+def upload_datasets_compat():
+    """
+    Compatibility shim for older clients that POST to /datasets/upload.
+    Domain is taken from ?domain=..., form field 'domain', JSON body 'domain', or 'X-Domain' header. Defaults to 'default'.
+    """
+    try:
+        domain = (
+            request.args.get("domain")
+            or request.form.get("domain")
+            or ((request.get_json() or {}).get("domain") if request.is_json else None)
+            or request.headers.get("X-Domain")
+            or "default"
+        )
+        items = []
+        if not request.files:
+            return jsonify({"detail": "No files found in request. Send multipart/form-data with at least one file field."}), 400
+        for _, file in request.files.items():
+            meta = upload_dataset_file(file, domain=domain)
+            items.append(meta)
+        return jsonify({"items": items, "domain": slug(domain)})
     except Exception as e:
         return jsonify({"detail": str(e)}), 500
 

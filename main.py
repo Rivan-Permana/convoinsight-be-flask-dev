@@ -1253,7 +1253,7 @@ def litellm_models():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-@app.get("/litellm/providers")
+@app.route("/litellm/providers", methods=["GET"])
 def litellm_providers():
     """
     Return sorted unique provider names from litellm.provider_list.

@@ -1,7 +1,7 @@
 # main.py — ConvoInsight BE (Flask, Cloud Run ready)
 # Polars + PandasAI wrappers; GCS/Firestore persistence; provider keys via Firestore (encrypted)
 
-import os, io, json, time, uuid, re, html
+import os, io, json, time, uuid, re, html, csv
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 from types import SimpleNamespace
@@ -418,6 +418,43 @@ def _read_local_csv_to_polars(path: str, sep_candidates: List[str] = (",", "|", 
         data = f.read()
     return _read_csv_bytes_to_polars(data, sep_candidates=sep_candidates)
 
+
+def _is_excel_file(filename: str) -> bool:
+    return filename.lower().endswith((".xlsx", ".xls", ".xlsm"))
+
+def _read_excel_bytes_to_polars(data: bytes):
+    """
+    Read Excel bytes into Polars via a Pandas shim (compat only).
+    """
+    try:
+        import pandas as _pd  # local import to avoid hard dep
+        pdf = _pd.read_excel(io.BytesIO(data))
+        import polars as _pl
+        df = _pl.from_pandas(pdf)
+        return _normalize_columns_to_str(df)
+    except Exception as e:
+        raise e
+
+def read_gcs_tabular_to_pl_df(gs_uri_or_blobname: str, *, sep_candidates: list[str] = (",","|",";","\t")):
+    """
+    Read CSV (with delimiter sniffing) or Excel from GCS into a Polars DataFrame.
+    """
+    if gs_uri_or_blobname.startswith("gs://"):
+        _, bucket_name, *rest = gs_uri_or_blobname.replace("gs://","").split("/")
+        blob_name = "/".join(rest)
+        bucket = _storage_client.bucket(bucket_name)
+    else:
+        bucket = _gcs_bucket()
+        blob_name = gs_uri_or_blobname
+    blob = bucket.blob(blob_name)
+    data = blob.download_as_bytes()
+    low = blob_name.lower()
+    if low.endswith((".xlsx",".xls",".xlsm")):
+        return _read_excel_bytes_to_polars(data)
+    else:
+        return _read_csv_bytes_to_polars(data, sep_candidates=sep_candidates)
+
+
 # ---- Upload (GCS when possible, safe local fallback otherwise) ----------------
 def upload_dataset_file(file_storage, *, domain: str) -> dict:
     if not GCS_BUCKET:
@@ -518,10 +555,10 @@ def upload_diagram_to_gcs(local_path: str, *, domain: str, session_id: str, run_
 # =========================
 # Latest Pipeline Configs (router/orchestrator/agents)
 # =========================
-router_system_configuration = """Make sure all of the information below is applied.
+router_system_configuration = f"""Make sure all of the information below is applied.
 1. You are the Orchestration Router: decide which agents/LLMs to run for a business data prompt.
-2. Output must be STRICT one-line JSON with keys: need_manipulator, need_visualizer, need_analyzer, need_compiler, compiler_model, visual_hint, reason.
-3. Precedence & overrides: Direct user prompt > Router USER config > Router DOMAIN config > Router SYSTEM defaults.
+2. Output must be STRICT one-line JSON with keys: need_manipulator, need_visualizer, need_analyzer, need_plan_explainer, need_compiler, compiler_model, plan_explainer_model, visual_hint, reason.
+3. Precedence & overrides: Direct user prompt > Router DOMAIN config > Router USER config > Router SYSTEM defaults.
 4. Flexibility: treat system defaults as fallbacks (e.g., default colors, currency, timezone). If the user or domain requests a different value, obey that without changing core routing logic.
 5. Use recent conversation context when deciding (short follow-ups may reuse prior data/visual).
 6. Consider user phrasing to infer needs (e.g., “use bar chart” => visualizer needed).
@@ -533,13 +570,14 @@ router_system_configuration = """Make sure all of the information below is appli
 12. Rules of thumb: if prompt contains “why/driver/explain/root cause/trend/surprise” then need_analyzer=true.
 13. Rules of thumb: if prompt mentions allocation, optimization, plan, gap-closure, “minimum number of additional takers”, set need_analyzer=true and set visual_hint="table".
 14. If follow-up with no new data ops implied and a processed df exists, set need_manipulator=false to reuse the previous dataframe.
-15. Compiler always runs; default compiler_model="gemini/gemini-2.5-pro" unless the domain/user requires otherwise.
-16. visual_hint ∈ {"bar","line","table","auto"}; pick the closest fit and prefer "table" for plan/allocation outputs.
+15. Compiler always runs by default; default compiler_model="gemini/gemini-2.5-pro" unless the domain/user requires otherwise.
+16. visual_hint ∈ {"{"}bar","line","table","auto"{"}"}; pick the closest fit and prefer "table" for plan/allocation outputs.
 17. Keep the reason short (≤120 chars). No prose beyond the JSON.
 18. In short: choose the most efficient set of agents/LLMs to answer the prompt well while respecting overrides.
-19. By default, Manipulator and Analyzer should always be used in most scenario, because response compiler did not have access to the complete detailed data."""
+19. By default, Manipulator and Analyzer should always be used in most scenario, because response compiler did not have access to the complete detailed data.
+20. Plan explainer is optional; enable it for complex, multi-agent plans or first runs; default plan_explainer_model="gemini/gemini-2.5-pro"."""
 
-orchestrator_system_configuration = """1. Honor precedence: direct user prompt > USER specific configuration > DOMAIN specific configuration > SYSTEM defaults.
+orchestrator_system_configuration = f"""1. Honor precedence: direct user prompt > DOMAIN specific configuration > USER specific configuration > SYSTEM defaults.
 2. Think step by step.
 3. You orchestrate 3 LLM PandasAI Agents for business data analysis.
 4. The 3 agents are: Data Manipulator, Data Visualizer, Data Analyser.
@@ -552,23 +590,25 @@ orchestrator_system_configuration = """1. Honor precedence: direct user prompt >
 11. Convert a short business question into three specialist prompts.
 12. Use the Router Context Hint and Visualization hint when applicable.
 13. Respect the user- and domain-level configurations injected below; overrides must not alter core process.
-14. All specialists operate in Python using PandasAI Semantic DataFrames (pai.DataFrame) backed by Polars DataFrames.
+14. All specialists operate in Python using PandasAI Semantic DataFrames (`pai.DataFrame`) backed by Polars DataFrames.
 15. Return STRICT JSON with keys: manipulator_prompt, visualizer_prompt, analyzer_prompt, compiler_instruction.
 16. Each value must be a single-line string. No extra keys, no prose, no markdown/code fences."""
 
-data_manipulator_system_configuration = """1. Honor precedence: direct user prompt > USER specific configuration > DOMAIN specific configuration > SYSTEM defaults.
+# --- Data Manipulator: SYSTEM configuration (numbered + precedence explicit) ---
+data_manipulator_system_configuration = f"""1. Honor precedence: direct user prompt > DOMAIN specific configuration > USER specific configuration > SYSTEM defaults.
 2. Enforce data hygiene before analysis.
-3. Parse dates to datetime; create explicit period columns (day/week/month).
+3. Parse dates to Polars datetime; create explicit period columns (day/week/month).
 4. Set consistent dtypes for numeric fields; strip/normalize categorical labels; standardize currency units if present.
 5. Handle missing values: impute or drop only when necessary; keep legitimate zeros.
 6. Mind each dataset’s name; avoid collisions in merges/aggregations.
 7. Produce exactly the minimal, analysis-ready dataframe(s) needed for the user question, with stable, well-named columns.
 8. Include the percentage version of appropriate raw value columns (share-of-total where relevant).
 9. End by returning only:
-    result = {"type":"dataframe","value": <THE_FINAL_DATAFRAME>}
+   result = {{"type":"dataframe","value": <THE_FINAL_DATAFRAME>}}
 10. Honor any user-level and domain-level instructions injected below."""
 
-data_visualizer_system_configuration = """1. Honor precedence: direct user prompt > USER specific configuration > DOMAIN specific configuration > SYSTEM defaults.
+# --- Data Visualizer: SYSTEM configuration (numbered + precedence explicit) ---
+data_visualizer_system_configuration = f"""1. Honor precedence: direct user prompt > DOMAIN specific configuration > USER specific configuration > SYSTEM defaults.
 2. Produce exactly ONE interactive visualization (a Plotly diagram or a table) per request.
 3. Choose the best form based on the user's question: Plotly diagrams for trends/comparisons; Table for discrete, plan, or allocation outputs.
 4. For explicit user preference: if prompt says “plotly table” use Plotly Table.
@@ -576,65 +616,70 @@ data_visualizer_system_configuration = """1. Honor precedence: direct user promp
 6. For Plotly diagrams: insight-first formatting (clear title/subtitle, axis units, thousands separators, rich hover).
 7. Aggregate data to sensible granularity (day/week/month) and cap extreme outliers for readability (note in subtitle).
 8. Use bar, grouped bar, or line chart; apply a truncated monochromatic colorscale by sampling from 0.25–1.0 of a standard scale (e.g., Blues).
-9. Output Python code only (no prose/comments/markdown). Import os and datetime. Build an export dir and a run-scoped timestamped filename using globals()["_RUN_ID"].
+9. Output Python code only (no prose/comments/markdown). Import os and datetime. Build an export dir and a run-scoped timestamped filename using globals()["_RUN_ID"] as in the original template.
 10. Write the file exactly once using an atomic lock (.lock) to avoid duplicates across retries; write fig HTML or table HTML as appropriate.
 11. Ensure file_path is a plain Python string; do not print/return anything else.
 12. The last line of code MUST be exactly:
-    result = {"type": "string", "value": file_path}
+    result = {{"type": "string", "value": file_path}}
 13. DO NOT rely on pandas-specific styling; prefer Plotly Table when a table is needed."""
 
-data_analyzer_system_configuration = """1. Honor precedence: direct user prompt > USER configuration specific > DOMAIN specific configuration > SYSTEM defaults.
+# --- Data Analyzer: SYSTEM configuration (numbered + precedence explicit) ---
+data_analyzer_system_configuration = f"""1. Honor precedence: direct user prompt > DOMAIN specific configuration > USER specific configuration > SYSTEM defaults.
 2. Write like you’re speaking to a person; be concise and insight-driven.
 3. Quantify where possible (deltas, % contributions, time windows); reference exact columns/filters used.
 4. Return only:
-    result = {"type":"string","value":"<3–6 crisp bullets or 2 short paragraphs of insights>"}"""
+   result = {{"type":"string","value":"<3–6 crisp bullets or 2 short paragraphs of insights>"}}"""
 
-response_compiler_system_configuration = """1. Honor precedence: direct user prompt > USER specific configuration > DOMAIN specific configuration > SYSTEM defaults.
-2. Brevity: ≤180 words; bullets preferred; no code blocks, no JSON, no screenshots.
-3. Lead with the answer: 1–2 sentence “Bottom line” with main number, time window, and delta.
-4. Quantified drivers: top 3 with magnitude, direction, and approx contribution (absolute and % where possible).
-5. Next actions: 2–4 prioritized, concrete actions with expected impact/rationale.
-6. Confidence & caveats: one short line on data quality/assumptions/gaps; include Confidence: High/Medium/Low.
-7. Minimal tables: ≤1 table only if essential (≤5×3); otherwise avoid tables.
-8. No repetition: do not restate agent text; synthesize it.
-9. Do not try to show images; Do not mention the path of the generated file if there is one..
-10. Always include units/currency and exact comparison window (e.g., “Aug 2025 vs Jul 2025”, “W34 vs W33”).
-11. Show both absolute and % change where sensible (e.g., “+$120k (+8.4%)”).
-12. Round smartly (money to nearest K unless < $10k; rates 1–2 decimals).
-13. If any agent fails or data is incomplete, still produce the best insight; mark gaps in Caveats and adjust Confidence.
-14. If the user asks “how much/which/why,” the first sentence must provide the number/entity/reason.
-15. Exact compiler_instruction template the orchestrator should emit (single line; steps separated by ';'):
-16. Read the user prompt, data_info, and all three agent responses;
-17. Compute the direct answer including the main number and compare period;
-18. Identify the top 3 quantified drivers with direction and contribution;
-19. Draft 'Bottom line' in 1–2 sentences answering plainly;
-20. List 2–4 prioritized Next actions with expected impact;
-21. Add a one-line Caveats with Confidence and any gaps;
-22. Keep ≤180 words, use bullets, avoid tables unless ≤5×3 and essential;
-23. Include units, absolute and % deltas, and explicit dates;
-24. Do not repeat agent text verbatim or include code/JSON.
-25. Format hint (shape, not literal):
-26. Bottom line — <answer with number + timeframe>.
-27. Drivers — <A: +X (≈Y%); B: −X (≈Y%); C: ±X (≈Y%)>.
-28. Next actions — 1) <action>; 2) <action>; 3) <action>.
-29. Caveats — <one line>. Confidence: <High/Medium/Low>.
-30. compiler_instruction must contain clear, step-by-step instructions to assemble the final response.
-31. The final response must be decision-ready and insight-first, not raw data.
-32. The compiler_instruction is used as the compiler LLM’s system content.
-33. Compiler user content will be: f"User Prompt:{user_prompt}. \nData Info:{data_info}. \nData Describe:{data_describe}. \nData Manipulator Response:{data_manipulator_response}. \nData Visualizer Response:{data_visualizer_response}. \nData Analyzer Response:{data_analyzer_response}".
-34. `data_info` is a string summary of dataframe types/shape.
-35. `data_manipulator_response` is a PandasAI DataFrameResponse.
-36. `data_visualizer_response` is a file path to an HTML/PNG inside {"type":"string","value": ...} with a plain Python string path.
-37. `data_analyzer_response` is a PandasAI StringResponse.
-38. Your goal in `compiler_instruction` is to force brevity, decisions, and insights.
-39. Mention the dataset name involved of each statement.
-40. SHOULD BE STRICTLY ONLY respond in HTML format."""
+response_compiler_system_configuration = f"""1. Honor precedence: direct user prompt > DOMAIN specific configuration > USER specific configuration > SYSTEM defaults.
+2. Output MUST be valid, self-contained HTML only. Do NOT use markdown (no **, *, -, numbered lines, code fences).
+3. Brevity: ≤180 words; bullets preferred via <ul><li>…</li></ul>; no code blocks, no JSON, no screenshots.
+4. Lead with the answer: 1–2 sentence “Bottom line” with main number, time window, and delta.
+5. Quantified drivers: top 3 with magnitude, direction, and approx contribution (absolute and % where possible).
+6. Next actions: 2–4 prioritized, concrete actions with expected impact/rationale.
+7. Confidence & caveats: one short line on data quality/assumptions/gaps; include Confidence: High/Medium/Low.
+8. Minimal tables: ≤1 table only if essential (≤5×3); otherwise avoid tables.
+9. No repetition: do not restate agent text; synthesize it.
+10. Do not try to show images; Do not mention the path of the generated file if there is one.
+11. Always include units/currency and exact comparison window (e.g., “Aug 2025 vs Jul 2025”, “W34 vs W33”).
+12. Show both absolute and % change where sensible (e.g., “+Rp120m (+8.4%)”).
+13. Round smartly (money to nearest K unless < Rp10m; rates 1–2 decimals).
+14. If any agent fails or data is incomplete, still produce the best insight; mark gaps in Caveats and adjust Confidence.
+15. If the user asks “how much/which/why,” the first sentence must provide the number/entity/reason.
+16. Exact compiler_instruction template the orchestrator should emit (single line; steps separated by ';'):
+17. Read the user prompt, data_info, and all three agent responses;
+18. Compute the direct answer including the main number and compare period;
+19. Identify the top 3 quantified drivers with direction and contribution;
+20. Draft 'Bottom line' in 1–2 sentences answering plainly;
+21. List 2–4 prioritized Next actions with expected impact;
+22. Add a one-line Caveats with Confidence and any gaps;
+23. Keep ≤180 words; use only HTML tags: <div>, <p>, <strong>, <em>, <ul>, <ol>, <li>, <table>, <thead>, <tbody>, <tr>, <th>, <td>;
+24. Include units, absolute and % deltas, and explicit dates;
+25. Do not repeat agent text verbatim or include code/JSON.
+26. Format hint (shape, not literal), using HTML tags only:
+    <div>
+      <p><strong>Bottom line —</strong> …</p>
+      <p><strong>Drivers —</strong></p>
+      <ul><li>…</li><li>…</li><li>…</li></ul>
+      <p><strong>Next actions —</strong></p>
+      <ol><li>…</li><li>…</li><li>…</li></ol>
+      <p><strong>Caveats —</strong> … Confidence: …</p>
+    </div>
+27. The final response MUST be strictly HTML; never emit markdown markers like **, *, -, or code fences.
+28. The compiler_instruction is used as the compiler LLM’s system content.
+29. Compiler user content will be: f"User Prompt:{{user_prompt}}. \\nData Info:{{data_info}}. \\nData Describe:{{data_describe}}. \\nData Manipulator Response:{{data_manipulator_response}}. \\nData Visualizer Response:{{data_visualizer_response}}. \\nData Analyzer Response:{{data_analyzer_response}}".
+30. `data_info` is a string summary of dataframe types/shape.
+31. `data_manipulator_response` is a PandasAI DataFrameResponse.
+32. `data_visualizer_response` is a file path to an HTML/PNG inside {{"type":"string","value": ...}} with a plain Python string path.
+33. `data_analyzer_response` is a PandasAI StringResponse.
+34. Your goal in `compiler_instruction` is to force brevity, decisions, and insights.
+35. Mention the data source of each statement to make it more credible.
+36. STRICTLY respond in HTML only (no markdown)."""
 
 # --- User/Domain configs (kept) ---
-user_specific_configuration = """1. (no user-specific instructions provided yet)."""
+user_specific_configuration = """1. (no user-specific instructions provided yet).""" # The default value is """1. (no user-specific instructions provided yet)."""
 
 domain_specific_configuration = """1. Use period labels like m0 (current month) and m1 (prior month); apply consistently.
-2. Use IDR as currency, for example: Rp93,000.00 atau Rp354,500.00.
+2. Use IDR as currency, for example: Rp93,000.00 or Rp354,500.00.
 3. Use blue themed chart and table colors.
 4. target should be in mn (million).
 5. %TUR is take up rate percentage.
@@ -642,7 +687,7 @@ domain_specific_configuration = """1. Use period labels like m0 (current month) 
 7. Revenue Squad is in mn wich is million idr.
 8. rev/subs and rev/trx should be in thousands of idr.
 9. MoM is month after month in percentage
-10. Subs is taker."""
+10. Subs is taker.""" # The default value is """1. (no domain-specific instructions provided yet)."""
 
 # =========================
 # Shared Data Loading (Polars-first)
@@ -656,12 +701,13 @@ def _load_domain_dataframes(domain: str, dataset_filters: Optional[set]) -> Tupl
     try:
         if GCS_BUCKET:
             for b in list_gcs_csvs(domain):
-                if not b.name.lower().endswith(".csv"):
+                low = b.name.lower()
+                if not (low.endswith('.csv') or low.endswith('.xlsx') or low.endswith('.xls') or low.endswith('.xlsm')):
                     continue
                 key = os.path.basename(b.name)
                 if dataset_filters and key not in dataset_filters:
                     continue
-                df = read_gcs_csv_to_pl_df(b.name)
+                df = read_gcs_tabular_to_pl_df(b.name)
                 dfs[key] = df
                 info_str = _polars_info_string(df)
                 data_info[key] = info_str
@@ -684,7 +730,7 @@ def _load_domain_dataframes(domain: str, dataset_filters: Optional[set]) -> Tupl
             continue
         path = os.path.join(domain_dir, name)
         try:
-            df = _read_local_csv_to_polars(path)
+            df = (_read_local_csv_to_polars(path) if name.lower().endswith('.csv') else _read_excel_bytes_to_polars(open(path, 'rb').read()))
             dfs[name] = df
             info_str = _polars_info_string(df)
             data_info[name] = info_str
@@ -697,6 +743,122 @@ def _load_domain_dataframes(domain: str, dataset_filters: Optional[set]) -> Tupl
             pass
 
     return dfs, data_info, data_describe
+
+
+def _fetch_pg_credentials_from_firestore(user_id: str, *, name: str | None = None, conn_id: str | None = None) -> Optional[dict]:
+    """
+    Fetch and decrypt a saved PG connection. Returns dict with host, port, dbname, user, password.
+    """
+    try:
+        if not user_id:
+            return None
+        doc_ref = None
+        if conn_id:
+            doc_ref = _firestore_client.collection(FIRESTORE_COLLECTION_PG).document(conn_id).get()
+            rec = doc_ref.to_dict() if doc_ref and doc_ref.exists else None
+        else:
+            # default by name
+            key_name = slug(name or "default")
+            doc_id = f"{user_id}_{key_name}"
+            doc = _firestore_client.collection(FIRESTORE_COLLECTION_PG).document(doc_id).get()
+            rec = doc.to_dict() if doc and doc.exists else None
+        if not rec:
+            return None
+        _require_fernet()
+        enc = rec.get("password_enc")
+        password = fernet.decrypt(enc.encode()).decode() if (enc and fernet) else None
+        return {
+            "host": rec.get("host"),
+            "port": int(rec.get("port")) if rec.get("port") else 5432,
+            "dbname": rec.get("dbname"),
+            "user": rec.get("user"),
+            "password": password
+        }
+    except Exception:
+        return None
+
+def _pg_connect(creds: dict):
+    try:
+        import psycopg2
+    except Exception as e:
+        raise RuntimeError("psycopg2 not installed on server") from e
+    return psycopg2.connect(host=creds["host"], port=creds["port"], dbname=creds["dbname"], user=creds["user"], password=creds["password"])
+
+def _read_sql_to_polars(conn, query: str):
+    try:
+        import polars as _pl
+        return _pl.read_database(query, conn)
+    except Exception:
+        # Fallback via pandas
+        import pandas as _pd
+        try:
+            pdf = _pd.read_sql_query(query, conn)
+        except Exception:
+            pdf = _pd.read_sql(query, conn)
+        import polars as _pl
+        return _pl.from_pandas(pdf)
+
+def _load_postgres_tables_to_dfs(creds: dict, *, tables: Optional[List[str]] = None, schema: str = "public", limit: Optional[int] = 500, key_prefix: str = "pg") -> Tuple[Dict[str, 'pl.DataFrame'], Dict[str, str], Dict[str, str]]:
+    dfs: Dict[str, 'pl.DataFrame'] = {}
+    info: Dict[str, str] = {}
+    describe: Dict[str, str] = {}
+    try:
+        conn = _pg_connect(creds)
+    except Exception:
+        return dfs, info, describe
+    try:
+        cur = conn.cursor()
+        if not tables:
+            cur.execute("SELECT table_name FROM information_schema.tables WHERE table_schema = %s", (schema,))
+            tables = [r[0] for r in cur.fetchall()]
+        for t in tables or []:
+            q = f'SELECT * FROM "{schema}"."{t}"'
+            if limit is not None:
+                q += f" LIMIT {int(limit)}"
+            df = _read_sql_to_polars(conn, q)
+            df = _normalize_columns_to_str(df)
+            key = f"{key_prefix}:{schema}.{t}"
+            dfs[key] = df
+            info[key] = _polars_info_string(df)
+            try:
+                ddesc = df.describe()
+                describe[key] = ddesc.to_pandas().to_json()
+            except Exception:
+                describe[key] = ""
+        cur.close()
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    return dfs, info, describe
+
+def _load_postgres_sql_to_dfs(creds: dict, *, query: str, name: str = "query", key_prefix: str = "pg") -> Tuple[Dict[str, 'pl.DataFrame'], Dict[str, str], Dict[str, str]]:
+    dfs: Dict[str, 'pl.DataFrame'] = {}
+    info: Dict[str, str] = {}
+    describe: Dict[str, str] = {}
+    try:
+        conn = _pg_connect(creds)
+    except Exception:
+        return dfs, info, describe
+    try:
+        df = _read_sql_to_polars(conn, query)
+        df = _normalize_columns_to_str(df)
+        key = f"{key_prefix}:{name}"
+        dfs[key] = df
+        info[key] = _polars_info_string(df)
+        try:
+            ddesc = df.describe()
+            describe[key] = ddesc.to_pandas().to_json()
+        except Exception:
+            describe[key] = ""
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    return dfs, info, describe
+
 
 # =========================
 # Router (a0.0.7) - UPDATED: accept llm model & api_key
@@ -737,6 +899,8 @@ def _run_router(user_prompt: str, data_info, data_describe, state: dict, *, llm_
             "need_analyzer": bool(need_analyze or not need_visual),
             "need_compiler": True,
             "compiler_model": llm_model,
+            "need_plan_explainer": True,
+            "plan_explainer_model": llm_model,
             "visual_hint": visual_hint,
             "reason": "heuristic fallback",
         }
@@ -1181,7 +1345,7 @@ def datasets_list():
             if os.path.isdir(domain_dir):
                 known = {(i.get("domain"), i.get("filename")) for i in items}
                 for name in sorted(os.listdir(domain_dir)):
-                    if name.lower().endswith(".csv") and (slug(domain), name) not in known:
+                    if name.lower().endswith('.csv') or name.lower().endswith('.xlsx') or name.lower().endswith('.xls') or name.lower().endswith('.xlsm') and (slug(domain), name) not in known:
                         path = os.path.join(domain_dir, name)
                         size = os.path.getsize(path)
                         items.append({
@@ -1265,7 +1429,7 @@ def datasets_list_all(domain):
         if os.path.isdir(domain_dir):
             known = {(i.get("domain"), i.get("filename")) for i in items}
             for name in sorted(os.listdir(domain_dir)):
-                if name.lower().endswith(".csv") and (slug(domain), name) not in known:
+                if name.lower().endswith('.csv') or name.lower().endswith('.xlsx') or name.lower().endswith('.xls') or name.lower().endswith('.xlsm') and (slug(domain), name) not in known:
                     path = os.path.join(domain_dir, name)
                     size = os.path.getsize(path)
                     items.append({
@@ -1420,7 +1584,7 @@ def compat_list_domain_datasets(domain: str):
             if os.path.isdir(domain_dir):
                 known_names = { i.get("filename") for i in items }
                 for name in sorted(os.listdir(domain_dir)):
-                    if name.lower().endswith(".csv") and name not in known_names:
+                    if name.lower().endswith('.csv') or name.lower().endswith('.xlsx') or name.lower().endswith('.xls') or name.lower().endswith('.xlsm') and name not in known_names:
                         path = os.path.join(domain_dir, name)
                         size = os.path.getsize(path)
                         items.append({"domain": slug(domain), "filename": name, "gs_uri": "", "size_bytes": size, "signed_url": ""})
@@ -1565,6 +1729,27 @@ def suggest():
             dataset_filters = None
 
         dfs, data_info, data_describe = _load_domain_dataframes(domain, dataset_filters)
+        # Optionally load Postgres sources and merge into dfs
+        pg_spec = body.get("pg") or {}
+        if pg_spec:
+            try:
+                creds = _fetch_pg_credentials_from_firestore(user_id_in, name=pg_spec.get("name"), conn_id=pg_spec.get("id"))
+                if creds:
+                    if pg_spec.get("sql"):
+                        dfs_pg, info_pg, desc_pg = _load_postgres_sql_to_dfs(creds, query=pg_spec.get("sql"), name=pg_spec.get("sql_name") or "query")
+                    else:
+                        dfs_pg, info_pg, desc_pg = _load_postgres_tables_to_dfs(
+                            creds,
+                            tables=pg_spec.get("tables"),
+                            schema=pg_spec.get("schema","public"),
+                            limit=pg_spec.get("limit", 500)
+                        )
+                    dfs.update(dfs_pg)
+                    data_info.update(info_pg)
+                    data_describe.update(desc_pg)
+            except Exception:
+                pass
+
 
         r = completion(
             model="gemini/gemini-2.5-pro",
@@ -1665,6 +1850,27 @@ def query():
 
         # load data (Polars)
         dfs, data_info, data_describe = _load_domain_dataframes(domain, dataset_filters)
+        # Optionally load Postgres sources and merge into dfs
+        pg_spec = body.get("pg") or {}
+        if pg_spec:
+            try:
+                creds = _fetch_pg_credentials_from_firestore(user_id_in, name=pg_spec.get("name"), conn_id=pg_spec.get("id"))
+                if creds:
+                    if pg_spec.get("sql"):
+                        dfs_pg, info_pg, desc_pg = _load_postgres_sql_to_dfs(creds, query=pg_spec.get("sql"), name=pg_spec.get("sql_name") or "query")
+                    else:
+                        dfs_pg, info_pg, desc_pg = _load_postgres_tables_to_dfs(
+                            creds,
+                            tables=pg_spec.get("tables"),
+                            schema=pg_spec.get("schema","public"),
+                            limit=pg_spec.get("limit", 500)
+                        )
+                    dfs.update(dfs_pg)
+                    data_info.update(info_pg)
+                    data_describe.update(desc_pg)
+            except Exception:
+                pass
+
         if not dfs:
             if dataset_filters:
                 available = []
@@ -1708,6 +1914,33 @@ def query():
         visualizer_prompt  = spec.get("visualizer_prompt", "")
         analyzer_prompt    = spec.get("analyzer_prompt", "")
         compiler_instruction = spec.get("compiler_instruction", "")
+        # ---------- Plan Explainer (router-controlled) ----------
+        plan_explainer_text = ""
+        need_plan_explainer = bool(agent_plan.get("need_plan_explainer", False))
+        plan_explainer_model = agent_plan.get("plan_explainer_model") or chosen_model_id
+        if need_plan_explainer:
+            try:
+                plan_explainer_response = completion(
+                    model=plan_explainer_model,
+                    messages=[
+                        {"role": "system", "content": "You are the Plan Explainer. Summarize, in a single concise paragraph, how the system will process the user\'s request using its agents (manipulator, visualizer, analyzer, compiler). Mention the key steps and why they\'re run. Do not include code; keep it short and clear for the user."},
+                        {"role": "user", "content":
+                            f"User Prompt: {prompt}\n"
+                            f"Datasets Domain: {domain}\n"
+                            f"Router Plan: {json.dumps(agent_plan, ensure_ascii=False)}\n"
+                            f"Agent Instructions: manipulator={manipulator_prompt[:300]}, visualizer={visualizer_prompt[:300]}, analyzer={analyzer_prompt[:300]}, compiler={compiler_instruction[:300]}\n"
+                            f"Data Info: {json.dumps(data_info, ensure_ascii=False)[:800]}\n"
+                            f"Data Describe: {json.dumps(data_describe, ensure_ascii=False)[:800]}"
+                        },
+                    ],
+                    seed=1, stream=False, verbosity="low", drop_params=True, reasoning_effort="high",
+                    api_key=chosen_api_key
+                )
+                plan_explainer_text = get_content(plan_explainer_response) or ""
+            except Exception:
+                plan_explainer_text = ""
+        state["last_plan_explainer_text"] = plan_explainer_text
+
 
         # Shared LLM (PandasAI via LiteLLM) - use chosen model & user key
         llm = LiteLLM(model=chosen_model_id, api_key=chosen_api_key)
@@ -1807,7 +2040,8 @@ def query():
             "visual_gs_uri": state.get("last_visual_gcs_path",""),
             "visual_kind": state.get("last_visual_kind",""),
             "analyzer_excerpt": (state.get("last_analyzer_text") or "")[:400],
-            "final_preview": final_content[:600]
+            "final_preview": final_content[:600],
+            "plan_explainer_preview": (state.get("last_plan_explainer_text") or "")[:400]
         })
         _save_conv_state(session_id, state)
 
@@ -1824,7 +2058,8 @@ def query():
             "need_analyzer": need_analyze,
             "need_manipulator": need_manip,
             "llm_model_used": chosen_model_id,
-            "provider": provider_in
+            "provider": provider_in,
+            "plan_explainer_text": state.get("last_plan_explainer_text","")
         })
     except RuntimeError as rexc:
         if "CANCELLED_BY_USER" in str(rexc):

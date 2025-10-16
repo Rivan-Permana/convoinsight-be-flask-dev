@@ -13,8 +13,7 @@ from flask_cors import CORS
 # --- Polars + PandasAI (Polars-first)
 import polars as pl
 import pandasai as pai
-from pandasai.llm.litellm import LiteLLM
-# from pandasai_litellm.litellm import LiteLLM
+from pandasai_litellm.litellm import LiteLLM
 from litellm import completion, model_list as LITELLM_MODEL_LIST
 from pandasai import SmartDataframe, SmartDatalake  # kept import for compatibility, not used in new path
 from pandasai.core.response.dataframe import DataFrameResponse
@@ -838,32 +837,43 @@ def _require_fernet():
 
 @app.route("/validate-key", methods=["POST"])
 def validate_key():
+    """
+    Validate API key for a given provider using litellm's built-in model registry.
+    """
     try:
         data = request.get_json()
         provider = data.get("provider")
         api_key = data.get("apiKey")
         user_id = data.get("userId")
+
         if not provider or not api_key or not user_id:
             return jsonify({"valid": False, "error": "Missing provider, apiKey, or userId"}), 400
 
-        _require_fernet()
+        # 🔹 Pastikan provider dikenal oleh litellm
+        groups = _group_litellm_models()
+        if provider not in groups:
+            return jsonify({"valid": False, "error": f"Provider not supported: {provider}"}), 400
 
-        cfg = get_provider_config(provider, api_key)
-        res = requests.get(cfg["url"], headers=cfg["headers"], timeout=6)
-        if res.status_code == 200:
-            j = res.json()
-            models = []
-            if "data" in j:
-                models = [m.get("id") for m in j["data"] if "id" in m]
-            elif "models" in j:
-                models = [m.get("name") or m.get("id") for m in j["models"]]
-            encrypted_key = fernet.encrypt(api_key.encode()).decode()
-            save_provider_key(user_id, provider, encrypted_key, models)
-            return jsonify({"valid": True, "provider": provider, "models": models, "token": encrypted_key})
-        else:
-            return jsonify({"valid": False, "provider": provider, "status": res.status_code, "detail": res.text}), 400
+        # 🔹 Ambil daftar model dari provider
+        models = groups[provider]
+        if not models:
+            return jsonify({"valid": False, "error": "No models found for provider"}), 400
+
+        # 🔐 Simpan API key terenkripsi
+        _require_fernet()
+        encrypted_key = fernet.encrypt(api_key.encode()).decode()
+        save_provider_key(user_id, provider, encrypted_key, models)
+
+        return jsonify({
+            "valid": True,
+            "provider": provider,
+            "models": models,
+            "token": encrypted_key
+        })
+
     except Exception as e:
         return jsonify({"valid": False, "error": str(e)}), 500
+
 
 @app.route("/get-provider-keys", methods=["GET"])
 def get_provider_keys():
@@ -890,34 +900,38 @@ def get_provider_keys():
                 "is_active": d.get("is_active", True),
                 "updated_at": updated_at,
             })
-        return jsonify({"items": items, "count": len(items)})
+
+        return jsonify({
+            "items": items,
+            "count": len(items),
+            "summary": f"{len(items)} provider keys found"
+        })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+
 @app.route("/update-provider-key", methods=["PUT"])
 def update_provider_key():
+    """
+    Update an existing provider key using LiteLLM provider list
+    """
     try:
         data = request.get_json()
         user_id = data.get("userId")
         provider = data.get("provider")
         api_key = data.get("apiKey")
+
         if not user_id or not provider or not api_key:
             return jsonify({"updated": False, "error": "Missing fields"}), 400
 
+        # 🔹 Validasi provider dari LiteLLM
+        groups = _group_litellm_models()
+        if provider not in groups:
+            return jsonify({"updated": False, "error": f"Provider not supported: {provider}"}), 400
+
         _require_fernet()
-
-        cfg = get_provider_config(provider, api_key)
-        res = requests.get(cfg["url"], headers=cfg["headers"], timeout=6)
-        if res.status_code != 200:
-            return jsonify({"updated": False, "error": "Invalid API key"}), 400
-
-        j = res.json()
-        models = []
-        if "data" in j:
-            models = [m.get("id") for m in j["data"] if "id" in m]
-        elif "models" in j:
-            models = [m.get("name") or m.get("id") for m in j["models"]]
         encrypted_key = fernet.encrypt(api_key.encode()).decode()
+        models = groups.get(provider, [])
 
         doc_ref = _firestore_client.collection(FIRESTORE_COLLECTION_PROVIDERS).document(f"{user_id}_{provider}")
         doc_ref.set({
@@ -929,23 +943,31 @@ def update_provider_key():
         }, merge=True)
 
         return jsonify({"updated": True, "models": models})
+
     except Exception as e:
         return jsonify({"updated": False, "error": str(e)}), 500
 
+
 @app.route("/delete-provider-key", methods=["DELETE"])
 def delete_provider_key():
+    """
+    Delete stored provider key.
+    """
     try:
         data = request.get_json()
         user_id = data.get("userId")
         provider = data.get("provider")
+
         if not user_id or not provider:
             return jsonify({"error": "Missing userId or provider"}), 400
 
         doc_id = f"{user_id}_{provider}"
         doc_ref = _firestore_client.collection(FIRESTORE_COLLECTION_PROVIDERS).document(doc_id)
         doc = doc_ref.get()
+
         if not doc.exists:
             return jsonify({"error": "Key not found"}), 404
+
         doc_ref.delete()
         return jsonify({"deleted": True})
     except Exception as e:

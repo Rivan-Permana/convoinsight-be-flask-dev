@@ -1221,6 +1221,24 @@ def litellm_models():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+@app.get("/litellm/providers")
+def litellm_providers():
+    """
+    Return sorted unique provider names from litellm.provider_list.
+    Example:
+      {
+        "count": 98,
+        "providers": ["AI21", "AI21_CHAT", ...]
+      }
+    """
+    try:
+        from litellm import provider_list
+        providers = sorted({p.name for p in provider_list})
+        return jsonify({"count": len(providers), "providers": providers})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 # =========================
 # Datasets CRUD + Domain listing
 # =========================

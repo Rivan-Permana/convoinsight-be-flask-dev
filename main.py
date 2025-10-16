@@ -13,7 +13,8 @@ from flask_cors import CORS
 # --- Polars + PandasAI (Polars-first)
 import polars as pl
 import pandasai as pai
-from pandasai_litellm.litellm import LiteLLM
+from pandasai.llm.litellm import LiteLLM
+# from pandasai_litellm.litellm import LiteLLM
 from litellm import completion, model_list as LITELLM_MODEL_LIST
 from pandasai import SmartDataframe, SmartDatalake  # kept import for compatibility, not used in new path
 from pandasai.core.response.dataframe import DataFrameResponse
@@ -952,29 +953,25 @@ def delete_provider_key():
 @app.route("/litellm/providers", methods=["GET"])
 def litellm_providers():
     """
-    Return sorted unique provider names from pandasai.litellm.provider_list.
-    Example:
-      {
-        "count": 98,
-        "providers": [
-          "AI21",
-          "ANTHROPIC",
-          "OPENAI",
-          "GROQ",
-          ...
-        ]
-      }
+    Return sorted provider names from pandasai or litellm.
     """
     try:
-        from pandasai.litellm import litellm
+        try:
+            # prefer pandasai internal integration (jika ada)
+            from pandasai.litellm import litellm as pai_litellm
+            litellm_mod = pai_litellm
+        except Exception:
+            import litellm as litellm_mod  # fallback ke core library
 
-        provider_names_sorted = sorted({p.name for p in litellm.provider_list})
+        provider_names_sorted = sorted({p.name for p in litellm_mod.provider_list})
         return jsonify({
             "count": len(provider_names_sorted),
             "providers": provider_names_sorted
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
 
 # =============== NEW: LiteLLM full model list (grouped) =================
 def _infer_provider_from_model_id(model_id: str) -> str:

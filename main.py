@@ -949,6 +949,33 @@ def delete_provider_key():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+@app.route("/litellm/providers", methods=["GET"])
+def litellm_providers():
+    """
+    Return sorted unique provider names from pandasai.litellm.provider_list.
+    Example:
+      {
+        "count": 98,
+        "providers": [
+          "AI21",
+          "ANTHROPIC",
+          "OPENAI",
+          "GROQ",
+          ...
+        ]
+      }
+    """
+    try:
+        from pandasai.litellm import litellm
+
+        provider_names_sorted = sorted({p.name for p in litellm.provider_list})
+        return jsonify({
+            "count": len(provider_names_sorted),
+            "providers": provider_names_sorted
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 # =============== NEW: LiteLLM full model list (grouped) =================
 def _infer_provider_from_model_id(model_id: str) -> str:
     """Heuristic grouping for LiteLLM model IDs."""

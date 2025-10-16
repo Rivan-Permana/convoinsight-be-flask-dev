@@ -951,22 +951,6 @@ def delete_provider_key():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-@app.route("/litellm/models", methods=["GET"])
-def litellm_models():
-    """
-    Return all valid models from LiteLLM.
-    """
-    try:
-        from litellm import get_valid_models
-        models = get_valid_models()
-        return jsonify({
-            "count": len(models),
-            "models": models,
-        })
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
 # =============== NEW: LiteLLM full model list (grouped) =================
 def _infer_provider_from_model_id(model_id: str) -> str:
     """Heuristic grouping for LiteLLM model IDs."""
@@ -1074,6 +1058,20 @@ def litellm_models():
         return jsonify({"count": total, "groups": groups})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+    
+@app.route("/litellm/providers", methods=["GET"])
+def litellm_providers():
+    import litellm
+    version = getattr(litellm, "__version__", "unknown")
+    try:
+        providers = sorted({p.name for p in litellm.provider_list})
+        return jsonify({
+            "count": len(providers),
+            "providers": providers,
+            "version": version
+        })
+    except Exception as e:
+        return jsonify({"error": str(e), "version": version}), 500
 
 # =========================
 # Datasets CRUD + Domain listing

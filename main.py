@@ -703,6 +703,20 @@ def _load_domain_dataframes(domain: str, dataset_filters: Optional[set]) -> Tupl
 # Router (a0.0.7) - UPDATED: accept llm model & api_key
 # =========================
 def _run_router(user_prompt: str, data_info, data_describe, state: dict, *, llm_model: str, llm_api_key: Optional[str]) -> dict:
+    """
+    Returns a dict:
+      {
+        "need_manipulator": bool,
+        "need_visualizer": bool,
+        "need_analyzer": bool,
+        "need_plan_explainer": bool,
+        "need_compiler": bool,
+        "compiler_model": "gemini/gemini-2.5-pro" (or other),
+        "plan_explainer_model": "gemini/gemini-2.5-pro" (or other),
+        "visual_hint": "bar|line|table|auto",
+        "reason": "<brief>",
+        "_elapsed": <float seconds>
+      }"""
     router_start = time.time()
     recent_context = json.dumps(state.get("history", [])[-6:], ensure_ascii=False)
 
@@ -734,19 +748,21 @@ def _run_router(user_prompt: str, data_info, data_describe, state: dict, *, llm_
         visual_hint = "bar" if "bar" in p else ("line" if "line" in p else ("table" if ("table" in p or optimize_terms) else "auto"))
         plan = {
             "need_manipulator": bool(need_manip),
-            "need_visualizer": bool(need_visual or optimize_terms),
+            "need_visualizer": bool(need_visual or ("ranked plan" in p) or ("showing [" in p) or optimize_terms),
             "need_analyzer": bool(need_analyze or not need_visual),
+            "need_plan_explainer": True,
             "need_compiler": True,
             "compiler_model": llm_model,
+            "plan_explainer_model": llm_model,
             "visual_hint": visual_hint,
             "reason": "heuristic fallback",
         }
-
+        
     # Hard guard for allocation/gap prompts
     p_low = user_prompt.lower()
     if re.search(r"\b(min(?:imum)? number|minimum number of additional takers|additional takers|close (?:the )?gap|gap closure|optimal allocation|allocate|allocation|optimi[sz]e)\b", p_low):
         plan["need_analyzer"] = True
-        plan["need_visualizer"] = True if not plan.get("need_visualizer") else plan["need_visualizer"]
+        plan["need_visualizer"] = True if "need_visualizer" not in plan or not plan["need_visualizer"] else plan["need_visualizer"]
         if plan.get("visual_hint", "auto") == "auto":
             plan["visual_hint"] = "table"
         plan["reason"] = (plan.get("reason") or "") + " + analyzer-for-gap/allocation tasks"
@@ -1752,6 +1768,63 @@ def query():
         analyzer_prompt    = spec.get("analyzer_prompt", "")
         compiler_instruction = spec.get("compiler_instruction", "")
 
+        need_plan_explainer = bool(agent_plan.get("need_plan_explainer", False))
+        plan_explainer_model = agent_plan.get("plan_explainer_model") or chosen_model_id
+
+        if need_plan_explainer:
+            plan_explainer_start_time = time.time()
+
+            # isi detail instruksi untuk ketiga agen
+            initial_content = json.dumps({
+                "manipulator_prompt": manipulator_prompt,
+                "visualizer_prompt": visualizer_prompt,
+                "analyzer_prompt": analyzer_prompt,
+                "compiler_instruction": compiler_instruction,
+            }, ensure_ascii=False, indent=2)
+
+            plan_explainer_response = completion(
+                model=plan_explainer_model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": """Make sure all of the information below is applied.
+                        1. The prompt that will be given to you is the details of what the system is going to do to respond to the user prompt.
+                        2. Your objective is to summarize that plan into an easy-to-understand, thought-process-style explanation
+                        of what you (the system) are going to do for the user to read while they wait.
+                        3. Respond in a single, human-readable paragraph.
+                        4. Include reasoning behind each crucial step taken."""
+                    },
+                    {
+                        "role": "user",
+                        "content": (
+                            f"User Prompt: {prompt}\n"
+                            f"Domain: {domain}\n"
+                            f"Data Info: {data_info}\n"
+                            f"Data Describe: {data_describe}\n"
+                            f"Agent Plan: {json.dumps(agent_plan, ensure_ascii=False)}\n"
+                            f"Detailed instructions for each agent:\n{initial_content}"
+                        )
+                    },
+                ],
+                seed=1,
+                stream=False,
+                verbosity="medium",
+                drop_params=True,
+                reasoning_effort="high",
+                api_key=chosen_api_key
+            )
+
+            plan_explainer_content = get_content(plan_explainer_response)
+            plan_explainer_end_time = time.time()
+            plan_explainer_elapsed_time = plan_explainer_end_time - plan_explainer_start_time
+            print(f"Elapsed time: {plan_explainer_elapsed_time:.2f} seconds")
+
+            # optionally simpan ke state agar bisa dikirim ke FE
+            state["last_plan_explainer"] = plan_explainer_content
+            _save_conv_state(session_id, state)
+        else:
+                print("Plan Explainer skipped (router decision).")
+
         # Shared LLM (PandasAI via LiteLLM) - use chosen model & user key
         llm = LiteLLM(model=chosen_model_id, api_key=chosen_api_key)
         pai.config.set({"llm": llm})
@@ -1867,7 +1940,8 @@ def query():
             "need_analyzer": need_analyze,
             "need_manipulator": need_manip,
             "llm_model_used": chosen_model_id,
-            "provider": provider_in
+            "provider": provider_in,
+            "plan_explainer": state.get("last_plan_explainer", ""),
         })
     except RuntimeError as rexc:
         if "CANCELLED_BY_USER" in str(rexc):

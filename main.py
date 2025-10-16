@@ -93,20 +93,6 @@ FIRESTORE_COLLECTION_PG        = os.getenv("FIRESTORE_PG_COLLECTION", "pg_connec
 app = Flask(__name__)
 CORS(app, origins=[o.strip() for o in CORS_ORIGINS if o.strip()], supports_credentials=True)
 
-@app.route("/litellm/providers", methods=["GET"])
-def litellm_providers():
-    import litellm
-    version = getattr(litellm, "__version__", "unknown")
-    try:
-        providers = sorted({p.name for p in litellm.provider_list})
-        return jsonify({
-            "count": len(providers),
-            "providers": providers,
-            "version": version
-        })
-    except Exception as e:
-        return jsonify({"error": str(e), "version": version}), 500
-
 # --- Init GCP clients ---
 _storage_client = storage.Client(project=GCP_PROJECT_ID) if GCP_PROJECT_ID else storage.Client()
 _firestore_client = firestore.Client(project=GCP_PROJECT_ID) if GCP_PROJECT_ID else firestore.Client()
@@ -1073,6 +1059,24 @@ def litellm_models():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
     
+@app.route("/litellm/providers", methods=["GET"])
+def litellm_providers():
+    import litellm
+    version = getattr(litellm, "__version__", "unknown")
+    try:
+        providers = sorted({p.name for p in litellm.provider_list})
+        return jsonify({
+            "count": len(providers),
+            "providers": providers,
+            "version": version
+        })
+    except Exception as e:
+        return jsonify({"error": str(e), "version": version}), 500
+
+@app.get("/debug/routes")
+def debug_routes():
+    from flask import current_app
+    return {"routes": sorted([r.rule for r in current_app.url_map.iter_rules()])}
 
 # =========================
 # Datasets CRUD + Domain listing

@@ -21,7 +21,8 @@ from pandasai.core.response.dataframe import DataFrameResponse
 
 # --- (pandas kept import for minimal surface compatibility, not used in pipeline)
 import pandas as pd  # not used for pipeline; retained to avoid non-pipeline breakages elsewhere
-
+import litellm
+from litellm import get_valid_models
 # --- GCP clients ---
 from google.cloud import storage
 from google.cloud import firestore
@@ -950,27 +951,20 @@ def delete_provider_key():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-@app.route("/litellm/providers", methods=["GET"])
-def litellm_providers():
+@app.route("/litellm/models", methods=["GET"])
+def litellm_models():
     """
-    Return sorted provider names from pandasai or litellm.
+    Return all valid models from LiteLLM.
     """
     try:
-        try:
-            # prefer pandasai internal integration (jika ada)
-            from pandasai.litellm import litellm as pai_litellm
-            litellm_mod = pai_litellm
-        except Exception:
-            import litellm as litellm_mod  # fallback ke core library
-
-        provider_names_sorted = sorted({p.name for p in litellm_mod.provider_list})
+        from litellm import get_valid_models
+        models = get_valid_models()
         return jsonify({
-            "count": len(provider_names_sorted),
-            "providers": provider_names_sorted
+            "count": len(models),
+            "models": models,
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-
 
 
 # =============== NEW: LiteLLM full model list (grouped) =================

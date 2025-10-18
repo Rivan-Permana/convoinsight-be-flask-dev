@@ -78,8 +78,7 @@ os.makedirs(CHARTS_ROOT,   exist_ok=True)
 GCS_BUCKET                  = os.getenv("GCS_BUCKET")
 GCS_DATASETS_PREFIX         = os.getenv("GCS_DATASETS_PREFIX", "datasets")
 GCS_DIAGRAMS_PREFIX         = os.getenv("GCS_DIAGRAMS_PREFIX", "diagrams")
-GCS_SIGNED_URL_TTL_SECONDS = int(os.getenv("GCS_SIGNED_URL_TTL_SECONDS", str(10 * 365 * 24 * 3600)))
- # 7 days
+GCS_SIGNED_URL_TTL_SECONDS  = int(os.getenv("GCS_SIGNED_URL_TTL_SECONDS", "604800"))  # 7 days
 GOOGLE_SERVICE_ACCOUNT_EMAIL = os.getenv("GOOGLE_SERVICE_ACCOUNT_EMAIL")  # optional but useful on Cloud Run
 
 # 🔧 FIX: pakai env var koleksi yang berbeda-beda (tidak ketuker)
@@ -506,13 +505,14 @@ def upload_diagram_to_gcs(local_path: str, *, domain: str, session_id: str, run_
     blob_name = f"{GCS_DIAGRAMS_PREFIX}/{kind}/{safe_domain}/{filename}"
     bucket = _gcs_bucket()
     blob = bucket.blob(blob_name)
-    blob.cache_control = "private, max-age=31536000"
+    blob.cache_control = "public, max-age=86400"
     blob.content_type = "text/html; charset=utf-8"
     blob.upload_from_filename(local_path)
     return {
         "blob_name": blob_name,
         "gs_uri": f"gs://{GCS_BUCKET}/{blob_name}",
         "signed_url": _signed_url(blob, filename, "text/html", GCS_SIGNED_URL_TTL_SECONDS),
+        "public_url": f"https://storage.googleapis.com/{GCS_BUCKET}/{blob_name}",
         "kind": kind,
     }
 
@@ -1181,35 +1181,6 @@ def datasets_upload():
             return jsonify({"detail":"Missing 'domain' or 'file'"}), 400
         uploaded = upload_dataset_file(file, domain=domain)
         return jsonify(uploaded), 201
-    except Exception as e:
-        return jsonify({"detail": str(e)}), 500
-
-@app.post("/diagram_signed_url")
-def diagram_signed_url():
-    try:
-        body = request.get_json(force=True)
-        domain = slug(body.get("domain"))
-        html_content = body.get("html", "")
-        kind = body.get("kind", "charts")
-        session_id = body.get("session_id", str(uuid.uuid4()))
-        if not domain or not html_content:
-            return jsonify({"detail": "Missing domain or html"}), 400
-
-        run_id = datetime.utcnow().strftime("%Y%m%d%H%M%S%f")
-        local_path = os.path.join(CHARTS_ROOT, f"{session_id}_{run_id}.html")
-
-        ensure_dir(CHARTS_ROOT)
-        with open(local_path, "w", encoding="utf-8") as f:
-            f.write(html_content)
-
-        uploaded = upload_diagram_to_gcs(
-            local_path,
-            domain=domain,
-            session_id=session_id,
-            run_id=run_id,
-            kind=kind,
-        )
-        return jsonify(uploaded)
     except Exception as e:
         return jsonify({"detail": str(e)}), 500
 

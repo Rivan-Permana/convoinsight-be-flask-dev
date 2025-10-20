@@ -88,6 +88,20 @@ FIRESTORE_COLLECTION_PROVIDERS = os.getenv("FIRESTORE_PROVIDERS_COLLECTION", "co
 # NEW: collection for PG/Supabase connections
 FIRESTORE_COLLECTION_PG        = os.getenv("FIRESTORE_PG_COLLECTION", "pg_connections")
 
+# --- Supabase Storage (untuk simpan chart) ---
+SUPABASE_URL  = os.getenv("SUPABASE_URL")
+SUPABASE_KEY  = os.getenv("SUPABASE_KEY")
+SUPABASE_BUCKET_CHARTS = os.getenv("SUPABASE_BUCKET_CHARTS", "charts")
+SUPABASE_SIGNED_TTL_SECONDS = int(os.getenv("SUPABASE_SIGNED_TTL_SECONDS", "604800"))
+
+supabase_client = None
+if SUPABASE_URL and SUPABASE_KEY:
+    try:
+        from supabase import create_client
+        supabase_client = create_client(SUPABASE_URL, SUPABASE_KEY)
+    except Exception as _e:
+        supabase_client = None  # biar aman kalau lib belum terpasang
+
 # --- Init Flask ---
 app = Flask(__name__)
 CORS(app, origins=[o.strip() for o in CORS_ORIGINS if o.strip()], supports_credentials=True)
@@ -330,6 +344,49 @@ def _signed_url(blob, filename: str, content_type: str, ttl_seconds: int) -> str
         response_disposition=f'inline; filename="{filename}"',
         response_type=content_type,
     )
+
+def _use_supabase_for_charts() -> bool:
+    return (os.getenv("CHARTS_STORAGE", "gcs").lower() == "supabase") and (supabase_client is not None)
+
+def upload_diagram_to_supabase(local_path: str, *, domain: str, session_id: str, run_id: str, kind: str) -> dict:
+    """
+    Upload file HTML chart/table ke Supabase Storage dan kembalikan signed/public URL.
+    """
+    if not os.path.exists(local_path):
+        raise FileNotFoundError(local_path)
+    if supabase_client is None:
+        raise RuntimeError("Supabase client is not initialized")
+
+    safe_domain = slug(domain)
+    kind = "tables" if kind == "tables" else "charts"
+    filename = f"{session_id}_{run_id}.html"
+    sb_path = f"{kind}/{safe_domain}/{filename}"
+
+    # upload (upsert supaya overwrite kalau run ulang)
+    with open(local_path, "rb") as f:
+        supabase_client.storage.from_(SUPABASE_BUCKET_CHARTS).upload(
+            file=f,
+            path=sb_path,
+            file_options={
+                "contentType": "text/html; charset=utf-8",
+                "upsert": True,
+                "cacheControl": "86400",
+            },
+        )
+
+    # signed url (kalau bucket private), plus public url kalau bucket public
+    signed_url = supabase_client.storage.from_(SUPABASE_BUCKET_CHARTS).create_signed_url(
+        sb_path, expires_in=SUPABASE_SIGNED_TTL_SECONDS
+    )["signed_url"]
+
+    public_url = supabase_client.storage.from_(SUPABASE_BUCKET_CHARTS).get_public_url(sb_path)["public_url"]
+
+    return {
+        "sb_path": sb_path,
+        "signed_url": signed_url,
+        "public_url": public_url,
+        "kind": kind,
+    }
 
 # ---- Local helpers / robust dev mode --------------
 def _upload_dataset_file_local(file_storage, *, domain: str) -> dict:
@@ -1874,14 +1931,25 @@ def query():
                 chart_url = f"/charts/{domain}/{filename}"
 
                 diagram_kind = _detect_diagram_kind(dest, visual_hint)
-                if GCS_BUCKET:
-                    uploaded = upload_diagram_to_gcs(dest, domain=domain, session_id=session_id, run_id=run_id, kind=diagram_kind)
-                    diagram_signed_url = uploaded["signed_url"]
-                    diagram_gs_uri     = uploaded["gs_uri"]
 
-                    state["last_visual_gcs_path"]   = diagram_gs_uri
+                if _use_supabase_for_charts():
+                    uploaded = upload_diagram_to_supabase(
+                        dest, domain=domain, session_id=session_id, run_id=run_id, kind=diagram_kind
+                    )
+                    diagram_signed_url = uploaded["signed_url"]
+                    diagram_gs_uri = uploaded["sb_path"]           
                     state["last_visual_signed_url"] = diagram_signed_url
-                    state["last_visual_kind"]       = diagram_kind
+                    state["last_visual_kind"] = diagram_kind
+                    state["last_visual_sb_path"] = uploaded["sb_path"]      
+                    state["last_visual_public_url"] = uploaded["public_url"] 
+                else:
+                    if GCS_BUCKET:
+                        uploaded = upload_diagram_to_gcs(dest, domain=domain, session_id=session_id, run_id=run_id, kind=diagram_kind)
+                        diagram_signed_url = uploaded["signed_url"]
+                        diagram_gs_uri     = uploaded["gs_uri"]
+                        state["last_visual_gcs_path"]   = diagram_gs_uri
+                        state["last_visual_signed_url"] = diagram_signed_url
+                        state["last_visual_kind"]       = diagram_kind
 
         # Analyzer
         _cancel_if_needed(session_id)
@@ -1930,11 +1998,12 @@ def query():
         exec_time = time.time() - t0
         return jsonify({
             "session_id": session_id,
-            "response": final_content,       # HTML
-            "chart_url": chart_url,          # dev preview
-            "diagram_kind": diagram_kind,    # "charts" | "tables"
-            "diagram_gs_uri": diagram_gs_uri, # gs://...
+            "response": final_content,       
+            "chart_url": chart_url,          
+            "diagram_kind": diagram_kind,    
+            "diagram_gs_uri": diagram_gs_uri, 
             "diagram_signed_url": diagram_signed_url,
+            "diagram_public_url": state.get("last_visual_public_url", ""),
             "execution_time": exec_time,
             "need_visualizer": need_visual,
             "need_analyzer": need_analyze,
@@ -2045,6 +2114,79 @@ def pg_test():
             return jsonify({"ok": False, "error": str(e)}), 400
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
+    
+@app.get("/charts/sb/list")
+def charts_sb_list():
+    """
+    List objek di Supabase Storage.
+    Query:
+      - prefix (opsional): mis. 'charts/<domain-slug>' atau 'tables/<domain-slug>'
+      - limit (opsional): default 100
+    """
+    if supabase_client is None:
+        return jsonify({"detail": "Supabase is not configured"}), 501
+    prefix = request.args.get("prefix", "").strip().strip("/")
+    limit = int(request.args.get("limit", "100"))
+    try:
+        items = supabase_client.storage.from_(SUPABASE_BUCKET_CHARTS).list(
+            path=prefix or "", limit=limit
+        )
+        # normalisasi output
+        out = [
+            {
+                "name": it.get("name"),
+                "id": it.get("id"),
+                "updated_at": it.get("updated_at"),
+                "created_at": it.get("created_at"),
+                "path": f"{prefix}/{it.get('name')}".strip("/"),
+                "size": it.get("metadata", {}).get("size"),
+            }
+            for it in items or []
+        ]
+        return jsonify({"items": out, "prefix": prefix})
+    except Exception as e:
+        return jsonify({"detail": str(e)}), 500
+
+
+@app.get("/charts/sb/signed")
+def charts_sb_signed():
+    """
+    Buat signed URL untuk path tertentu.
+    Query:
+      - path (wajib): contoh 'charts/<domain>/<file>.html'
+      - ttl  (opsional): detik; default SUPABASE_SIGNED_TTL_SECONDS
+    """
+    if supabase_client is None:
+        return jsonify({"detail": "Supabase is not configured"}), 501
+    path = (request.args.get("path") or "").strip().strip("/")
+    if not path:
+        return jsonify({"detail": "Missing 'path'"}), 400
+    ttl = int(request.args.get("ttl", str(SUPABASE_SIGNED_TTL_SECONDS)))
+    try:
+        signed = supabase_client.storage.from_(SUPABASE_BUCKET_CHARTS).create_signed_url(path, expires_in=ttl)["signed_url"]
+        public_url = supabase_client.storage.from_(SUPABASE_BUCKET_CHARTS).get_public_url(path)["public_url"]
+        return jsonify({"path": path, "signed_url": signed, "public_url": public_url})
+    except Exception as e:
+        return jsonify({"detail": str(e)}), 500
+
+
+@app.delete("/charts/sb")
+def charts_sb_delete():
+    """
+    Hapus 1 objek.
+    Body JSON: { "path": "charts/<domain>/<file>.html" }
+    """
+    if supabase_client is None:
+        return jsonify({"detail": "Supabase is not configured"}), 501
+    body = request.get_json(force=True)
+    path = (body.get("path") or "").strip().strip("/")
+    if not path:
+        return jsonify({"detail": "Missing 'path'"}), 400
+    try:
+        supabase_client.storage.from_(SUPABASE_BUCKET_CHARTS).remove([path])
+        return jsonify({"deleted": True, "path": path})
+    except Exception as e:
+        return jsonify({"detail": str(e)}), 500
 
 # --- Entry point ---------------------------------------------------------------
 if __name__ == "__main__":

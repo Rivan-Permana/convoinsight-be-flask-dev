@@ -36,3 +36,5 @@ psycopg2-binary==2.9.9      # driver PG untuk SQLAlchemy (mudah dipakai di conta
 connectorx>=0.3.3
 # atau via ADBC:
 adbc-driver-postgresql>=1.0.0
+
+supabase>=2,<3

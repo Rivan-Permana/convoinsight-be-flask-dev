@@ -39,6 +39,9 @@ from google.oauth2 import service_account
 import requests
 from cryptography.fernet import Fernet
 
+from supabase import create_client, Client
+from storage3.types import FileOptions
+
 # -------- optional: load .env --------
 try:
     from dotenv import load_dotenv
@@ -363,11 +366,11 @@ def upload_diagram_to_supabase(local_path: str, *, domain: str, session_id: str,
         supabase_client.storage.from_(SUPABASE_BUCKET_CHARTS).upload(
             file=f,
             path=sb_path,
-            file_options={
-                "content_type": "text/html; charset=utf-8",
-                "cache_control": "86400",
-                "upsert": "true",
-            },
+            file_options=FileOptions(
+                content_type="text/html; charset=utf-8",
+                cache_control="86400",
+                upsert=True,
+            ),
         )
 
     signed_url = supabase_client.storage.from_(SUPABASE_BUCKET_CHARTS).create_signed_url(
@@ -376,8 +379,6 @@ def upload_diagram_to_supabase(local_path: str, *, domain: str, session_id: str,
     public_url = supabase_client.storage.from_(SUPABASE_BUCKET_CHARTS).get_public_url(sb_path)["public_url"]
 
     return {"sb_path": sb_path, "signed_url": signed_url, "public_url": public_url, "kind": kind}
-
-    
 
 # ---- Local helpers / robust dev mode --------------
 def _upload_dataset_file_local(file_storage, *, domain: str) -> dict:

@@ -702,7 +702,25 @@ def _load_domain_dataframes(domain: str, dataset_filters: Optional[set]) -> Tupl
 # Router (a0.0.7) - UPDATED: accept llm model & api_key
 # =========================
 def _run_router(user_prompt: str, data_info, data_describe, state: dict, *, llm_model: str, llm_api_key: Optional[str]) -> dict:
-    router_start = time.time()
+    """
+    Returns a dict:
+      {
+        "need_manipulator": bool,
+        "need_visualizer": bool,
+        "need_analyzer": bool,
+        "need_plan_explainer": bool,
+        "need_compiler": bool,
+        "compiler_model": "gemini/gemini-2.5-pro" (or other),
+        "plan_explainer_model": "gemini/gemini-2.5-pro" (or other),
+        "visual_hint": "bar|line|table|auto",
+        "reason": "<brief>",
+        "_elapsed": <float seconds>
+      }
+    """
+    # PERBAIKAN: Mendefinisikan _now untuk mendapatkan waktu yang presisi
+    _now = getattr(time, "perf_counter", time.time)
+    router_start = _now()
+
     recent_context = json.dumps(state.get("history", [])[-6:], ensure_ascii=False)
 
     router_response = completion(
@@ -729,14 +747,17 @@ def _run_router(user_prompt: str, data_info, data_describe, state: dict, *, llm_
         optimize_terms = bool(re.search(r"\b(allocate|allocation|optimal|optimi[sz]e|plan|planning|min(?:imum)? number|minimum number|close (?:the )?gap|gap closure|takers?)\b", p))
         need_analyze = bool(re.search(r"\b(why|driver|explain|root cause|trend|surprise|reason)\b", p)) or optimize_terms
         follow_up = bool(re.search(r"\b(what about|and|how about|ok but|also)\b", p)) or len(p.split()) <= 8
-        need_manip = not follow_up  # reuse if follow-up
-        visual_hint = "bar" if "bar" in p else ("line" if "line" in p else ("table" if ("table" in p or optimize_terms) else "auto"))
+        # PERBAIKAN: Menggunakan parameter `state` bukan variabel global `_CONV_STATE`
+        need_manip = not follow_up or state.get("last_df_processed") is None
+        visual_hint = "bar" if "bar" in p else ("line" if "line" in p else ("table" if ("table" in p or "ranked plan" in p or "showing [" in p or optimize_terms) else "auto"))
         plan = {
             "need_manipulator": bool(need_manip),
-            "need_visualizer": bool(need_visual or optimize_terms),
+            "need_visualizer": bool(need_visual or ("ranked plan" in p) or ("showing [" in p) or optimize_terms),
             "need_analyzer": bool(need_analyze or not need_visual),
+            "need_plan_explainer": True,
             "need_compiler": True,
-            "compiler_model": llm_model,
+            "compiler_model": "gemini/gemini-2.5-pro",
+            "plan_explainer_model": "gemini/gemini-2.5-pro",
             "visual_hint": visual_hint,
             "reason": "heuristic fallback",
         }
@@ -750,9 +771,17 @@ def _run_router(user_prompt: str, data_info, data_describe, state: dict, *, llm_
             plan["visual_hint"] = "table"
         plan["reason"] = (plan.get("reason") or "") + " + analyzer-for-gap/allocation tasks"
 
-    router_end = time.time()
+    # PERBAIKAN: Menggunakan variabel yang konsisten untuk waktu
+    router_end = _now()
     plan["_elapsed"] = float(router_end - router_start)
+    print(f"Router elapsed: {plan['_elapsed']:.2f}s — Plan: {plan}")
+
+    # PERBAIKAN: Menyimpan hasil ke `state` yang diterima sebagai parameter
+    state["last_plan"] = plan
+    state["last_router_elapsed"] = plan["_elapsed"]
+
     return plan
+
 
 # =========================
 # Orchestrate (a0.0.7) - UPDATED: accept llm model & api_key
@@ -1701,6 +1730,23 @@ def query():
             "dataset_filter": (sorted(datasets) if datasets else "ALL"),
         }
 
+                # === NEW: Run router to decide which agents to run ===
+        agent_plan = _run_router(user_prompt=prompt, data_info=data_info, data_describe=data_describe)
+        need_manip = bool(agent_plan.get("need_manipulator", True))
+        need_visual = bool(agent_plan.get("need_visualizer", True))
+        need_analyze = bool(agent_plan.get("need_analyzer", True))
+        need_plan_explainer = bool(agent_plan.get("need_plan_explainer", True))
+
+        # Force analyzer for gap/allocation prompts even if plan says otherwise (guards router issue)
+        if re.search(r"\b(min(?:imum)? number|minimum number of additional takers|additional takers|close (?:the )?gap|gap closure|optimal allocation|allocate|allocation|optimi[sz]e)\b", prompt.lower()):
+            need_analyze = True
+        need_compile = bool(agent_plan.get("need_compiler", True))  # now controlled by router
+        compiler_model = agent_plan.get("compiler_model") or "gemini/gemini-2.5-pro"
+        plan_explainer_model = agent_plan.get("plan_explainer_model") or "gemini/gemini-2.5-pro"
+        visual_hint = agent_plan.get("visual_hint", "auto")
+        if visual_hint == "auto" and re.search(r"(ranked plan|showing \[)", prompt.lower()):
+            visual_hint = "table"
+
         # Orchestrator
         _cancel_if_needed(session_id)
         spec = _run_orchestrator(prompt, domain, data_info, data_describe, visual_hint, context_hint, llm_model=chosen_model_id, llm_api_key=chosen_api_key)
@@ -1708,6 +1754,48 @@ def query():
         visualizer_prompt  = spec.get("visualizer_prompt", "")
         analyzer_prompt    = spec.get("analyzer_prompt", "")
         compiler_instruction = spec.get("compiler_instruction", "")
+
+        plan_explainer_content = ""
+        if need_plan_explainer:
+            plan_explainer_start_time = _now()
+            plan_explainer_response = completion(
+                model=plan_explainer_model,
+                messages=[
+                    {"role": "system", "content": f"""
+                    Make sure all of the information below is applied.
+                     1. The prompt that will be given to you is the details of what the systems is going to do to respond to the user prompt.
+                     2. Your objective is to summarize the prompt that will be given to you into an easy to understand thought-process-like-explanation of what you (the system) are going to do for the user to read while they wait.
+                     3. Your respond must be in a form of a single paragraph.
+                     4. Include reason behind each crucial steps taken."""},
+                    {
+                        "role": "user",
+                        "content": (f"""Make sure all of the information below is applied
+                        User Prompt: {prompt}.
+                        Datasets Domain name: {domain}.
+                        df.info of each dfs key(file name)-value pair:\n{data_info}.
+                        df.describe of each dfs key(file name)-value pair:\n{data_describe}.
+                        Plan for each agents: {agent_plan}.
+                        Detailed instructions for each agents: {spec}.
+                        """)
+                    }
+                ],
+                seed=1,
+                stream=False,
+                verbosity="medium",
+                drop_params=True,
+                reasoning_effort="high",
+                api_key=chosen_api_key # Pastikan API key diteruskan
+            )
+
+            plan_explainer_content = get_content(plan_explainer_response)
+            print(plan_explainer_content)
+            _now = getattr(time, "perf_counter", time.time)
+            plan_explainer_end_time = _now()
+            plan_explainer_elapsed_time = plan_explainer_end_time - plan_explainer_start_time
+            print(f"Plan Explainer Elapsed time: {plan_explainer_elapsed_time:.2f} seconds")
+        else:
+            plan_explainer_content = "Plan Explainer skipped (router decision)."
+            print(plan_explainer_content)
 
         # Shared LLM (PandasAI via LiteLLM) - use chosen model & user key
         llm = LiteLLM(model=chosen_model_id, api_key=chosen_api_key)

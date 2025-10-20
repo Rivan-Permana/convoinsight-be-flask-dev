@@ -20,7 +20,8 @@ from pandasai.core.response.dataframe import DataFrameResponse
 
 # --- (pandas kept import for minimal surface compatibility, not used in pipeline)
 import pandas as pd  # not used for pipeline; retained to avoid non-pipeline breakages elsewhere
-
+import litellm
+from litellm import get_valid_models
 # --- GCP clients ---
 from google.cloud import storage
 from google.cloud import firestore
@@ -715,12 +716,8 @@ def _run_router(user_prompt: str, data_info, data_describe, state: dict, *, llm_
         "visual_hint": "bar|line|table|auto",
         "reason": "<brief>",
         "_elapsed": <float seconds>
-      }
-    """
-    # PERBAIKAN: Mendefinisikan _now untuk mendapatkan waktu yang presisi
-    _now = getattr(time, "perf_counter", time.time)
-    router_start = _now()
-
+      }"""
+    router_start = time.time()
     recent_context = json.dumps(state.get("history", [])[-6:], ensure_ascii=False)
 
     router_response = completion(
@@ -756,8 +753,8 @@ def _run_router(user_prompt: str, data_info, data_describe, state: dict, *, llm_
             "need_analyzer": bool(need_analyze or not need_visual),
             "need_plan_explainer": True,
             "need_compiler": True,
-            "compiler_model": "gemini/gemini-2.5-pro",
-            "plan_explainer_model": "gemini/gemini-2.5-pro",
+            "compiler_model": llm_model,
+            "plan_explainer_model": llm_model,
             "visual_hint": visual_hint,
             "reason": "heuristic fallback",
         }
@@ -766,7 +763,7 @@ def _run_router(user_prompt: str, data_info, data_describe, state: dict, *, llm_
     p_low = user_prompt.lower()
     if re.search(r"\b(min(?:imum)? number|minimum number of additional takers|additional takers|close (?:the )?gap|gap closure|optimal allocation|allocate|allocation|optimi[sz]e)\b", p_low):
         plan["need_analyzer"] = True
-        plan["need_visualizer"] = True if not plan.get("need_visualizer") else plan["need_visualizer"]
+        plan["need_visualizer"] = True if "need_visualizer" not in plan or not plan["need_visualizer"] else plan["need_visualizer"]
         if plan.get("visual_hint", "auto") == "auto":
             plan["visual_hint"] = "table"
         plan["reason"] = (plan.get("reason") or "") + " + analyzer-for-gap/allocation tasks"
@@ -865,32 +862,43 @@ def _require_fernet():
 
 @app.route("/validate-key", methods=["POST"])
 def validate_key():
+    """
+    Validate API key for a given provider using litellm's built-in model registry.
+    """
     try:
         data = request.get_json()
         provider = data.get("provider")
         api_key = data.get("apiKey")
         user_id = data.get("userId")
+
         if not provider or not api_key or not user_id:
             return jsonify({"valid": False, "error": "Missing provider, apiKey, or userId"}), 400
 
-        _require_fernet()
+        # 🔹 Pastikan provider dikenal oleh litellm
+        groups = _group_litellm_models()
+        if provider not in groups:
+            return jsonify({"valid": False, "error": f"Provider not supported: {provider}"}), 400
 
-        cfg = get_provider_config(provider, api_key)
-        res = requests.get(cfg["url"], headers=cfg["headers"], timeout=6)
-        if res.status_code == 200:
-            j = res.json()
-            models = []
-            if "data" in j:
-                models = [m.get("id") for m in j["data"] if "id" in m]
-            elif "models" in j:
-                models = [m.get("name") or m.get("id") for m in j["models"]]
-            encrypted_key = fernet.encrypt(api_key.encode()).decode()
-            save_provider_key(user_id, provider, encrypted_key, models)
-            return jsonify({"valid": True, "provider": provider, "models": models, "token": encrypted_key})
-        else:
-            return jsonify({"valid": False, "provider": provider, "status": res.status_code, "detail": res.text}), 400
+        # 🔹 Ambil daftar model dari provider
+        models = groups[provider]
+        if not models:
+            return jsonify({"valid": False, "error": "No models found for provider"}), 400
+
+        # 🔐 Simpan API key terenkripsi
+        _require_fernet()
+        encrypted_key = fernet.encrypt(api_key.encode()).decode()
+        save_provider_key(user_id, provider, encrypted_key, models)
+
+        return jsonify({
+            "valid": True,
+            "provider": provider,
+            "models": models,
+            "token": encrypted_key
+        })
+
     except Exception as e:
         return jsonify({"valid": False, "error": str(e)}), 500
+
 
 @app.route("/get-provider-keys", methods=["GET"])
 def get_provider_keys():
@@ -917,34 +925,38 @@ def get_provider_keys():
                 "is_active": d.get("is_active", True),
                 "updated_at": updated_at,
             })
-        return jsonify({"items": items, "count": len(items)})
+
+        return jsonify({
+            "items": items,
+            "count": len(items),
+            "summary": f"{len(items)} provider keys found"
+        })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+
 @app.route("/update-provider-key", methods=["PUT"])
 def update_provider_key():
+    """
+    Update an existing provider key using LiteLLM provider list
+    """
     try:
         data = request.get_json()
         user_id = data.get("userId")
         provider = data.get("provider")
         api_key = data.get("apiKey")
+
         if not user_id or not provider or not api_key:
             return jsonify({"updated": False, "error": "Missing fields"}), 400
 
+        # 🔹 Validasi provider dari LiteLLM
+        groups = _group_litellm_models()
+        if provider not in groups:
+            return jsonify({"updated": False, "error": f"Provider not supported: {provider}"}), 400
+
         _require_fernet()
-
-        cfg = get_provider_config(provider, api_key)
-        res = requests.get(cfg["url"], headers=cfg["headers"], timeout=6)
-        if res.status_code != 200:
-            return jsonify({"updated": False, "error": "Invalid API key"}), 400
-
-        j = res.json()
-        models = []
-        if "data" in j:
-            models = [m.get("id") for m in j["data"] if "id" in m]
-        elif "models" in j:
-            models = [m.get("name") or m.get("id") for m in j["models"]]
         encrypted_key = fernet.encrypt(api_key.encode()).decode()
+        models = groups.get(provider, [])
 
         doc_ref = _firestore_client.collection(FIRESTORE_COLLECTION_PROVIDERS).document(f"{user_id}_{provider}")
         doc_ref.set({
@@ -956,23 +968,31 @@ def update_provider_key():
         }, merge=True)
 
         return jsonify({"updated": True, "models": models})
+
     except Exception as e:
         return jsonify({"updated": False, "error": str(e)}), 500
 
+
 @app.route("/delete-provider-key", methods=["DELETE"])
 def delete_provider_key():
+    """
+    Delete stored provider key.
+    """
     try:
         data = request.get_json()
         user_id = data.get("userId")
         provider = data.get("provider")
+
         if not user_id or not provider:
             return jsonify({"error": "Missing userId or provider"}), 400
 
         doc_id = f"{user_id}_{provider}"
         doc_ref = _firestore_client.collection(FIRESTORE_COLLECTION_PROVIDERS).document(doc_id)
         doc = doc_ref.get()
+
         if not doc.exists:
             return jsonify({"error": "Key not found"}), 404
+
         doc_ref.delete()
         return jsonify({"deleted": True})
     except Exception as e:
@@ -1085,6 +1105,25 @@ def litellm_models():
         return jsonify({"count": total, "groups": groups})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+@app.route("/litellm/providers", methods=["GET"])
+def litellm_providers():
+    import litellm
+    version = getattr(litellm, "__version__", "unknown")
+    try:
+        providers = sorted({p.name for p in litellm.provider_list})
+        return jsonify({
+            "count": len(providers),
+            "providers": providers,
+            "version": version
+        })
+    except Exception as e:
+        return jsonify({"error": str(e), "version": version}), 500
+
+@app.get("/debug/routes")
+def debug_routes():
+    from flask import current_app
+    return {"routes": sorted([r.rule for r in current_app.url_map.iter_rules()])}
 
 # =========================
 # Datasets CRUD + Domain listing
@@ -1755,47 +1794,62 @@ def query():
         analyzer_prompt    = spec.get("analyzer_prompt", "")
         compiler_instruction = spec.get("compiler_instruction", "")
 
-        plan_explainer_content = ""
+        need_plan_explainer = bool(agent_plan.get("need_plan_explainer", False))
+        plan_explainer_model = agent_plan.get("plan_explainer_model") or chosen_model_id
+
         if need_plan_explainer:
-            plan_explainer_start_time = _now()
+            plan_explainer_start_time = time.time()
+
+            # isi detail instruksi untuk ketiga agen
+            initial_content = json.dumps({
+                "manipulator_prompt": manipulator_prompt,
+                "visualizer_prompt": visualizer_prompt,
+                "analyzer_prompt": analyzer_prompt,
+                "compiler_instruction": compiler_instruction,
+            }, ensure_ascii=False, indent=2)
+
             plan_explainer_response = completion(
                 model=plan_explainer_model,
                 messages=[
-                    {"role": "system", "content": f"""
-                    Make sure all of the information below is applied.
-                     1. The prompt that will be given to you is the details of what the systems is going to do to respond to the user prompt.
-                     2. Your objective is to summarize the prompt that will be given to you into an easy to understand thought-process-like-explanation of what you (the system) are going to do for the user to read while they wait.
-                     3. Your respond must be in a form of a single paragraph.
-                     4. Include reason behind each crucial steps taken."""},
+                    {
+                        "role": "system",
+                        "content": """Make sure all of the information below is applied.
+                        1. The prompt that will be given to you is the details of what the system is going to do to respond to the user prompt.
+                        2. Your objective is to summarize that plan into an easy-to-understand, thought-process-style explanation
+                        of what you (the system) are going to do for the user to read while they wait.
+                        3. Respond in a single, human-readable paragraph.
+                        4. Include reasoning behind each crucial step taken."""
+                    },
                     {
                         "role": "user",
-                        "content": (f"""Make sure all of the information below is applied
-                        User Prompt: {prompt}.
-                        Datasets Domain name: {domain}.
-                        df.info of each dfs key(file name)-value pair:\n{data_info}.
-                        df.describe of each dfs key(file name)-value pair:\n{data_describe}.
-                        Plan for each agents: {agent_plan}.
-                        Detailed instructions for each agents: {spec}.
-                        """)
-                    }
+                        "content": (
+                            f"User Prompt: {prompt}\n"
+                            f"Domain: {domain}\n"
+                            f"Data Info: {data_info}\n"
+                            f"Data Describe: {data_describe}\n"
+                            f"Agent Plan: {json.dumps(agent_plan, ensure_ascii=False)}\n"
+                            f"Detailed instructions for each agent:\n{initial_content}"
+                        )
+                    },
                 ],
                 seed=1,
                 stream=False,
                 verbosity="medium",
                 drop_params=True,
                 reasoning_effort="high",
-                api_key=chosen_api_key # Pastikan API key diteruskan
+                api_key=chosen_api_key
             )
 
             plan_explainer_content = get_content(plan_explainer_response)
-            print(plan_explainer_content)
-            _now = getattr(time, "perf_counter", time.time)
-            plan_explainer_end_time = _now()
+            plan_explainer_end_time = time.time()
             plan_explainer_elapsed_time = plan_explainer_end_time - plan_explainer_start_time
-            print(f"Plan Explainer Elapsed time: {plan_explainer_elapsed_time:.2f} seconds")
+            print(f"Elapsed time: {plan_explainer_elapsed_time:.2f} seconds")
+
+            # optionally simpan ke state agar bisa dikirim ke FE
+            state["last_plan_explainer"] = plan_explainer_content
+            _save_conv_state(session_id, state)
         else:
-            plan_explainer_content = "Plan Explainer skipped (router decision)."
-            print(plan_explainer_content)
+                print("Plan Explainer skipped (router decision).")
 
         # Shared LLM (PandasAI via LiteLLM) - use chosen model & user key
         llm = LiteLLM(model=chosen_model_id, api_key=chosen_api_key)
@@ -1912,7 +1966,8 @@ def query():
             "need_analyzer": need_analyze,
             "need_manipulator": need_manip,
             "llm_model_used": chosen_model_id,
-            "provider": provider_in
+            "provider": provider_in,
+            "plan_explainer": state.get("last_plan_explainer", ""),
         })
     except RuntimeError as rexc:
         if "CANCELLED_BY_USER" in str(rexc):

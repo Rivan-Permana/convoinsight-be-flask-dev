@@ -744,9 +744,8 @@ def _run_router(user_prompt: str, data_info, data_describe, state: dict, *, llm_
         optimize_terms = bool(re.search(r"\b(allocate|allocation|optimal|optimi[sz]e|plan|planning|min(?:imum)? number|minimum number|close (?:the )?gap|gap closure|takers?)\b", p))
         need_analyze = bool(re.search(r"\b(why|driver|explain|root cause|trend|surprise|reason)\b", p)) or optimize_terms
         follow_up = bool(re.search(r"\b(what about|and|how about|ok but|also)\b", p)) or len(p.split()) <= 8
-        # PERBAIKAN: Menggunakan parameter `state` bukan variabel global `_CONV_STATE`
-        need_manip = not follow_up or state.get("last_df_processed") is None
-        visual_hint = "bar" if "bar" in p else ("line" if "line" in p else ("table" if ("table" in p or "ranked plan" in p or "showing [" in p or optimize_terms) else "auto"))
+        need_manip = not follow_up  # reuse if follow-up
+        visual_hint = "bar" if "bar" in p else ("line" if "line" in p else ("table" if ("table" in p or optimize_terms) else "auto"))
         plan = {
             "need_manipulator": bool(need_manip),
             "need_visualizer": bool(need_visual or ("ranked plan" in p) or ("showing [" in p) or optimize_terms),
@@ -768,17 +767,9 @@ def _run_router(user_prompt: str, data_info, data_describe, state: dict, *, llm_
             plan["visual_hint"] = "table"
         plan["reason"] = (plan.get("reason") or "") + " + analyzer-for-gap/allocation tasks"
 
-    # PERBAIKAN: Menggunakan variabel yang konsisten untuk waktu
-    router_end = _now()
+    router_end = time.time()
     plan["_elapsed"] = float(router_end - router_start)
-    print(f"Router elapsed: {plan['_elapsed']:.2f}s — Plan: {plan}")
-
-    # PERBAIKAN: Menyimpan hasil ke `state` yang diterima sebagai parameter
-    state["last_plan"] = plan
-    state["last_router_elapsed"] = plan["_elapsed"]
-
     return plan
-
 
 # =========================
 # Orchestrate (a0.0.7) - UPDATED: accept llm model & api_key
@@ -1768,23 +1759,6 @@ def query():
             "last_analyzer_excerpt": (state.get("last_analyzer_text") or "")[:400],
             "dataset_filter": (sorted(datasets) if datasets else "ALL"),
         }
-
-                # === NEW: Run router to decide which agents to run ===
-        agent_plan = _run_router(user_prompt=prompt, data_info=data_info, data_describe=data_describe)
-        need_manip = bool(agent_plan.get("need_manipulator", True))
-        need_visual = bool(agent_plan.get("need_visualizer", True))
-        need_analyze = bool(agent_plan.get("need_analyzer", True))
-        need_plan_explainer = bool(agent_plan.get("need_plan_explainer", True))
-
-        # Force analyzer for gap/allocation prompts even if plan says otherwise (guards router issue)
-        if re.search(r"\b(min(?:imum)? number|minimum number of additional takers|additional takers|close (?:the )?gap|gap closure|optimal allocation|allocate|allocation|optimi[sz]e)\b", prompt.lower()):
-            need_analyze = True
-        need_compile = bool(agent_plan.get("need_compiler", True))  # now controlled by router
-        compiler_model = agent_plan.get("compiler_model") or "gemini/gemini-2.5-pro"
-        plan_explainer_model = agent_plan.get("plan_explainer_model") or "gemini/gemini-2.5-pro"
-        visual_hint = agent_plan.get("visual_hint", "auto")
-        if visual_hint == "auto" and re.search(r"(ranked plan|showing \[)", prompt.lower()):
-            visual_hint = "table"
 
         # Orchestrator
         _cancel_if_needed(session_id)

@@ -349,6 +349,9 @@ def _use_supabase_for_charts() -> bool:
     return (os.getenv("CHARTS_STORAGE", "gcs").lower() == "supabase") and (supabase_client is not None)
 
 def upload_diagram_to_supabase(local_path: str, *, domain: str, session_id: str, run_id: str, kind: str) -> dict:
+    """
+    Upload file HTML chart/table ke Supabase Storage dan kembalikan signed/public URL.
+    """
     if not os.path.exists(local_path):
         raise FileNotFoundError(local_path)
     if supabase_client is None:
@@ -359,19 +362,24 @@ def upload_diagram_to_supabase(local_path: str, *, domain: str, session_id: str,
     filename = f"{session_id}_{run_id}.html"
     sb_path = f"{kind}/{safe_domain}/{filename}"
 
-    storage = supabase_client.storage.from_(SUPABASE_BUCKET_CHARTS)
+    # upload (upsert supaya overwrite kalau run ulang)
     with open(local_path, "rb") as f:
-        data = f.read()
+        supabase_client.storage.from_(SUPABASE_BUCKET_CHARTS).upload(
+            file=f,
+            path=sb_path,
+            file_options={
+                "contentType": "text/html; charset=utf-8",
+                "upsert": True,
+                "cacheControl": "86400",
+            },
+        )
 
-    storage.upload(
-        sb_path,
-        data,
-        {"content-type": "text/html; charset=utf-8", "cache-control": "86400"},
-        upsert=True,
-    )
+    # signed url (kalau bucket private), plus public url kalau bucket public
+    signed_url = supabase_client.storage.from_(SUPABASE_BUCKET_CHARTS).create_signed_url(
+        sb_path, expires_in=SUPABASE_SIGNED_TTL_SECONDS
+    )["signed_url"]
 
-    signed_url = storage.create_signed_url(sb_path, expires_in=SUPABASE_SIGNED_TTL_SECONDS)["signed_url"]
-    public_url = storage.get_public_url(sb_path)["public_url"]
+    public_url = supabase_client.storage.from_(SUPABASE_BUCKET_CHARTS).get_public_url(sb_path)["public_url"]
 
     return {
         "sb_path": sb_path,
@@ -379,6 +387,7 @@ def upload_diagram_to_supabase(local_path: str, *, domain: str, session_id: str,
         "public_url": public_url,
         "kind": kind,
     }
+    
 
 # ---- Local helpers / robust dev mode --------------
 def _upload_dataset_file_local(file_storage, *, domain: str) -> dict:

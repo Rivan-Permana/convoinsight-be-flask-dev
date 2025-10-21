@@ -569,34 +569,6 @@ def upload_diagram_to_gcs(local_path: str, *, domain: str, session_id: str, run_
         "kind": kind,
     }
 
-def clear_notifications_all_users():
-    total_deleted = 0
-    users_ref = _firestore_client.collection("users").stream()
-    for user_doc in users_ref:
-        notif_ref = user_doc.reference.collection("notifications")
-        for notif_doc in notif_ref.stream():
-            notif_doc.reference.delete()
-            total_deleted += 1
-    print(f"[{datetime.now().isoformat()}] ✅ Cleared {total_deleted} notifications (all users).")
-    return total_deleted
-
-
-def schedule_midnight_reset():
-    now = datetime.now()
-    next_midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-    delay = (next_midnight - now).total_seconds()
-
-    def run_and_reschedule():
-        clear_notifications_all_users()
-        schedule_midnight_reset()
-
-    threading.Timer(delay, run_and_reschedule).start()
-    print(f"[Scheduler] Next reset scheduled at {next_midnight.isoformat()} (in {delay/3600:.2f} hours).")
-
-@app.before_first_request
-def start_notification_scheduler():
-    schedule_midnight_reset()
-
 # =========================
 # Latest Pipeline Configs (router/orchestrator/agents)
 # =========================
@@ -1069,33 +1041,6 @@ def delete_provider_key():
         return jsonify({"deleted": True})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-
-@app.post("/notifications/reset-user")
-def notifications_reset_user():
-    """
-    Reset all notifications for a specific user.
-    Body JSON: { "userId": "<uid>" }
-    """
-    try:
-        data = request.get_json(force=True)
-        user_id = data.get("userId")
-
-        if not user_id:
-            return jsonify({"ok": False, "error": "Missing userId"}), 400
-
-        user_ref = _firestore_client.collection("users").document(user_id)
-        notif_ref = user_ref.collection("notifications")
-        notifs = notif_ref.stream()
-        count = 0
-        for n in notifs:
-            n.reference.delete()
-            count += 1
-
-        print(f"[{datetime.now().isoformat()}] Reset {count} notifications for user {user_id}")
-        return jsonify({"ok": True, "deleted": count})
-    except Exception as e:
-        print("[ERROR in notifications_reset_user]", e)
-        return jsonify({"ok": False, "error": str(e)}), 500
 
 # =============== NEW: LiteLLM full model list (grouped) =================
 def _infer_provider_from_model_id(model_id: str) -> str:

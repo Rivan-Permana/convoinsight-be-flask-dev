@@ -2145,7 +2145,6 @@ def query():
         plan_explainer_model = agent_plan.get("plan_explainer_model") or chosen_model_id
 
         if need_plan_explainer:
-            plan_explainer_start_time = time.time()
 
             # isi detail instruksi untuk ketiga agen
             initial_content = json.dumps(
@@ -2190,14 +2189,46 @@ def query():
                 api_key=chosen_api_key,
             )
 
-            plan_explainer_content = get_content(plan_explainer_response)
-            plan_explainer_end_time = time.time()
-            plan_explainer_elapsed_time = plan_explainer_end_time - plan_explainer_start_time
-            print(f"Elapsed time: {plan_explainer_elapsed_time:.2f} seconds")
+            # --- ambil & sanitasi output explainer ---
+            plan_explainer_content = (get_content(plan_explainer_response) or "").strip()
 
-            # optionally simpan ke state agar bisa dikirim ke FE
+            # buang filler pembuka yang sering muncul
+            try:
+                import re
+
+                plan_explainer_content = re.sub(
+                    r"^\s*(?:of course[.,]?\s*)+", "", plan_explainer_content, flags=re.I
+                )
+            except Exception:
+                pass
+
+            # Fallback kalau tetap kosong → buat explainer ringkas dari konteks lokal
+            if not plan_explainer_content:
+                vh = (agent_plan.get("visual_hint") or "auto").lower()
+                viz_txt = (
+                    "a table"
+                    if vh == "table"
+                    else (
+                        "a line chart"
+                        if vh == "line"
+                        else ("a bar chart" if vh == "bar" else "a chart")
+                    )
+                )
+                # coba sebut dataset yang aktif (kalau ada)
+                ds_txt = (
+                    ", ".join(sorted(datasets))
+                    if datasets
+                    else "the most relevant dataset(s) in this domain"
+                )
+                plan_explainer_content = (
+                    f"First, I will identify {ds_txt}, parse dates and normalize labels to build a tidy dataframe. "
+                    f"Next, I’ll aggregate to the right period and create {viz_txt} for a clear comparison. "
+                    "Finally, I’ll quantify totals/deltas, surface notable spikes, and compile a concise answer with next steps."
+                )
+
+            # simpan ke state + history
             state["last_plan_explainer"] = plan_explainer_content
-            _append_history(state, "assistant", state["last_plan_explainer"])
+            _append_history(state, "assistant", plan_explainer_content)
             _save_conv_state(session_id, state)
         else:
             print("Plan Explainer skipped (router decision).")
@@ -2361,6 +2392,7 @@ def query():
                 "llm_model_used": chosen_model_id,
                 "provider": provider_in,
                 "plan_explainer": state.get("last_plan_explainer", ""),
+                "need_plan_explainer": need_plan_explainer,
             }
         )
     except RuntimeError as rexc:

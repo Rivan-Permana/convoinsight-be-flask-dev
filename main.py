@@ -1823,10 +1823,12 @@ def query():
         need_plan_explainer = bool(agent_plan.get("need_plan_explainer", False))
         plan_explainer_model = agent_plan.get("plan_explainer_model") or chosen_model_id
 
+        plan_explainer_content = ""  # Default ke string kosong
         if need_plan_explainer:
-            plan_explainer_start_time = time.time()
+            plan_explainer_start_time = time.time()  # Di Colab _now()
+            print("--- Attempting Plan Explainer ---")
 
-            # isi detail instruksi untuk ketiga agen
+            # Isi detail instruksi untuk ketiga agen
             initial_content = json.dumps({
                 "manipulator_prompt": manipulator_prompt,
                 "visualizer_prompt": visualizer_prompt,
@@ -1834,48 +1836,72 @@ def query():
                 "compiler_instruction": compiler_instruction,
             }, ensure_ascii=False, indent=2)
 
-            plan_explainer_response = completion(
-                model=plan_explainer_model,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": """Make sure all of the information below is applied.
-                        1. The prompt that will be given to you is the details of what the system is going to do to respond to the user prompt.
-                        2. Your objective is to summarize that plan into an easy-to-understand, thought-process-style explanation
-                        of what you (the system) are going to do for the user to read while they wait.
-                        3. Respond in a single, human-readable paragraph.
-                        4. Include reasoning behind each crucial step taken."""
-                    },
-                    {
-                        "role": "user",
-                        "content": (
-                            f"User Prompt: {prompt}\n"
-                            f"Domain: {domain}\n"
-                            f"Data Info: {data_info}\n"
-                            f"Data Describe: {data_describe}\n"
-                            f"Agent Plan: {json.dumps(agent_plan, ensure_ascii=False)}\n"
-                            f"Detailed instructions for each agent:\n{initial_content}"
-                        )
-                    },
-                ],
-                seed=1,
-                stream=False,
-                verbosity="medium",
-                drop_params=True,
-                reasoning_effort="high",
-                api_key=chosen_api_key
-            )
+            max_retries = 3  # Coba maksimal 3 kali
+            for attempt in range(max_retries):
+                try:
+                    print(f"Plan Explainer attempt {attempt + 1}/{max_retries}")
+                    plan_explainer_response = completion(
+                        model=plan_explainer_model,
+                        messages=[
+                            {
+                                "role": "system",
+                                "content": """Make sure all of the information below is applied.
+        1. The prompt that will be given to you is the details of what the system is going to do to respond to the user prompt.
+        2. Your objective is to summarize that plan into an easy-to-understand, thought-process-style explanation
+        of what you (the system) are going to do for the user to read while they wait.
+        3. Respond in a single, human-readable paragraph.
+        4. Include reasoning behind each crucial step taken."""
+                            },
+                            {
+                                "role": "user",
+                                "content": (
+                                    f"User Prompt: {prompt}\n"
+                                    f"Domain: {domain}\n"
+                                    f"Data Info: {data_info}\n"
+                                    f"Data Describe: {data_describe}\n"
+                                    f"Agent Plan: {json.dumps(agent_plan, ensure_ascii=False)}\n"
+                                    f"Detailed instructions for each agent:\n{initial_content}"
+                                )
+                            },
+                        ],
+                        seed=1,
+                        stream=False,
+                        verbosity="medium",
+                        drop_params=True,
+                        reasoning_effort="high",
+                        api_key=chosen_api_key
+                    )
 
-            plan_explainer_content = get_content(plan_explainer_response)
-            plan_explainer_end_time = time.time()
+                    temp_content = get_content(plan_explainer_response)
+                    if temp_content and temp_content.strip():  # Jika berhasil dan tidak kosong
+                        plan_explainer_content = temp_content
+                        print("Plan Explainer succeeded.")
+                        break  # Keluar dari loop retry
+                    else:
+                        print(f"Plan Explainer attempt {attempt + 1} returned empty content.")
+                        if attempt < max_retries - 1:
+                            time.sleep(1)  # Tunggu 1 detik sebelum mencoba lagi
+
+                except Exception as e:
+                    print(f"Plan Explainer attempt {attempt + 1} failed: {e}")
+                    if attempt < max_retries - 1:
+                        time.sleep(1)  # Tunggu 1 detik sebelum mencoba lagi
+                    else:
+                        print("Plan Explainer failed after all retries.")
+
+            plan_explainer_end_time = time.time()  # Di Colab _now()
             plan_explainer_elapsed_time = plan_explainer_end_time - plan_explainer_start_time
-            print(f"Elapsed time: {plan_explainer_elapsed_time:.2f} seconds")
+            print(f"Plan Explainer process finished. Elapsed: {plan_explainer_elapsed_time:.2f} seconds")
+            print(f"Final Plan Explainer Content: '{plan_explainer_content}'")  # Log hasil akhir
 
-            # optionally simpan ke state agar bisa dikirim ke FE
+            # Simpan ke state (meskipun kosong jika semua retry gagal)
             state["last_plan_explainer"] = plan_explainer_content
+            print("--- DEBUG: Saving state with Plan Explainer ---")
             _save_conv_state(session_id, state)
+            print("---------------------------------------------")
+
         else:
-                print("Plan Explainer skipped (router decision).")
+            print("Plan Explainer skipped (router decision).")
 
         # Shared LLM (PandasAI via LiteLLM) - use chosen model & user key
         llm = LiteLLM(model=chosen_model_id, api_key=chosen_api_key)

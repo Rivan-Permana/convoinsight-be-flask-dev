@@ -244,6 +244,7 @@ def _fs_default_state():
         "last_visual_kind": "",
         "last_analyzer_text": "",
         "last_plan": None,
+        "last_plan_explainer": "",
         "updated_at": firestore.SERVER_TIMESTAMP,
         "created_at": firestore.SERVER_TIMESTAMP,
     }

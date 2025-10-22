@@ -947,6 +947,7 @@ def _run_router(
             if "need_visualizer" not in plan or not plan["need_visualizer"]
             else plan["need_visualizer"]
         )
+        plan["need_plan_explainer"] = bool(plan.get("need_plan_explainer", True))
         if plan.get("visual_hint", "auto") == "auto":
             plan["visual_hint"] = "table"
         plan["reason"] = (plan.get("reason") or "") + " + analyzer-for-gap/allocation tasks"

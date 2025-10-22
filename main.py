@@ -1,4 +1,4 @@
-# main.py — ConvoInsight BE (Flask, Cloud Run ready) 
+# main.py — ConvoInsight BE (Flask, Cloud Run ready)
 # Polars + PandasAI wrappers; GCS/Firestore persistence; provider keys via Firestore (encrypted)
 
 import os, io, json, time, uuid, re, html
@@ -15,13 +15,17 @@ import polars as pl
 import pandasai as pai
 from pandasai_litellm.litellm import LiteLLM
 from litellm import completion, model_list as LITELLM_MODEL_LIST
-from pandasai import SmartDataframe, SmartDatalake  # kept import for compatibility, not used in new path
+from pandasai import (
+    SmartDataframe,
+    SmartDatalake,
+)  # kept import for compatibility, not used in new path
 from pandasai.core.response.dataframe import DataFrameResponse
 
 # --- (pandas kept import for minimal surface compatibility, not used in pipeline)
 import pandas as pd  # not used for pipeline; retained to avoid non-pipeline breakages elsewhere
 import litellm
 from litellm import get_valid_models
+
 # --- GCP clients ---
 from google.cloud import storage
 from google.cloud import firestore
@@ -29,6 +33,7 @@ from google.cloud import firestore
 # === GCP auth imports (for signed URLs on Cloud Run) ===
 import google.auth
 from google.auth.transport.requests import Request as GoogleAuthRequest
+
 # NEW: use IAM Signer to sign without private key on Cloud Run
 try:
     from google.auth import iam
@@ -49,6 +54,7 @@ import threading, time
 # -------- optional: load .env --------
 try:
     from dotenv import load_dotenv
+
     load_dotenv()
 except Exception:
     pass
@@ -60,6 +66,7 @@ try:
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
     from reportlab.lib.enums import TA_LEFT
     from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+
     _REPORTLAB_AVAILABLE = True
 except Exception:
     _REPORTLAB_AVAILABLE = False
@@ -73,31 +80,33 @@ fernet = Fernet(FERNET_KEY.encode()) if FERNET_KEY else None
 
 CORS_ORIGINS = os.getenv(
     "CORS_ORIGINS",
-    "http://127.0.0.1:5500,http://localhost:5500,http://localhost:5173,http://127.0.0.1:5173,https://convoinsight.vercel.app"
+    "http://127.0.0.1:5500,http://localhost:5500,http://localhost:5173,http://127.0.0.1:5173,https://convoinsight.vercel.app",
 ).split(",")
 
 DATASETS_ROOT = os.getenv("DATASETS_ROOT", os.path.abspath("./datasets"))
-CHARTS_ROOT   = os.getenv("CHARTS_ROOT",   os.path.abspath("./charts"))
+CHARTS_ROOT = os.getenv("CHARTS_ROOT", os.path.abspath("./charts"))
 os.makedirs(DATASETS_ROOT, exist_ok=True)
-os.makedirs(CHARTS_ROOT,   exist_ok=True)
+os.makedirs(CHARTS_ROOT, exist_ok=True)
 
 # GCS / Firestore
-GCS_BUCKET                  = os.getenv("GCS_BUCKET")
-GCS_DATASETS_PREFIX         = os.getenv("GCS_DATASETS_PREFIX", "datasets")
-GCS_DIAGRAMS_PREFIX         = os.getenv("GCS_DIAGRAMS_PREFIX", "diagrams")
-GCS_SIGNED_URL_TTL_SECONDS  = int(os.getenv("GCS_SIGNED_URL_TTL_SECONDS", "604800"))  # 7 days
-GOOGLE_SERVICE_ACCOUNT_EMAIL = os.getenv("GOOGLE_SERVICE_ACCOUNT_EMAIL")  # optional but useful on Cloud Run
+GCS_BUCKET = os.getenv("GCS_BUCKET")
+GCS_DATASETS_PREFIX = os.getenv("GCS_DATASETS_PREFIX", "datasets")
+GCS_DIAGRAMS_PREFIX = os.getenv("GCS_DIAGRAMS_PREFIX", "diagrams")
+GCS_SIGNED_URL_TTL_SECONDS = int(os.getenv("GCS_SIGNED_URL_TTL_SECONDS", "604800"))  # 7 days
+GOOGLE_SERVICE_ACCOUNT_EMAIL = os.getenv(
+    "GOOGLE_SERVICE_ACCOUNT_EMAIL"
+)  # optional but useful on Cloud Run
 
 # 🔧 FIX: pakai env var koleksi yang berbeda-beda (tidak ketuker)
-FIRESTORE_COLLECTION_SESSIONS  = os.getenv("FIRESTORE_SESSIONS_COLLECTION", "convo_sessions")
-FIRESTORE_COLLECTION_DATASETS  = os.getenv("FIRESTORE_DATASETS_COLLECTION", "datasets_meta")
+FIRESTORE_COLLECTION_SESSIONS = os.getenv("FIRESTORE_SESSIONS_COLLECTION", "convo_sessions")
+FIRESTORE_COLLECTION_DATASETS = os.getenv("FIRESTORE_DATASETS_COLLECTION", "datasets_meta")
 FIRESTORE_COLLECTION_PROVIDERS = os.getenv("FIRESTORE_PROVIDERS_COLLECTION", "convo_providers")
 # NEW: collection for PG/Supabase connections
-FIRESTORE_COLLECTION_PG        = os.getenv("FIRESTORE_PG_COLLECTION", "pg_connections")
+FIRESTORE_COLLECTION_PG = os.getenv("FIRESTORE_PG_COLLECTION", "pg_connections")
 
 # --- Supabase Storage (untuk simpan chart) ---
-SUPABASE_URL  = os.getenv("SUPABASE_URL")
-SUPABASE_KEY  = os.getenv("SUPABASE_KEY")
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 SUPABASE_BUCKET_CHARTS = os.getenv("SUPABASE_BUCKET_CHARTS", "charts")
 SUPABASE_SIGNED_TTL_SECONDS = int(os.getenv("SUPABASE_SIGNED_TTL_SECONDS", "604800"))
 
@@ -105,6 +114,7 @@ supabase_client = None
 if SUPABASE_URL and SUPABASE_KEY:
     try:
         from supabase import create_client
+
         supabase_client = create_client(SUPABASE_URL, SUPABASE_KEY)
     except Exception as _e:
         supabase_client = None  # biar aman kalau lib belum terpasang
@@ -115,10 +125,13 @@ CORS(app, origins=[o.strip() for o in CORS_ORIGINS if o.strip()], supports_crede
 
 # --- Init GCP clients ---
 _storage_client = storage.Client(project=GCP_PROJECT_ID) if GCP_PROJECT_ID else storage.Client()
-_firestore_client = firestore.Client(project=GCP_PROJECT_ID) if GCP_PROJECT_ID else firestore.Client()
+_firestore_client = (
+    firestore.Client(project=GCP_PROJECT_ID) if GCP_PROJECT_ID else firestore.Client()
+)
 
 # --- Cancel flags ---
 _CANCEL_FLAGS = set()  # holds session_id
+
 
 # =========================
 # Utilities & Helpers
@@ -126,9 +139,11 @@ _CANCEL_FLAGS = set()  # holds session_id
 def slug(s: str) -> str:
     return "-".join(s.strip().split()).lower()
 
+
 def ensure_dir(p: str):
     os.makedirs(p, exist_ok=True)
     return p
+
 
 def get_content(r):
     """Extract content from LiteLLM response (robust)."""
@@ -149,6 +164,7 @@ def get_content(r):
     except Exception:
         return str(r)
 
+
 def _safe_json_loads(s: str):
     try:
         return json.loads(s)
@@ -156,28 +172,41 @@ def _safe_json_loads(s: str):
         start = s.find("{")
         end = s.rfind("}")
         if start >= 0 and end >= 0 and end > start:
-            return json.loads(s[start:end+1])
+            return json.loads(s[start : end + 1])
         raise
+
 
 def _should_cancel(session_id: str) -> bool:
     return session_id in _CANCEL_FLAGS
+
 
 def _cancel_if_needed(session_id: str):
     if _should_cancel(session_id):
         _CANCEL_FLAGS.discard(session_id)
         raise RuntimeError("CANCELLED_BY_USER")
 
+
 def get_provider_config(provider: str, api_key: str):
     if provider == "openai":
-        return {"url": "https://api.openai.com/v1/models", "headers": {"Authorization": f"Bearer {api_key}"}}
+        return {
+            "url": "https://api.openai.com/v1/models",
+            "headers": {"Authorization": f"Bearer {api_key}"},
+        }
     elif provider == "groq":
-        return {"url": "https://api.groq.com/openai/v1/models", "headers": {"Authorization": f"Bearer {api_key}"}}
+        return {
+            "url": "https://api.groq.com/openai/v1/models",
+            "headers": {"Authorization": f"Bearer {api_key}"},
+        }
     elif provider == "anthropic":
         return {"url": "https://api.anthropic.com/v1/models", "headers": {"x-api-key": api_key}}
     elif provider == "google":
-        return {"url": f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}", "headers": {}}
+        return {
+            "url": f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}",
+            "headers": {},
+        }
     else:
         raise ValueError("Provider not supported")
+
 
 def save_provider_key(user_id: str, provider: str, encrypted_key: str, models: list):
     try:
@@ -199,6 +228,7 @@ def save_provider_key(user_id: str, provider: str, encrypted_key: str, models: l
         print("Firestore save error:", e)
         return False
 
+
 # --- NEW: Resolve user-selected provider/model + decrypt token (used by /query) ---
 def _compose_model_id(provider: str, model: Optional[str]) -> str:
     """
@@ -207,7 +237,13 @@ def _compose_model_id(provider: str, model: Optional[str]) -> str:
     """
     if model and "/" in model:
         return model
-    prefix_map = {"google": "gemini", "gemini": "gemini", "openai": "openai", "anthropic": "anthropic", "groq": "groq"}
+    prefix_map = {
+        "google": "gemini",
+        "gemini": "gemini",
+        "openai": "openai",
+        "anthropic": "anthropic",
+        "groq": "groq",
+    }
     prefix = prefix_map.get((provider or "").lower(), "gemini")
     default_model_map = {
         "gemini": "gemini-2.5-pro",
@@ -217,6 +253,7 @@ def _compose_model_id(provider: str, model: Optional[str]) -> str:
     }
     chosen = model or default_model_map.get(prefix, "gemini-2.5-pro")
     return f"{prefix}/{chosen}"
+
 
 def _get_user_provider_token(user_id: str, provider: str) -> Optional[str]:
     """
@@ -235,6 +272,7 @@ def _get_user_provider_token(user_id: str, provider: str) -> Optional[str]:
     except Exception:
         return None
 
+
 # --- Firestore-backed conversation state -----------
 def _fs_default_state():
     return {
@@ -249,8 +287,10 @@ def _fs_default_state():
         "created_at": firestore.SERVER_TIMESTAMP,
     }
 
+
 def _fs_sess_ref(session_id: str):
     return _firestore_client.collection(FIRESTORE_COLLECTION_SESSIONS).document(session_id)
+
 
 def _get_conv_state(session_id: str) -> dict:
     doc = _fs_sess_ref(session_id).get()
@@ -265,10 +305,12 @@ def _get_conv_state(session_id: str) -> dict:
         _fs_sess_ref(session_id).set(state, merge=True)
         return state
 
+
 def _save_conv_state(session_id: str, state: dict):
     st = dict(state)
     st["updated_at"] = firestore.SERVER_TIMESTAMP
     _fs_sess_ref(session_id).set(st, merge=True)
+
 
 def _append_history(state: dict, role: str, content: str, max_len=10_000, keep_last=100):
     content = str(content)
@@ -278,11 +320,13 @@ def _append_history(state: dict, role: str, content: str, max_len=10_000, keep_l
     hist.append({"role": role, "content": content, "ts": time.time()})
     state["history"] = hist[-keep_last:]
 
+
 # --- GCS helpers -----------------------------------
 def _gcs_bucket():
     if not GCS_BUCKET:
         raise RuntimeError("GCS_BUCKET is not set")
     return _storage_client.bucket(GCS_BUCKET)
+
 
 def _metadata_sa_email() -> Optional[str]:
     """Fetch the service account email from GCE metadata (Cloud Run)."""
@@ -297,6 +341,7 @@ def _metadata_sa_email() -> Optional[str]:
     except Exception:
         pass
     return None
+
 
 def _signed_url(blob, filename: str, content_type: str, ttl_seconds: int) -> str:
     """
@@ -353,10 +398,16 @@ def _signed_url(blob, filename: str, content_type: str, ttl_seconds: int) -> str
         response_type=content_type,
     )
 
-def _use_supabase_for_charts() -> bool:
-    return (os.getenv("CHARTS_STORAGE", "gcs").lower() == "supabase") and (supabase_client is not None)
 
-def upload_diagram_to_supabase(local_path: str, *, domain: str, session_id: str, run_id: str, kind: str) -> dict:
+def _use_supabase_for_charts() -> bool:
+    return (os.getenv("CHARTS_STORAGE", "gcs").lower() == "supabase") and (
+        supabase_client is not None
+    )
+
+
+def upload_diagram_to_supabase(
+    local_path: str, *, domain: str, session_id: str, run_id: str, kind: str
+) -> dict:
     if not os.path.exists(local_path):
         raise FileNotFoundError(local_path)
     if supabase_client is None:
@@ -381,9 +432,12 @@ def upload_diagram_to_supabase(local_path: str, *, domain: str, session_id: str,
     signed_url = supabase_client.storage.from_(SUPABASE_BUCKET_CHARTS).create_signed_url(
         sb_path, expires_in=SUPABASE_SIGNED_TTL_SECONDS
     )["signed_url"]
-    public_url = supabase_client.storage.from_(SUPABASE_BUCKET_CHARTS).get_public_url(sb_path)["public_url"]
+    public_url = supabase_client.storage.from_(SUPABASE_BUCKET_CHARTS).get_public_url(sb_path)[
+        "public_url"
+    ]
 
     return {"sb_path": sb_path, "signed_url": signed_url, "public_url": public_url, "kind": kind}
+
 
 # ---- Local helpers / robust dev mode --------------
 def _upload_dataset_file_local(file_storage, *, domain: str) -> dict:
@@ -393,7 +447,14 @@ def _upload_dataset_file_local(file_storage, *, domain: str) -> dict:
     dest = os.path.join(folder, filename)
     file_storage.save(dest)
     size = os.path.getsize(dest) if os.path.exists(dest) else 0
-    return {"filename": filename, "gs_uri": "", "signed_url": "", "size_bytes": size, "local_path": dest}
+    return {
+        "filename": filename,
+        "gs_uri": "",
+        "signed_url": "",
+        "size_bytes": size,
+        "local_path": dest,
+    }
+
 
 def _save_bytes_local(domain: str, filename: str, data: bytes) -> dict:
     safe_domain = slug(domain)
@@ -402,7 +463,14 @@ def _save_bytes_local(domain: str, filename: str, data: bytes) -> dict:
     with open(dest, "wb") as f:
         f.write(data)
     size = os.path.getsize(dest)
-    return {"filename": filename, "gs_uri": "", "signed_url": "", "size_bytes": size, "local_path": dest}
+    return {
+        "filename": filename,
+        "gs_uri": "",
+        "signed_url": "",
+        "size_bytes": size,
+        "local_path": dest,
+    }
+
 
 # =========================
 # Polars DataFrame helpers (from latest pipeline)
@@ -412,6 +480,7 @@ def _normalize_columns_to_str(df: pl.DataFrame) -> pl.DataFrame:
     if new_names != df.columns:
         df = df.set_column_names(new_names)
     return df
+
 
 def _polars_info_string(df: pl.DataFrame) -> str:
     lines = [f"shape: {df.shape[0]} rows x {df.shape[1]} columns", "dtypes/nulls:"]
@@ -425,6 +494,7 @@ def _polars_info_string(df: pl.DataFrame) -> str:
         lines.append(f"  - {name}: {dtype} (nulls={n})")
     return "\n".join(lines)
 
+
 def _to_polars_dataframe(obj):
     if isinstance(obj, pl.DataFrame):
         return _normalize_columns_to_str(obj)
@@ -433,6 +503,7 @@ def _to_polars_dataframe(obj):
         return _normalize_columns_to_str(df)
     except Exception:
         return None
+
 
 def _as_pai_df(df):
     """
@@ -453,7 +524,10 @@ def _as_pai_df(df):
             pdf.columns = [str(c) for c in pdf.columns]
         return pai.DataFrame(pdf)
 
-def _read_csv_bytes_to_polars(data: bytes, sep_candidates: List[str] = (",", "|", ";", "\t")) -> pl.DataFrame:
+
+def _read_csv_bytes_to_polars(
+    data: bytes, sep_candidates: List[str] = (",", "|", ";", "\t")
+) -> pl.DataFrame:
     last_err = None
     for sep in sep_candidates:
         try:
@@ -468,10 +542,14 @@ def _read_csv_bytes_to_polars(data: bytes, sep_candidates: List[str] = (",", "|"
     except Exception as e:
         raise last_err or e
 
-def _read_local_csv_to_polars(path: str, sep_candidates: List[str] = (",", "|", ";", "\t")) -> pl.DataFrame:
+
+def _read_local_csv_to_polars(
+    path: str, sep_candidates: List[str] = (",", "|", ";", "\t")
+) -> pl.DataFrame:
     with open(path, "rb") as f:
         data = f.read()
     return _read_csv_bytes_to_polars(data, sep_candidates=sep_candidates)
+
 
 # ---- Upload (GCS when possible, safe local fallback otherwise) ----------------
 def upload_dataset_file(file_storage, *, domain: str) -> dict:
@@ -510,14 +588,18 @@ def upload_dataset_file(file_storage, *, domain: str) -> dict:
         # Only if upload to GCS itself fails, fallback to local
         return _upload_dataset_file_local(file_storage, domain=domain)
 
+
 def list_gcs_csvs(domain: str) -> List[storage.Blob]:
     safe_domain = slug(domain)
     prefix = f"{GCS_DATASETS_PREFIX}/{safe_domain}/"
     return list(_gcs_bucket().list_blobs(prefix=prefix))
 
-def read_gcs_csv_to_pl_df(gs_uri_or_blobname: str, *, sep_candidates: List[str] = (",","|",";","\t")) -> pl.DataFrame:
+
+def read_gcs_csv_to_pl_df(
+    gs_uri_or_blobname: str, *, sep_candidates: List[str] = (",", "|", ";", "\t")
+) -> pl.DataFrame:
     if gs_uri_or_blobname.startswith("gs://"):
-        _, bucket_name, *rest = gs_uri_or_blobname.replace("gs://","").split("/")
+        _, bucket_name, *rest = gs_uri_or_blobname.replace("gs://", "").split("/")
         blob_name = "/".join(rest)
         bucket = _storage_client.bucket(bucket_name)
     else:
@@ -527,15 +609,17 @@ def read_gcs_csv_to_pl_df(gs_uri_or_blobname: str, *, sep_candidates: List[str] 
     data = blob.download_as_bytes()
     return _read_csv_bytes_to_polars(data, sep_candidates=sep_candidates)
 
+
 def delete_gcs_object(blob_name_or_gs_uri: str):
     if blob_name_or_gs_uri.startswith("gs://"):
-        _, bucket_name, *rest = blob_name_or_gs_uri.replace("gs://","").split("/")
+        _, bucket_name, *rest = blob_name_or_gs_uri.replace("gs://", "").split("/")
         blob_name = "/".join(rest)
         bucket = _storage_client.bucket(bucket_name)
     else:
         bucket = _gcs_bucket()
         blob_name = blob_name_or_gs_uri
     bucket.blob(blob_name).delete()
+
 
 # ---- Diagrams (charts|tables) helper ------------
 def _detect_diagram_kind(local_html_path: str, visual_hint: str) -> str:
@@ -550,7 +634,10 @@ def _detect_diagram_kind(local_html_path: str, visual_hint: str) -> str:
         pass
     return "tables" if str(visual_hint).lower().strip() == "table" else "charts"
 
-def upload_diagram_to_gcs(local_path: str, *, domain: str, session_id: str, run_id: str, kind: str) -> dict:
+
+def upload_diagram_to_gcs(
+    local_path: str, *, domain: str, session_id: str, run_id: str, kind: str
+) -> dict:
     if not os.path.exists(local_path):
         raise FileNotFoundError(local_path)
     safe_domain = slug(domain)
@@ -569,6 +656,7 @@ def upload_diagram_to_gcs(local_path: str, *, domain: str, session_id: str, run_
         "public_url": f"https://storage.googleapis.com/{GCS_BUCKET}/{blob_name}",
         "kind": kind,
     }
+
 
 # =========================
 # Latest Pipeline Configs (router/orchestrator/agents)
@@ -699,10 +787,13 @@ domain_specific_configuration = """1. Use period labels like m0 (current month) 
 9. MoM is month after month in percentage
 10. Subs is taker."""
 
+
 # =========================
 # Shared Data Loading (Polars-first)
 # =========================
-def _load_domain_dataframes(domain: str, dataset_filters: Optional[set]) -> Tuple[Dict[str, pl.DataFrame], Dict[str, str], Dict[str, str]]:
+def _load_domain_dataframes(
+    domain: str, dataset_filters: Optional[set]
+) -> Tuple[Dict[str, pl.DataFrame], Dict[str, str], Dict[str, str]]:
     dfs: Dict[str, pl.DataFrame] = {}
     data_info: Dict[str, str] = {}
     data_describe: Dict[str, str] = {}
@@ -753,10 +844,19 @@ def _load_domain_dataframes(domain: str, dataset_filters: Optional[set]) -> Tupl
 
     return dfs, data_info, data_describe
 
+
 # =========================
 # Router (a0.0.7) - UPDATED: accept llm model & api_key
 # =========================
-def _run_router(user_prompt: str, data_info, data_describe, state: dict, *, llm_model: str, llm_api_key: Optional[str]) -> dict:
+def _run_router(
+    user_prompt: str,
+    data_info,
+    data_describe,
+    state: dict,
+    *,
+    llm_model: str,
+    llm_api_key: Optional[str],
+) -> dict:
     """
     Returns a dict:
       {
@@ -778,16 +878,21 @@ def _run_router(user_prompt: str, data_info, data_describe, state: dict, *, llm_
         model=llm_model,
         messages=[
             {"role": "system", "content": router_system_configuration.strip()},
-            {"role": "user", "content":
-                f"""Make sure all of the information below is applied.
+            {
+                "role": "user",
+                "content": f"""Make sure all of the information below is applied.
                 User Prompt: {user_prompt}
                 Recent Context: {recent_context}
                 Data Info (summary): {data_info}
-                Data Describe (summary): {data_describe}"""
+                Data Describe (summary): {data_describe}""",
             },
         ],
-        seed=1, stream=False, verbosity="low", drop_params=True, reasoning_effort="high",
-        api_key=llm_api_key
+        seed=1,
+        stream=False,
+        verbosity="low",
+        drop_params=True,
+        reasoning_effort="high",
+        api_key=llm_api_key,
     )
     router_content = get_content(router_response)
     try:
@@ -795,14 +900,32 @@ def _run_router(user_prompt: str, data_info, data_describe, state: dict, *, llm_
     except Exception:
         p = user_prompt.lower()
         need_visual = bool(re.search(r"\b(chart|plot|graph|visual|bar|line|table)\b", p))
-        optimize_terms = bool(re.search(r"\b(allocate|allocation|optimal|optimi[sz]e|plan|planning|min(?:imum)? number|minimum number|close (?:the )?gap|gap closure|takers?)\b", p))
-        need_analyze = bool(re.search(r"\b(why|driver|explain|root cause|trend|surprise|reason)\b", p)) or optimize_terms
-        follow_up = bool(re.search(r"\b(what about|and|how about|ok but|also)\b", p)) or len(p.split()) <= 8
+        optimize_terms = bool(
+            re.search(
+                r"\b(allocate|allocation|optimal|optimi[sz]e|plan|planning|min(?:imum)? number|minimum number|close (?:the )?gap|gap closure|takers?)\b",
+                p,
+            )
+        )
+        need_analyze = (
+            bool(re.search(r"\b(why|driver|explain|root cause|trend|surprise|reason)\b", p))
+            or optimize_terms
+        )
+        follow_up = (
+            bool(re.search(r"\b(what about|and|how about|ok but|also)\b", p)) or len(p.split()) <= 8
+        )
         need_manip = not follow_up  # reuse if follow-up
-        visual_hint = "bar" if "bar" in p else ("line" if "line" in p else ("table" if ("table" in p or optimize_terms) else "auto"))
+        visual_hint = (
+            "bar"
+            if "bar" in p
+            else (
+                "line" if "line" in p else ("table" if ("table" in p or optimize_terms) else "auto")
+            )
+        )
         plan = {
             "need_manipulator": bool(need_manip),
-            "need_visualizer": bool(need_visual or ("ranked plan" in p) or ("showing [" in p) or optimize_terms),
+            "need_visualizer": bool(
+                need_visual or ("ranked plan" in p) or ("showing [" in p) or optimize_terms
+            ),
             "need_analyzer": bool(need_analyze or not need_visual),
             "need_plan_explainer": True,
             "need_compiler": True,
@@ -814,9 +937,16 @@ def _run_router(user_prompt: str, data_info, data_describe, state: dict, *, llm_
 
     # Hard guard for allocation/gap prompts
     p_low = user_prompt.lower()
-    if re.search(r"\b(min(?:imum)? number|minimum number of additional takers|additional takers|close (?:the )?gap|gap closure|optimal allocation|allocate|allocation|optimi[sz]e)\b", p_low):
+    if re.search(
+        r"\b(min(?:imum)? number|minimum number of additional takers|additional takers|close (?:the )?gap|gap closure|optimal allocation|allocate|allocation|optimi[sz]e)\b",
+        p_low,
+    ):
         plan["need_analyzer"] = True
-        plan["need_visualizer"] = True if "need_visualizer" not in plan or not plan["need_visualizer"] else plan["need_visualizer"]
+        plan["need_visualizer"] = (
+            True
+            if "need_visualizer" not in plan or not plan["need_visualizer"]
+            else plan["need_visualizer"]
+        )
         if plan.get("visual_hint", "auto") == "auto":
             plan["visual_hint"] = "table"
         plan["reason"] = (plan.get("reason") or "") + " + analyzer-for-gap/allocation tasks"
@@ -825,14 +955,27 @@ def _run_router(user_prompt: str, data_info, data_describe, state: dict, *, llm_
     plan["_elapsed"] = float(router_end - router_start)
     return plan
 
+
 # =========================
 # Orchestrate (a0.0.7) - UPDATED: accept llm model & api_key
 # =========================
-def _run_orchestrator(user_prompt: str, domain: str, data_info, data_describe, visual_hint: str, context_hint: dict, *, llm_model: str, llm_api_key: Optional[str]):
+def _run_orchestrator(
+    user_prompt: str,
+    domain: str,
+    data_info,
+    data_describe,
+    visual_hint: str,
+    context_hint: dict,
+    *,
+    llm_model: str,
+    llm_api_key: Optional[str],
+):
     resp = completion(
         model=llm_model,
         messages=[
-            {"role": "system", "content": f"""
+            {
+                "role": "system",
+                "content": f"""
             You are the Orchestrator.
             Make sure all of the information below is applied.
 
@@ -855,27 +998,38 @@ def _run_orchestrator(user_prompt: str, domain: str, data_info, data_describe, v
             {user_specific_configuration}
 
             domain_specific_configuration:
-            {domain_specific_configuration}"""},
-
-            {"role": "user", "content":
-                f"""Make sure all of the information below is applied.
+            {domain_specific_configuration}""",
+            },
+            {
+                "role": "user",
+                "content": f"""Make sure all of the information below is applied.
                 User Prompt: {user_prompt}
                 Datasets Domain name: {domain}.
                 df.info of each dfs key(file name)-value pair:\n{data_info}.
                 df.describe of each dfs key(file name)-value pair:\n{data_describe}.
                 Router Context Hint: {json.dumps(context_hint)}
-                Visualization hint (from router): {visual_hint}"""
-            }
+                Visualization hint (from router): {visual_hint}""",
+            },
         ],
-        seed=1, stream=False, verbosity="low", drop_params=True, reasoning_effort="high",
-        api_key=llm_api_key
+        seed=1,
+        stream=False,
+        verbosity="low",
+        drop_params=True,
+        reasoning_effort="high",
+        api_key=llm_api_key,
     )
     content = get_content(resp)
     try:
         spec = _safe_json_loads(content)
     except Exception:
-        spec = {"manipulator_prompt":"", "visualizer_prompt":"", "analyzer_prompt":"", "compiler_instruction":""}
+        spec = {
+            "manipulator_prompt": "",
+            "visualizer_prompt": "",
+            "analyzer_prompt": "",
+            "compiler_instruction": "",
+        }
     return spec
+
 
 # =========================
 # Health & Static
@@ -884,10 +1038,12 @@ def _run_orchestrator(user_prompt: str, domain: str, data_info, data_describe, v
 def health():
     return jsonify({"status": "healthy", "ts": datetime.utcnow().isoformat()})
 
+
 # 🔧 Tambah root route biar gak 404 pas akses domain dasar Cloud Run
 @app.get("/")
 def root():
     return jsonify({"ok": True, "service": "ConvoInsight BE", "health": "/health"})
+
 
 @app.route("/charts/<path:relpath>")
 def serve_chart(relpath):
@@ -896,12 +1052,14 @@ def serve_chart(relpath):
     filename = os.path.basename(full)
     return send_from_directory(base, filename)
 
+
 # =========================
 # Provider key management
 # =========================
 def _require_fernet():
     if not fernet:
         raise RuntimeError("FERNET_KEY is not configured on server")
+
 
 @app.route("/validate-key", methods=["POST"])
 def validate_key():
@@ -932,12 +1090,9 @@ def validate_key():
         encrypted_key = fernet.encrypt(api_key.encode()).decode()
         save_provider_key(user_id, provider, encrypted_key, models)
 
-        return jsonify({
-            "valid": True,
-            "provider": provider,
-            "models": models,
-            "token": encrypted_key
-        })
+        return jsonify(
+            {"valid": True, "provider": provider, "models": models, "token": encrypted_key}
+        )
 
     except Exception as e:
         return jsonify({"valid": False, "error": str(e)}), 500
@@ -950,8 +1105,11 @@ def get_provider_keys():
         if not user_id:
             return jsonify({"error": "Missing userId"}), 400
 
-        docs = (_firestore_client.collection(FIRESTORE_COLLECTION_PROVIDERS)
-                .where("user_id", "==", user_id).stream())
+        docs = (
+            _firestore_client.collection(FIRESTORE_COLLECTION_PROVIDERS)
+            .where("user_id", "==", user_id)
+            .stream()
+        )
 
         items = []
         for doc in docs:
@@ -961,19 +1119,19 @@ def get_provider_keys():
                 updated_at = raw_updated.isoformat()
             else:
                 updated_at = str(raw_updated) if raw_updated else None
-            items.append({
-                "id": doc.id,
-                "provider": d.get("provider"),
-                "models": d.get("models", []),
-                "is_active": d.get("is_active", True),
-                "updated_at": updated_at,
-            })
+            items.append(
+                {
+                    "id": doc.id,
+                    "provider": d.get("provider"),
+                    "models": d.get("models", []),
+                    "is_active": d.get("is_active", True),
+                    "updated_at": updated_at,
+                }
+            )
 
-        return jsonify({
-            "items": items,
-            "count": len(items),
-            "summary": f"{len(items)} provider keys found"
-        })
+        return jsonify(
+            {"items": items, "count": len(items), "summary": f"{len(items)} provider keys found"}
+        )
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -1001,14 +1159,19 @@ def update_provider_key():
         encrypted_key = fernet.encrypt(api_key.encode()).decode()
         models = groups.get(provider, [])
 
-        doc_ref = _firestore_client.collection(FIRESTORE_COLLECTION_PROVIDERS).document(f"{user_id}_{provider}")
-        doc_ref.set({
-            "user_id": user_id,
-            "provider": provider,
-            "token": encrypted_key,
-            "models": models,
-            "updated_at": firestore.SERVER_TIMESTAMP
-        }, merge=True)
+        doc_ref = _firestore_client.collection(FIRESTORE_COLLECTION_PROVIDERS).document(
+            f"{user_id}_{provider}"
+        )
+        doc_ref.set(
+            {
+                "user_id": user_id,
+                "provider": provider,
+                "token": encrypted_key,
+                "models": models,
+                "updated_at": firestore.SERVER_TIMESTAMP,
+            },
+            merge=True,
+        )
 
         return jsonify({"updated": True, "models": models})
 
@@ -1041,6 +1204,7 @@ def delete_provider_key():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+
 # =============== NEW: LiteLLM full model list (grouped) =================
 def _infer_provider_from_model_id(model_id: str) -> str:
     """Heuristic grouping for LiteLLM model IDs."""
@@ -1049,9 +1213,12 @@ def _infer_provider_from_model_id(model_id: str) -> str:
     # Path-style: take first segment
     if "/" in low:
         first = low.split("/")[0]
-        if first in ("gemini", "google"): return "google"
-        if first in ("openai", "anthropic", "groq", "mistral", "cohere"): return first
-        if first in ("azure", "azure_ai"): return first
+        if first in ("gemini", "google"):
+            return "google"
+        if first in ("openai", "anthropic", "groq", "mistral", "cohere"):
+            return first
+        if first in ("azure", "azure_ai"):
+            return first
         return first
 
     # Region-prefixed dotted forms: us.anthropic.claude-... → anthropic
@@ -1063,7 +1230,20 @@ def _infer_provider_from_model_id(model_id: str) -> str:
 
     # Heuristics by common prefixes
     starts = lambda *pfx: any(low.startswith(p) for p in pfx)
-    if starts("gpt-", "o1", "o3", "omni-", "chatgpt-", "text-embedding", "babbage", "davinci", "whisper", "ft:", "tts-", "gpt-5"):
+    if starts(
+        "gpt-",
+        "o1",
+        "o3",
+        "omni-",
+        "chatgpt-",
+        "text-embedding",
+        "babbage",
+        "davinci",
+        "whisper",
+        "ft:",
+        "tts-",
+        "gpt-5",
+    ):
         return "openai"
     if starts("gemini", "palm", "chat-bison", "text-bison", "learnlm", "veo", "imagen", "gemma"):
         return "google"
@@ -1131,12 +1311,14 @@ def _infer_provider_from_model_id(model_id: str) -> str:
         return "meta"
     return "other"
 
+
 def _group_litellm_models():
     groups = defaultdict(set)
     for mid in LITELLM_MODEL_LIST:
         prov = _infer_provider_from_model_id(mid)
         groups[prov].add(mid)
     return {k: sorted(list(v)) for k, v in sorted(groups.items(), key=lambda kv: kv[0])}
+
 
 @app.get("/litellm/models")
 def litellm_models():
@@ -1149,24 +1331,25 @@ def litellm_models():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+
 @app.route("/litellm/providers", methods=["GET"])
 def litellm_providers():
     import litellm
+
     version = getattr(litellm, "__version__", "unknown")
     try:
         providers = sorted({p.name for p in litellm.provider_list})
-        return jsonify({
-            "count": len(providers),
-            "providers": providers,
-            "version": version
-        })
+        return jsonify({"count": len(providers), "providers": providers, "version": version})
     except Exception as e:
         return jsonify({"error": str(e), "version": version}), 500
+
 
 @app.get("/debug/routes")
 def debug_routes():
     from flask import current_app
+
     return {"routes": sorted([r.rule for r in current_app.url_map.iter_rules()])}
+
 
 # =========================
 # Datasets CRUD + Domain listing
@@ -1186,9 +1369,10 @@ def list_domains():
         try:
             metas = _list_dataset_meta()
             for m in metas:
-                d = m.get("domain","")
-                f = m.get("filename","")
-                if not d or not f: continue
+                d = m.get("domain", "")
+                f = m.get("filename", "")
+                if not d or not f:
+                    continue
                 result.setdefault(d, [])
                 if f not in result[d]:
                     result[d].append(f)
@@ -1198,9 +1382,11 @@ def list_domains():
     except Exception as e:
         return jsonify({"detail": str(e)}), 500
 
+
 def _ds_ref(domain: str, filename: str):
     key = f"{slug(domain)}::{filename}"
     return _firestore_client.collection(FIRESTORE_COLLECTION_DATASETS).document(key)
+
 
 def _save_dataset_meta(domain: str, filename: str, gs_uri: str, size: int):
     meta = {
@@ -1213,10 +1399,12 @@ def _save_dataset_meta(domain: str, filename: str, gs_uri: str, size: int):
     }
     _ds_ref(domain, filename).set(meta, merge=True)
 
+
 def _delete_dataset_meta(domain: str, filename: str):
     _ds_ref(domain, filename).delete()
 
-def _list_dataset_meta(domain: Optional[str]=None, limit: int=200) -> List[dict]:
+
+def _list_dataset_meta(domain: Optional[str] = None, limit: int = 200) -> List[dict]:
     col = _firestore_client.collection(FIRESTORE_COLLECTION_DATASETS)
     q = col.order_by("updated_at", direction=firestore.Query.DESCENDING)
     if domain:
@@ -1224,23 +1412,25 @@ def _list_dataset_meta(domain: Optional[str]=None, limit: int=200) -> List[dict]
     docs = q.limit(limit).stream()
     return [d.to_dict() for d in docs if d.exists]
 
+
 @app.post("/datasets/upload")
 def datasets_upload():
     try:
         domain = request.form.get("domain")
         file = request.files.get("file")
         if not domain or not file:
-            return jsonify({"detail":"Missing 'domain' or 'file'"}), 400
+            return jsonify({"detail": "Missing 'domain' or 'file'"}), 400
         uploaded = upload_dataset_file(file, domain=domain)
         return jsonify(uploaded), 201
     except Exception as e:
         return jsonify({"detail": str(e)}), 500
 
+
 @app.get("/datasets")
 def datasets_list():
     try:
         domain = request.args.get("domain")
-        add_signed = request.args.get("signed","false").lower() in ("1","true","yes")
+        add_signed = request.args.get("signed", "false").lower() in ("1", "true", "yes")
         items = []
 
         # 1) Firestore metadata (jika ada)
@@ -1249,15 +1439,18 @@ def datasets_list():
             if add_signed:
                 for it in items:
                     try:
-                        gs_uri = it.get("gs_uri","")
+                        gs_uri = it.get("gs_uri", "")
                         if not gs_uri:
-                            it.setdefault("signed_url",""); continue
-                        _, bucket_name, *rest = gs_uri.replace("gs://","").split("/")
+                            it.setdefault("signed_url", "")
+                            continue
+                        _, bucket_name, *rest = gs_uri.replace("gs://", "").split("/")
                         blob_name = "/".join(rest)
                         blob = _storage_client.bucket(bucket_name).blob(blob_name)
-                        it["signed_url"] = _signed_url(blob, it["filename"], "text/csv", GCS_SIGNED_URL_TTL_SECONDS)
+                        it["signed_url"] = _signed_url(
+                            blob, it["filename"], "text/csv", GCS_SIGNED_URL_TTL_SECONDS
+                        )
                     except Exception:
-                        it.setdefault("signed_url","")
+                        it.setdefault("signed_url", "")
         except Exception:
             items = []
 
@@ -1279,7 +1472,9 @@ def datasets_list():
                     }
                     if add_signed:
                         try:
-                            rec["signed_url"] = _signed_url(b, fname, "text/csv", GCS_SIGNED_URL_TTL_SECONDS)
+                            rec["signed_url"] = _signed_url(
+                                b, fname, "text/csv", GCS_SIGNED_URL_TTL_SECONDS
+                            )
                         except Exception:
                             pass
                     items.append(rec)
@@ -1295,18 +1490,21 @@ def datasets_list():
                     if name.lower().endswith(".csv") and (slug(domain), name) not in known:
                         path = os.path.join(domain_dir, name)
                         size = os.path.getsize(path)
-                        items.append({
-                            "domain": slug(domain),
-                            "filename": name,
-                            "gs_uri": "",
-                            "size_bytes": size,
-                            "signed_url": ""
-                        })
+                        items.append(
+                            {
+                                "domain": slug(domain),
+                                "filename": name,
+                                "gs_uri": "",
+                                "size_bytes": size,
+                                "signed_url": "",
+                            }
+                        )
 
         # IMPORTANT: kembalikan *dua* key supaya FE lama/baru sama-sama jalan
-        return jsonify({ "items": items, "datasets": items })
+        return jsonify({"items": items, "datasets": items})
     except Exception as e:
         return jsonify({"detail": str(e)}), 500
+
 
 # ✅ NEW: Return all datasets for a given domain (path-based)
 @app.get("/datasets/<domain>/all")
@@ -1379,17 +1577,20 @@ def datasets_list_all(domain):
                 if name.lower().endswith(".csv") and (slug(domain), name) not in known:
                     path = os.path.join(domain_dir, name)
                     size = os.path.getsize(path)
-                    items.append({
-                        "domain": slug(domain),
-                        "filename": name,
-                        "gs_uri": "",
-                        "size_bytes": size,
-                        "signed_url": "",
-                    })
+                    items.append(
+                        {
+                            "domain": slug(domain),
+                            "filename": name,
+                            "gs_uri": "",
+                            "size_bytes": size,
+                            "signed_url": "",
+                        }
+                    )
 
         return jsonify({"items": items, "datasets": items})
     except Exception as e:
         return jsonify({"detail": str(e)}), 500
+
 
 @app.delete("/datasets/<domain>/all")
 def datasets_delete_all(domain):
@@ -1438,11 +1639,12 @@ def datasets_delete_all(domain):
     except Exception as e:
         return jsonify({"detail": str(e)}), 500
 
+
 @app.get("/datasets/<domain>/<path:filename>")
 def datasets_read(domain, filename):
     try:
-        n = int(request.args.get("n","50"))
-        as_fmt = request.args.get("as","json")
+        n = int(request.args.get("n", "50"))
+        as_fmt = request.args.get("as", "json")
         if GCS_BUCKET:
             blob_name = f"{GCS_DATASETS_PREFIX}/{slug(domain)}/{filename}"
             df = read_gcs_csv_to_pl_df(blob_name)
@@ -1456,10 +1658,11 @@ def datasets_read(domain, filename):
         if as_fmt == "csv":
             out = io.StringIO()
             df.write_csv(out)
-            return out.getvalue(), 200, {"Content-Type":"text/csv; charset=utf-8"}
+            return out.getvalue(), 200, {"Content-Type": "text/csv; charset=utf-8"}
         return jsonify({"records": df.to_dicts()})
     except Exception as e:
         return jsonify({"detail": str(e)}), 500
+
 
 @app.delete("/datasets/<domain>/<path:filename>")
 def datasets_delete(domain, filename):
@@ -1481,13 +1684,15 @@ def datasets_delete(domain, filename):
     except Exception as e:
         return jsonify({"detail": str(e)}), 500
 
+
 # FE compatibility
 @app.post("/upload_datasets/<domain>")
 def compat_upload_datasets(domain: str):
     try:
         files: List = []
         single = request.files.get("file")
-        if single: files.append(single)
+        if single:
+            files.append(single)
         files.extend(request.files.getlist("files"))
         files.extend(request.files.getlist("files[]"))
 
@@ -1496,7 +1701,11 @@ def compat_upload_datasets(domain: str):
             uploads.append(upload_dataset_file(f, domain=domain))
 
         if not uploads and request.data:
-            fname = request.args.get("filename") or request.headers.get("X-Filename") or f"upload_{int(time.time())}.csv"
+            fname = (
+                request.args.get("filename")
+                or request.headers.get("X-Filename")
+                or f"upload_{int(time.time())}.csv"
+            )
             uploads.append(_save_bytes_local(domain, fname, request.data))
 
         if not uploads:
@@ -1506,6 +1715,7 @@ def compat_upload_datasets(domain: str):
     except Exception as e:
         return jsonify({"detail": str(e)}), 500
 
+
 @app.get("/domains/<domain>/datasets")
 def compat_list_domain_datasets(domain: str):
     try:
@@ -1513,15 +1723,17 @@ def compat_list_domain_datasets(domain: str):
         try:
             fs_items = _list_dataset_meta(domain=domain)
             for it in fs_items:
-                gs_uri = it.get("gs_uri","")
+                gs_uri = it.get("gs_uri", "")
                 if gs_uri:
                     try:
-                        _, bucket_name, *rest = gs_uri.replace("gs://","").split("/")
+                        _, bucket_name, *rest = gs_uri.replace("gs://", "").split("/")
                         blob_name = "/".join(rest)
                         blob = _storage_client.bucket(bucket_name).blob(blob_name)
-                        it["signed_url"] = _signed_url(blob, it["filename"], "text/csv", GCS_SIGNED_URL_TTL_SECONDS)
+                        it["signed_url"] = _signed_url(
+                            blob, it["filename"], "text/csv", GCS_SIGNED_URL_TTL_SECONDS
+                        )
                     except Exception:
-                        it.setdefault("signed_url","")
+                        it.setdefault("signed_url", "")
             items.extend(fs_items)
         except Exception:
             pass
@@ -1529,12 +1741,20 @@ def compat_list_domain_datasets(domain: str):
         try:
             domain_dir = os.path.join(DATASETS_ROOT, slug(domain))
             if os.path.isdir(domain_dir):
-                known_names = { i.get("filename") for i in items }
+                known_names = {i.get("filename") for i in items}
                 for name in sorted(os.listdir(domain_dir)):
                     if name.lower().endswith(".csv") and name not in known_names:
                         path = os.path.join(domain_dir, name)
                         size = os.path.getsize(path)
-                        items.append({"domain": slug(domain), "filename": name, "gs_uri": "", "size_bytes": size, "signed_url": ""})
+                        items.append(
+                            {
+                                "domain": slug(domain),
+                                "filename": name,
+                                "gs_uri": "",
+                                "size_bytes": size,
+                                "signed_url": "",
+                            }
+                        )
         except Exception:
             pass
 
@@ -1542,9 +1762,11 @@ def compat_list_domain_datasets(domain: str):
     except Exception as e:
         return jsonify({"detail": str(e)}), 500
 
+
 @app.get("/domains/<domain>/datasets")
 def compat_list_domain_datasets_trailing(domain: str):
     return compat_list_domain_datasets(domain)
+
 
 # =========================
 # Sessions / PDF Export / Cancel
@@ -1552,43 +1774,59 @@ def compat_list_domain_datasets_trailing(domain: str):
 @app.get("/sessions")
 def sessions_list():
     try:
-        limit = int(request.args.get("limit","20"))
+        limit = int(request.args.get("limit", "20"))
         col = _firestore_client.collection(FIRESTORE_COLLECTION_SESSIONS)
-        docs = col.order_by("updated_at", direction=firestore.Query.DESCENDING).limit(limit).stream()
+        docs = (
+            col.order_by("updated_at", direction=firestore.Query.DESCENDING).limit(limit).stream()
+        )
         items = []
         for d in docs:
-            if not d.exists: continue
+            if not d.exists:
+                continue
             data = d.to_dict() or {}
-            items.append({
-                "session_id": d.id,
-                "updated_at": str(data.get("updated_at","")),
-                "created_at": str(data.get("created_at","")),
-                "last_visual_signed_url": data.get("last_visual_signed_url","") or "",
-                "last_visual_kind": data.get("last_visual_kind",""),
-                "last_plan": data.get("last_plan"),
-            })
+            items.append(
+                {
+                    "session_id": d.id,
+                    "updated_at": str(data.get("updated_at", "")),
+                    "created_at": str(data.get("created_at", "")),
+                    "last_visual_signed_url": data.get("last_visual_signed_url", "") or "",
+                    "last_visual_kind": data.get("last_visual_kind", ""),
+                    "last_plan": data.get("last_plan"),
+                }
+            )
         return jsonify({"items": items})
     except Exception as e:
         return jsonify({"detail": str(e)}), 500
+
 
 @app.get("/sessions/<session_id>/history")
 def sessions_history(session_id):
     try:
         st = _get_conv_state(session_id)
-        return jsonify({
-            "session_id": session_id,
-            "history": st.get("history", []),
-            "last_visual_signed_url": st.get("last_visual_signed_url",""),
-            "last_visual_kind": st.get("last_visual_kind",""),
-            "last_plan": st.get("last_plan"),
-        })
+        return jsonify(
+            {
+                "session_id": session_id,
+                "history": st.get("history", []),
+                "last_visual_signed_url": st.get("last_visual_signed_url", ""),
+                "last_visual_kind": st.get("last_visual_kind", ""),
+                "last_plan": st.get("last_plan"),
+            }
+        )
     except Exception as e:
         return jsonify({"detail": str(e)}), 500
+
 
 @app.get("/sessions/<session_id>/export/pdf")
 def sessions_export_pdf(session_id: str):
     if not _REPORTLAB_AVAILABLE:
-        return jsonify({"detail": "PDF export requires 'reportlab'. Install first: uv pip install reportlab"}), 501
+        return (
+            jsonify(
+                {
+                    "detail": "PDF export requires 'reportlab'. Install first: uv pip install reportlab"
+                }
+            ),
+            501,
+        )
     try:
         state = _get_conv_state(session_id)
         history: List[dict] = state.get("history", [])
@@ -1596,8 +1834,10 @@ def sessions_export_pdf(session_id: str):
         doc = SimpleDocTemplate(buf, pagesize=A4)
         styles = getSampleStyleSheet()
         title = styles["Heading1"]
-        meta  = styles["Normal"]
-        body  = ParagraphStyle("Body", parent=styles["BodyText"], fontSize=10, leading=14, alignment=TA_LEFT)
+        meta = styles["Normal"]
+        body = ParagraphStyle(
+            "Body", parent=styles["BodyText"], fontSize=10, leading=14, alignment=TA_LEFT
+        )
         role_style = styles["Heading3"]
 
         story: List = []
@@ -1619,16 +1859,24 @@ def sessions_export_pdf(session_id: str):
                     content = json.dumps(content, ensure_ascii=False, indent=2)
                 safe = html.escape(content).replace("\n", "<br/>")
 
-                story.append(Paragraph(f"{i}. <b>{role}</b> <font size=9 color='#666666'>({ts_str})</font>", role_style))
+                story.append(
+                    Paragraph(
+                        f"{i}. <b>{role}</b> <font size=9 color='#666666'>({ts_str})</font>",
+                        role_style,
+                    )
+                )
                 story.append(Paragraph(safe, body))
                 story.append(Spacer(1, 8))
 
         doc.build(story)
         buf.seek(0)
         filename = f"chat_session_{session_id}.pdf"
-        return send_file(buf, mimetype="application/pdf", as_attachment=True, download_name=filename)
+        return send_file(
+            buf, mimetype="application/pdf", as_attachment=True, download_name=filename
+        )
     except Exception as e:
         return jsonify({"detail": str(e)}), 500
+
 
 @app.post("/query/cancel")
 def query_cancel():
@@ -1636,11 +1884,12 @@ def query_cancel():
         body = request.get_json(force=True) if request.data else {}
         session_id = body.get("session_id")
         if not session_id:
-            return jsonify({"detail":"Missing 'session_id'"}), 400
+            return jsonify({"detail": "Missing 'session_id'"}), 400
         _CANCEL_FLAGS.add(session_id)
         return jsonify({"ok": True})
     except Exception as e:
         return jsonify({"detail": str(e)}), 500
+
 
 # =========================
 # NEW: Suggestion Endpoint (a0.0.7)
@@ -1660,11 +1909,11 @@ def suggest():
             return jsonify({"detail": "No API key configured"}), 500
 
         body = request.get_json(force=True)
-        domain_in  = body.get("domain")
+        domain_in = body.get("domain")
         dataset_field = body.get("dataset")
 
         if not domain_in:
-            return jsonify({"detail":"Missing 'domain'"}), 400
+            return jsonify({"detail": "Missing 'domain'"}), 400
 
         domain = slug(domain_in)
         if isinstance(dataset_field, list):
@@ -1680,34 +1929,55 @@ def suggest():
         r = completion(
             model="gemini/gemini-2.5-pro",
             messages=[
-                {"role":"system","content":"""
+                {
+                    "role": "system",
+                    "content": """
                 Make sure all of the information below is applied.
                 1. Based on the provided dataset(s), Suggest exactly 4 realistic user prompt in a format of a STRICT one-line JSON with keys: suggestion1, suggestion2, suggestion3, suggestion4.
                 2. Each suggestion should be less than 100 characters. No prose beyond the JSON.
                 3. Each value must be a single-line string. No extra keys, no prose, no markdown/code fences.
-                """},
-                {"role":"user","content":
-                    f"""Make sure all of the information below is applied.
+                """,
+                },
+                {
+                    "role": "user",
+                    "content": f"""Make sure all of the information below is applied.
                     Datasets Domain name: {domain}.
                     df.info of each dfs key(file name)-value pair:
                     {data_info}.
                     df.describe of each dfs key(file name)-value pair:
-                    {data_describe}."""
-                }
+                    {data_describe}.""",
+                },
             ],
-            seed=1, stream=False, verbosity="low", drop_params=True, reasoning_effort="high",
+            seed=1,
+            stream=False,
+            verbosity="low",
+            drop_params=True,
+            reasoning_effort="high",
         )
         content = get_content(r)
         try:
-            m = re.search(r'\{.*\}', content, re.DOTALL)
+            m = re.search(r"\{.*\}", content, re.DOTALL)
             js = json.loads(m.group(0)) if m else {}
         except Exception:
             js = {}
-        suggestions = [js.get("suggestion1",""), js.get("suggestion2",""), js.get("suggestion3",""), js.get("suggestion4","")]
+        suggestions = [
+            js.get("suggestion1", ""),
+            js.get("suggestion2", ""),
+            js.get("suggestion3", ""),
+            js.get("suggestion4", ""),
+        ]
         elapsed = time.time() - t0
-        return jsonify({"suggestions": suggestions, "elapsed": elapsed, "data_info": data_info, "data_describe": data_describe})
+        return jsonify(
+            {
+                "suggestions": suggestions,
+                "elapsed": elapsed,
+                "data_info": data_info,
+                "data_describe": data_describe,
+            }
+        )
     except Exception as e:
         return jsonify({"detail": str(e)}), 500
+
 
 # =========================
 # NEW: Query/Inferencing Endpoint (a0.0.7, Polars pipeline)
@@ -1731,18 +2001,18 @@ def query():
     t0 = time.time()
     try:
         body = request.get_json(force=True)
-        domain_in  = body.get("domain")
-        prompt     = body.get("prompt")
+        domain_in = body.get("domain")
+        prompt = body.get("prompt")
         session_id = body.get("session_id") or str(uuid.uuid4())
 
         # NEW: provider/model/userId for multi-provider support
         provider_in = body.get("provider") or "google"
-        model_in    = body.get("model")
-        user_id_in  = body.get("userId")
+        model_in = body.get("model")
+        user_id_in = body.get("userId")
 
         # Compose model id + API key resolution
         chosen_model_id = _compose_model_id(provider_in, model_in)
-        chosen_api_key  = None
+        chosen_api_key = None
         if user_id_in and provider_in:
             chosen_api_key = _get_user_provider_token(user_id_in, provider_in)
         # Fallback to GEMINI_API_KEY when no user token
@@ -1763,7 +2033,14 @@ def query():
         if not domain_in or not prompt:
             return jsonify({"detail": "Missing 'domain' or 'prompt'"}), 400
         if not chosen_api_key:
-            return jsonify({"detail": "No API key available for the selected provider. Save a key first or send userId/provider."}), 400
+            return (
+                jsonify(
+                    {
+                        "detail": "No API key available for the selected provider. Save a key first or send userId/provider."
+                    }
+                ),
+                400,
+            )
 
         domain = slug(domain_in)
 
@@ -1781,22 +2058,53 @@ def query():
                 available = []
                 domain_dir = os.path.join(DATASETS_ROOT, domain)
                 if os.path.isdir(domain_dir):
-                    available.extend(sorted([f for f in os.listdir(domain_dir) if f.lower().endswith(".csv")]))
+                    available.extend(
+                        sorted([f for f in os.listdir(domain_dir) if f.lower().endswith(".csv")])
+                    )
                 try:
                     if GCS_BUCKET:
-                        available.extend(sorted({os.path.basename(b.name) for b in list_gcs_csvs(domain) if b.name.lower().endswith(".csv")}))
+                        available.extend(
+                            sorted(
+                                {
+                                    os.path.basename(b.name)
+                                    for b in list_gcs_csvs(domain)
+                                    if b.name.lower().endswith(".csv")
+                                }
+                            )
+                        )
                 except Exception:
                     pass
-                return jsonify({
-                    "code": "DATASET_NOT_FOUND",
-                    "detail": f"Requested datasets {sorted(list(dataset_filters))} not found in domain '{domain}'.",
-                    "domain": domain,
-                    "available": sorted(list(set(available))),
-                }), 404
-            return jsonify({"code":"NEED_UPLOAD", "detail": f"No CSV files found in domain '{domain}'", "domain": domain}), 409
+                return (
+                    jsonify(
+                        {
+                            "code": "DATASET_NOT_FOUND",
+                            "detail": f"Requested datasets {sorted(list(dataset_filters))} not found in domain '{domain}'.",
+                            "domain": domain,
+                            "available": sorted(list(set(available))),
+                        }
+                    ),
+                    404,
+                )
+            return (
+                jsonify(
+                    {
+                        "code": "NEED_UPLOAD",
+                        "detail": f"No CSV files found in domain '{domain}'",
+                        "domain": domain,
+                    }
+                ),
+                409,
+            )
 
         # Router
-        agent_plan = _run_router(prompt, data_info, data_describe, state, llm_model=chosen_model_id, llm_api_key=chosen_api_key)
+        agent_plan = _run_router(
+            prompt,
+            data_info,
+            data_describe,
+            state,
+            llm_model=chosen_model_id,
+            llm_api_key=chosen_api_key,
+        )
         need_manip = bool(agent_plan.get("need_manipulator", True))
         need_visual = bool(agent_plan.get("need_visualizer", True))
         include_insight = body.get("includeInsight", True)
@@ -1814,92 +2122,82 @@ def query():
 
         # Orchestrator
         _cancel_if_needed(session_id)
-        spec = _run_orchestrator(prompt, domain, data_info, data_describe, visual_hint, context_hint, llm_model=chosen_model_id, llm_api_key=chosen_api_key)
+        spec = _run_orchestrator(
+            prompt,
+            domain,
+            data_info,
+            data_describe,
+            visual_hint,
+            context_hint,
+            llm_model=chosen_model_id,
+            llm_api_key=chosen_api_key,
+        )
         manipulator_prompt = spec.get("manipulator_prompt", "")
-        visualizer_prompt  = spec.get("visualizer_prompt", "")
-        analyzer_prompt    = spec.get("analyzer_prompt", "")
+        visualizer_prompt = spec.get("visualizer_prompt", "")
+        analyzer_prompt = spec.get("analyzer_prompt", "")
         compiler_instruction = spec.get("compiler_instruction", "")
 
-        need_plan_explainer = bool(agent_plan.get("need_plan_explainer", False))
+        force_explain = body.get("forceExplain", True)
+        need_plan_explainer = bool(agent_plan.get("need_plan_explainer", True)) and bool(
+            force_explain
+        )
         plan_explainer_model = agent_plan.get("plan_explainer_model") or chosen_model_id
 
-        plan_explainer_content = ""  # Default ke string kosong
         if need_plan_explainer:
-            plan_explainer_start_time = time.time()  # Di Colab _now()
-            print("--- Attempting Plan Explainer ---")
+            plan_explainer_start_time = time.time()
 
-            # Isi detail instruksi untuk ketiga agen
-            initial_content = json.dumps({
-                "manipulator_prompt": manipulator_prompt,
-                "visualizer_prompt": visualizer_prompt,
-                "analyzer_prompt": analyzer_prompt,
-                "compiler_instruction": compiler_instruction,
-            }, ensure_ascii=False, indent=2)
+            # isi detail instruksi untuk ketiga agen
+            initial_content = json.dumps(
+                {
+                    "manipulator_prompt": manipulator_prompt,
+                    "visualizer_prompt": visualizer_prompt,
+                    "analyzer_prompt": analyzer_prompt,
+                    "compiler_instruction": compiler_instruction,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
 
-            max_retries = 3  # Coba maksimal 3 kali
-            for attempt in range(max_retries):
-                try:
-                    print(f"Plan Explainer attempt {attempt + 1}/{max_retries}")
-                    plan_explainer_response = completion(
-                        model=plan_explainer_model,
-                        messages=[
-                            {
-                                "role": "system",
-                                "content": """Make sure all of the information below is applied.
-        1. The prompt that will be given to you is the details of what the system is going to do to respond to the user prompt.
-        2. Your objective is to summarize that plan into an easy-to-understand, thought-process-style explanation
-        of what you (the system) are going to do for the user to read while they wait.
-        3. Respond in a single, human-readable paragraph.
-        4. Include reasoning behind each crucial step taken."""
-                            },
-                            {
-                                "role": "user",
-                                "content": (
-                                    f"User Prompt: {prompt}\n"
-                                    f"Domain: {domain}\n"
-                                    f"Data Info: {data_info}\n"
-                                    f"Data Describe: {data_describe}\n"
-                                    f"Agent Plan: {json.dumps(agent_plan, ensure_ascii=False)}\n"
-                                    f"Detailed instructions for each agent:\n{initial_content}"
-                                )
-                            },
-                        ],
-                        seed=1,
-                        stream=False,
-                        verbosity="medium",
-                        drop_params=True,
-                        reasoning_effort="high",
-                        api_key=chosen_api_key
-                    )
+            plan_explainer_response = completion(
+                model=plan_explainer_model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": """Make sure all of the information below is applied.
+                        1. The prompt that will be given to you is the details of what the system is going to do to respond to the user prompt.
+                        2. Your objective is to summarize that plan into an easy-to-understand, thought-process-style explanation of what you (the system) are going to do for the user to read while they wait.
+                        3. Respond in a single, human-readable paragraph.
+                        4. Include reasoning behind each crucial step taken.""",
+                    },
+                    {
+                        "role": "user",
+                        "content": (
+                            f"User Prompt: {prompt}\n"
+                            f"Domain: {domain}\n"
+                            f"Data Info: {data_info}\n"
+                            f"Data Describe: {data_describe}\n"
+                            f"Agent Plan: {json.dumps(agent_plan, ensure_ascii=False)}\n"
+                            f"Detailed instructions for each agent:\n{initial_content}"
+                        ),
+                    },
+                ],
+                seed=1,
+                stream=False,
+                verbosity="medium",
+                drop_params=True,
+                reasoning_effort="high",
+                api_key=chosen_api_key,
+            )
 
-                    temp_content = get_content(plan_explainer_response)
-                    if temp_content and temp_content.strip():  # Jika berhasil dan tidak kosong
-                        plan_explainer_content = temp_content
-                        print("Plan Explainer succeeded.")
-                        break  # Keluar dari loop retry
-                    else:
-                        print(f"Plan Explainer attempt {attempt + 1} returned empty content.")
-                        if attempt < max_retries - 1:
-                            time.sleep(1)  # Tunggu 1 detik sebelum mencoba lagi
-
-                except Exception as e:
-                    print(f"Plan Explainer attempt {attempt + 1} failed: {e}")
-                    if attempt < max_retries - 1:
-                        time.sleep(1)  # Tunggu 1 detik sebelum mencoba lagi
-                    else:
-                        print("Plan Explainer failed after all retries.")
-
-            plan_explainer_end_time = time.time()  # Di Colab _now()
+            plan_explainer_content = get_content(plan_explainer_response)
+            plan_explainer_end_time = time.time()
             plan_explainer_elapsed_time = plan_explainer_end_time - plan_explainer_start_time
-            print(f"Plan Explainer process finished. Elapsed: {plan_explainer_elapsed_time:.2f} seconds")
-            print(f"Final Plan Explainer Content: '{plan_explainer_content}'")  # Log hasil akhir
+            print(f"Elapsed time: {plan_explainer_elapsed_time:.2f} seconds")
 
-            # Simpan ke state (meskipun kosong jika semua retry gagal)
+            # optionally simpan ke state agar bisa dikirim ke FE
             state["last_plan_explainer"] = plan_explainer_content
-            print("--- DEBUG: Saving state with Plan Explainer ---")
+            _append_history(state, "assistant", state["last_plan_explainer"])
             _save_conv_state(session_id, state)
-            print("---------------------------------------------")
-
         else:
             print("Plan Explainer skipped (router decision).")
 
@@ -1935,7 +2233,12 @@ def query():
 
         if need_visual:
             if df_processed is None:
-                return jsonify({"detail": "Visualization requested but no processed dataframe available."}), 500
+                return (
+                    jsonify(
+                        {"detail": "Visualization requested but no processed dataframe available."}
+                    ),
+                    500,
+                )
             data_visualizer = _as_pai_df(df_processed)
             dv_resp = data_visualizer.chat(visualizer_prompt)
 
@@ -1948,7 +2251,9 @@ def query():
                 try:
                     os.replace(chart_path, dest)
                 except Exception:
-                    import shutil; shutil.copyfile(chart_path, dest)
+                    import shutil
+
+                    shutil.copyfile(chart_path, dest)
                 chart_url = f"/charts/{domain}/{filename}"
 
                 diagram_kind = _detect_diagram_kind(dest, visual_hint)
@@ -1958,26 +2263,35 @@ def query():
                         dest, domain=domain, session_id=session_id, run_id=run_id, kind=diagram_kind
                     )
                     diagram_signed_url = uploaded["signed_url"]
-                    diagram_gs_uri = uploaded["sb_path"]           
+                    diagram_gs_uri = uploaded["sb_path"]
                     state["last_visual_signed_url"] = diagram_signed_url
                     state["last_visual_kind"] = diagram_kind
-                    state["last_visual_sb_path"] = uploaded["sb_path"]      
-                    state["last_visual_public_url"] = uploaded["public_url"] 
+                    state["last_visual_sb_path"] = uploaded["sb_path"]
+                    state["last_visual_public_url"] = uploaded["public_url"]
                 else:
                     if GCS_BUCKET:
-                        uploaded = upload_diagram_to_gcs(dest, domain=domain, session_id=session_id, run_id=run_id, kind=diagram_kind)
+                        uploaded = upload_diagram_to_gcs(
+                            dest,
+                            domain=domain,
+                            session_id=session_id,
+                            run_id=run_id,
+                            kind=diagram_kind,
+                        )
                         diagram_signed_url = uploaded["signed_url"]
-                        diagram_gs_uri     = uploaded["gs_uri"]
-                        state["last_visual_gcs_path"]   = diagram_gs_uri
+                        diagram_gs_uri = uploaded["gs_uri"]
+                        state["last_visual_gcs_path"] = diagram_gs_uri
                         state["last_visual_signed_url"] = diagram_signed_url
-                        state["last_visual_kind"]       = diagram_kind
+                        state["last_visual_kind"] = diagram_kind
 
         # Analyzer
         _cancel_if_needed(session_id)
         da_resp = ""
         if need_analyze:
             if df_processed is None:
-                return jsonify({"detail": "Analyzer requested but no processed dataframe available."}), 500
+                return (
+                    jsonify({"detail": "Analyzer requested but no processed dataframe available."}),
+                    500,
+                )
             data_analyzer = _as_pai_df(df_processed)
             da_obj = data_analyzer.chat(analyzer_prompt)
             da_resp = get_content(da_obj)
@@ -1985,60 +2299,76 @@ def query():
 
         # Compiler (use chosen model & key)
         _cancel_if_needed(session_id)
-        data_info_runtime = _polars_info_string(df_processed) if isinstance(df_processed, pl.DataFrame) else data_info
+        data_info_runtime = (
+            _polars_info_string(df_processed)
+            if isinstance(df_processed, pl.DataFrame)
+            else data_info
+        )
         final_response = completion(
             model=compiler_model or chosen_model_id,
             messages=[
                 {"role": "system", "content": compiler_instruction},
-                {"role": "user", "content":
-                    f"User Prompt:{prompt}. \n"
+                {
+                    "role": "user",
+                    "content": f"User Prompt:{prompt}. \n"
                     f"Datasets Domain name: {domain}. \n"
                     f"df.info of each dfs key(file name)-value pair:\n{data_info_runtime}. \n"
                     f"df.describe of each dfs key(file name)-value pair:\n{data_describe}. \n"
                     f"Data Visualizer Response:{getattr(dv_resp, 'value', '')}. \n"
-                    f"Data Analyzer Response:{da_resp}."
+                    f"Data Analyzer Response:{da_resp}.",
                 },
             ],
-            seed=1, stream=False, verbosity="medium", drop_params=True, reasoning_effort="high",
-            api_key=chosen_api_key
+            seed=1,
+            stream=False,
+            verbosity="medium",
+            drop_params=True,
+            reasoning_effort="high",
+            api_key=chosen_api_key,
         )
         final_content = get_content(final_response)
 
         # Persist summary
-        _append_history(state, "assistant", {
-            "plan": agent_plan,
-            "visual_path": "",
-            "visual_signed_url": state.get("last_visual_signed_url",""),
-            "visual_gs_uri": state.get("last_visual_gcs_path",""),
-            "visual_kind": state.get("last_visual_kind",""),
-            "analyzer_excerpt": (state.get("last_analyzer_text") or "")[:400],
-            "final_preview": final_content[:600]
-        })
+        _append_history(
+            state,
+            "assistant",
+            {
+                "plan": agent_plan,
+                "visual_path": "",
+                "visual_signed_url": state.get("last_visual_signed_url", ""),
+                "visual_gs_uri": state.get("last_visual_gcs_path", ""),
+                "visual_kind": state.get("last_visual_kind", ""),
+                "analyzer_excerpt": (state.get("last_analyzer_text") or "")[:400],
+                "final_preview": final_content[:600],
+            },
+        )
         _save_conv_state(session_id, state)
 
         exec_time = time.time() - t0
-        return jsonify({
-            "session_id": session_id,
-            "response": final_content,       
-            "chart_url": chart_url,          
-            "diagram_kind": diagram_kind,    
-            "diagram_gs_uri": diagram_gs_uri, 
-            "diagram_signed_url": diagram_signed_url,
-            "diagram_public_url": state.get("last_visual_public_url", ""),
-            "execution_time": exec_time,
-            "need_visualizer": need_visual,
-            "need_analyzer": need_analyze,
-            "need_manipulator": need_manip,
-            "llm_model_used": chosen_model_id,
-            "provider": provider_in,
-            "plan_explainer": state.get("last_plan_explainer", ""),
-        })
+        return jsonify(
+            {
+                "session_id": session_id,
+                "response": final_content,
+                "chart_url": chart_url,
+                "diagram_kind": diagram_kind,
+                "diagram_gs_uri": diagram_gs_uri,
+                "diagram_signed_url": diagram_signed_url,
+                "diagram_public_url": state.get("last_visual_public_url", ""),
+                "execution_time": exec_time,
+                "need_visualizer": need_visual,
+                "need_analyzer": need_analyze,
+                "need_manipulator": need_manip,
+                "llm_model_used": chosen_model_id,
+                "provider": provider_in,
+                "plan_explainer": state.get("last_plan_explainer", ""),
+            }
+        )
     except RuntimeError as rexc:
         if "CANCELLED_BY_USER" in str(rexc):
-            return jsonify({"code":"CANCELLED","detail":"Processing cancelled by user."}), 409
+            return jsonify({"code": "CANCELLED", "detail": "Processing cancelled by user."}), 409
         return jsonify({"detail": str(rexc)}), 500
     except Exception as e:
         return jsonify({"detail": str(e)}), 500
+
 
 # =========================
 # NEW: Supabase/Postgre credentials management (password encrypted)
@@ -2066,20 +2396,24 @@ def pg_save():
             return jsonify({"saved": False, "error": "Missing one of required fields"}), 400
         enc_pw = fernet.encrypt(password.encode()).decode()
         doc_id = f"{user_id}_{slug(name)}"
-        _firestore_client.collection(FIRESTORE_COLLECTION_PG).document(doc_id).set({
-            "user_id": user_id,
-            "name": name,
-            "host": host,
-            "port": str(port),
-            "dbname": dbname,
-            "user": user,
-            "password_enc": enc_pw,
-            "updated_at": firestore.SERVER_TIMESTAMP,
-            "created_at": firestore.SERVER_TIMESTAMP,
-        }, merge=True)
+        _firestore_client.collection(FIRESTORE_COLLECTION_PG).document(doc_id).set(
+            {
+                "user_id": user_id,
+                "name": name,
+                "host": host,
+                "port": str(port),
+                "dbname": dbname,
+                "user": user,
+                "password_enc": enc_pw,
+                "updated_at": firestore.SERVER_TIMESTAMP,
+                "created_at": firestore.SERVER_TIMESTAMP,
+            },
+            merge=True,
+        )
         return jsonify({"saved": True, "id": doc_id})
     except Exception as e:
         return jsonify({"saved": False, "error": str(e)}), 500
+
 
 @app.get("/pg/get")
 def pg_get():
@@ -2092,23 +2426,29 @@ def pg_get():
         user_id = request.args.get("userId")
         if not user_id:
             return jsonify({"error": "Missing userId"}), 400
-        docs = (_firestore_client.collection(FIRESTORE_COLLECTION_PG)
-                .where("user_id", "==", user_id).stream())
+        docs = (
+            _firestore_client.collection(FIRESTORE_COLLECTION_PG)
+            .where("user_id", "==", user_id)
+            .stream()
+        )
         items = []
         for d in docs:
             rec = d.to_dict() or {}
-            items.append({
-                "id": d.id,
-                "name": rec.get("name"),
-                "host": rec.get("host"),
-                "port": rec.get("port"),
-                "dbname": rec.get("dbname"),
-                "user": rec.get("user"),
-                "updated_at": str(rec.get("updated_at","")),
-            })
+            items.append(
+                {
+                    "id": d.id,
+                    "name": rec.get("name"),
+                    "host": rec.get("host"),
+                    "port": rec.get("port"),
+                    "dbname": rec.get("dbname"),
+                    "user": rec.get("user"),
+                    "updated_at": str(rec.get("updated_at", "")),
+                }
+            )
         return jsonify({"items": items, "count": len(items)})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
 
 @app.post("/pg/test")
 def pg_test():
@@ -2119,23 +2459,29 @@ def pg_test():
     """
     try:
         body = request.get_json(force=True)
-        host = body.get("host"); port = body.get("port"); dbname = body.get("dbname")
-        user = body.get("user"); password = body.get("password")
+        host = body.get("host")
+        port = body.get("port")
+        dbname = body.get("dbname")
+        user = body.get("user")
+        password = body.get("password")
         if not all([host, port, dbname, user, password]):
-            return jsonify({"ok": False, "error":"Missing fields"}), 400
+            return jsonify({"ok": False, "error": "Missing fields"}), 400
         try:
             import psycopg2  # optional dependency
         except Exception:
             return jsonify({"ok": False, "error": "psycopg2 not installed on server"}), 501
         try:
-            conn = psycopg2.connect(host=host, port=port, dbname=dbname, user=user, password=password, connect_timeout=5)
+            conn = psycopg2.connect(
+                host=host, port=port, dbname=dbname, user=user, password=password, connect_timeout=5
+            )
             conn.close()
             return jsonify({"ok": True})
         except Exception as e:
             return jsonify({"ok": False, "error": str(e)}), 400
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
-    
+
+
 @app.get("/charts/sb/list")
 def charts_sb_list():
     """
@@ -2184,8 +2530,12 @@ def charts_sb_signed():
         return jsonify({"detail": "Missing 'path'"}), 400
     ttl = int(request.args.get("ttl", str(SUPABASE_SIGNED_TTL_SECONDS)))
     try:
-        signed = supabase_client.storage.from_(SUPABASE_BUCKET_CHARTS).create_signed_url(path, expires_in=ttl)["signed_url"]
-        public_url = supabase_client.storage.from_(SUPABASE_BUCKET_CHARTS).get_public_url(path)["public_url"]
+        signed = supabase_client.storage.from_(SUPABASE_BUCKET_CHARTS).create_signed_url(
+            path, expires_in=ttl
+        )["signed_url"]
+        public_url = supabase_client.storage.from_(SUPABASE_BUCKET_CHARTS).get_public_url(path)[
+            "public_url"
+        ]
         return jsonify({"path": path, "signed_url": signed, "public_url": public_url})
     except Exception as e:
         return jsonify({"detail": str(e)}), 500
@@ -2208,6 +2558,7 @@ def charts_sb_delete():
         return jsonify({"deleted": True, "path": path})
     except Exception as e:
         return jsonify({"detail": str(e)}), 500
+
 
 # --- Entry point ---------------------------------------------------------------
 if __name__ == "__main__":

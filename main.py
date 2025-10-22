@@ -575,7 +575,7 @@ def upload_diagram_to_gcs(local_path: str, *, domain: str, session_id: str, run_
 # =========================
 router_system_configuration = """Make sure all of the information below is applied.
 1. You are the Orchestration Router: decide which agents/LLMs to run for a business data prompt.
-2. Output must be STRICT one-line JSON with keys: need_manipulator, need_visualizer, need_analyzer, need_compiler, compiler_model, visual_hint, reason.
+2. Output must be STRICT one-line JSON with keys: need_manipulator, need_visualizer, need_analyzer, need_plan_explainer, need_compiler, compiler_model, visual_hint, reason.
 3. Precedence & overrides: Direct user prompt > Router USER config > Router DOMAIN config > Router SYSTEM defaults.
 4. Flexibility: treat system defaults as fallbacks (e.g., default colors, currency, timezone). If the user or domain requests a different value, obey that without changing core routing logic.
 5. Use recent conversation context when deciding (short follow-ups may reuse prior data/visual).
@@ -861,10 +861,8 @@ def _run_orchestrator(user_prompt: str, domain: str, data_info, data_describe, v
                 f"""Make sure all of the information below is applied.
                 User Prompt: {user_prompt}
                 Datasets Domain name: {domain}.
-                df.info of each dfs key(file name)-value pair:
-                {data_info}.
-                df.describe of each dfs key(file name)-value pair:
-                {data_describe}.
+                df.info of each dfs key(file name)-value pair:\n{data_info}.
+                df.describe of each dfs key(file name)-value pair:\n{data_describe}.
                 Router Context Hint: {json.dumps(context_hint)}
                 Visualization hint (from router): {visual_hint}"""
             }

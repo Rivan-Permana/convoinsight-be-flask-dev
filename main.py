@@ -26,6 +26,14 @@ import pandas as pd  # not used for pipeline; retained to avoid non-pipeline bre
 import litellm
 from litellm import get_valid_models
 
+# --- ✅ a0.0.8: Optional SQLAlchemy for PostgreSQL unification into dfs
+try:
+    from sqlalchemy import create_engine, text as sa_text
+    from sqlalchemy.pool import NullPool
+    _SQLALCHEMY_AVAILABLE = True
+except Exception:
+    _SQLALCHEMY_AVAILABLE = False
+
 # --- GCP clients ---
 from google.cloud import storage
 from google.cloud import firestore
@@ -636,6 +644,19 @@ def _read_csv_bytes_to_polars(
         raise last_err or e
 
 
+# ✅ a0.0.8: Excel readers (beside multi-separator CSV)
+def _is_excel_filename(name: str) -> bool:
+    n = name.lower()
+    return n.endswith(".xlsx") or n.endswith(".xls")
+
+
+def _read_excel_bytes_to_polars(data: bytes, sheet_name: Optional[str] = None) -> pl.DataFrame:
+    # pandas can read excel from BytesIO; then convert to Polars
+    with io.BytesIO(data) as bio:
+        pdf = pd.read_excel(bio, sheet_name=sheet_name)  # requires openpyxl/xlrd depending on format
+    return _normalize_columns_to_str(pl.from_pandas(pdf))
+
+
 def _read_local_csv_to_polars(
     path: str, sep_candidates: List[str] = (",", "|", ";", "\t")
 ) -> pl.DataFrame:
@@ -646,6 +667,18 @@ def _read_local_csv_to_polars(
 
 # ---- Upload (GCS when possible, safe local fallback otherwise) ----------------
 def upload_dataset_file(file_storage, *, domain: str) -> dict:
+    # ✅ a0.0.8: detect content type by extension (csv/xlsx/xls)
+    filename = file_storage.filename or "upload"
+    ext = os.path.splitext(filename)[1].lower()
+    if ext in (".xlsx", ".xls"):
+        content_type = (
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            if ext == ".xlsx"
+            else "application/vnd.ms-excel"
+        )
+    else:
+        content_type = "text/csv"
+
     if not GCS_BUCKET:
         return _upload_dataset_file_local(file_storage, domain=domain)
 
@@ -657,9 +690,9 @@ def upload_dataset_file(file_storage, *, domain: str) -> dict:
         bucket = _gcs_bucket()
         blob = bucket.blob(blob_name)
         blob.cache_control = "private, max-age=0"
-        blob.content_type = "text/csv"
+        blob.content_type = content_type
         file_storage.stream.seek(0)
-        blob.upload_from_file(file_storage.stream, rewind=True, size=None, content_type="text/csv")
+        blob.upload_from_file(file_storage.stream, rewind=True, size=None, content_type=content_type)
         size = blob.size or 0
         gs_uri = f"gs://{GCS_BUCKET}/{blob_name}"
         try:
@@ -668,7 +701,7 @@ def upload_dataset_file(file_storage, *, domain: str) -> dict:
             pass
         # Try to make signed URL; tolerate failures
         try:
-            signed = _signed_url(blob, filename, "text/csv", GCS_SIGNED_URL_TTL_SECONDS)
+            signed = _signed_url(blob, filename, content_type, GCS_SIGNED_URL_TTL_SECONDS)
         except Exception:
             signed = ""
         return {
@@ -687,6 +720,16 @@ def list_gcs_csvs(domain: str) -> List[storage.Blob]:
     prefix = f"{GCS_DATASETS_PREFIX}/{safe_domain}/"
     return list(_gcs_bucket().list_blobs(prefix=prefix))
 
+# ✅ a0.0.8: list both CSV and Excel; kept CSV helper for compat
+def list_gcs_tabulars(domain: str) -> List[storage.Blob]:
+    blobs = list_gcs_csvs(domain)
+    out = []
+    for b in blobs:
+        n = b.name.lower()
+        if n.endswith(".csv") or n.endswith(".xlsx") or n.endswith(".xls"):
+            out.append(b)
+    return out
+
 
 def read_gcs_csv_to_pl_df(
     gs_uri_or_blobname: str, *, sep_candidates: List[str] = (",", "|", ";", "\t")
@@ -700,6 +743,24 @@ def read_gcs_csv_to_pl_df(
         blob_name = gs_uri_or_blobname
     blob = bucket.blob(blob_name)
     data = blob.download_as_bytes()
+    return _read_csv_bytes_to_polars(data, sep_candidates=sep_candidates)
+
+# ✅ a0.0.8: general tabular reader for GCS (CSV + Excel)
+def read_gcs_tabular_to_pl_df(
+    gs_uri_or_blobname: str, *, sep_candidates: List[str] = (",", "|", ";", "\t")
+) -> pl.DataFrame:
+    if gs_uri_or_blobname.startswith("gs://"):
+        _, bucket_name, *rest = gs_uri_or_blobname.replace("gs://", "").split("/")
+        blob_name = "/".join(rest)
+        bucket = _storage_client.bucket(bucket_name)
+    else:
+        bucket = _gcs_bucket()
+        blob_name = gs_uri_or_blobname
+    blob = bucket.blob(blob_name)
+    data = blob.download_as_bytes()
+    name = os.path.basename(blob_name).lower()
+    if name.endswith(".xlsx") or name.endswith(".xls"):
+        return _read_excel_bytes_to_polars(data)
     return _read_csv_bytes_to_polars(data, sep_candidates=sep_candidates)
 
 
@@ -884,6 +945,83 @@ domain_specific_configuration = """1. Use period labels like m0 (current month) 
 # =========================
 # Shared Data Loading (Polars-first)
 # =========================
+
+# ✅ a0.0.8: decrypt+build PG URL, then loaders that register dfs[*] = Polars DF
+def _pg_get_decrypted_conn(user_id: str, name: str = "default") -> Optional[dict]:
+    try:
+        doc_id = f"{user_id}_{slug(name)}"
+        doc = _firestore_client.collection(FIRESTORE_COLLECTION_PG).document(doc_id).get()
+        if not doc.exists:
+            return None
+        rec = doc.to_dict() or {}
+        pw_enc = rec.get("password_enc")
+        if not pw_enc or not fernet:
+            return None
+        rec["password"] = fernet.decrypt(pw_enc.encode()).decode()
+        return rec
+    except Exception:
+        return None
+
+
+def _pg_build_engine_url(meta: dict) -> str:
+    host = meta["host"]
+    port = str(meta["port"])
+    dbname = meta["dbname"]
+    user = meta["user"]
+    password = meta["password"]
+    # Prefer psycopg2; PgBouncer-friendly (transaction pooling side)
+    return f"postgresql+psycopg2://{user}:{password}@{host}:{port}/{dbname}"
+
+
+def _read_sql_to_polars(conn, query: str) -> pl.DataFrame:
+    # use pandas.read_sql then convert -> Polars
+    pdf = pd.read_sql(sa_text(query), conn)
+    return _normalize_columns_to_str(pl.from_pandas(pdf))
+
+
+def _load_pg_tables_into_dfs(
+    *, user_id: str, name: str = "default", tables: Optional[List[str]] = None,
+    schema: str = "public", limit: Optional[int] = None, key_prefix: str = "pg"
+) -> Dict[str, pl.DataFrame]:
+    if not _SQLALCHEMY_AVAILABLE:
+        return {}
+    meta = _pg_get_decrypted_conn(user_id, name=name)
+    if not meta:
+        return {}
+    engine = create_engine(_pg_build_engine_url(meta), poolclass=NullPool, connect_args={"sslmode": meta.get("sslmode","require")})
+    out = {}
+    with engine.connect() as conn:
+        # discover tables if none specified
+        if not tables:
+            rs = conn.exec_driver_sql(
+                "SELECT table_name FROM information_schema.tables WHERE table_schema=%s",
+                (schema,),
+            )
+            tables = [r[0] for r in rs.fetchall()]
+        for t in tables:
+            q = f'SELECT * FROM "{schema}"."{t}"' + (f" LIMIT {int(limit)}" if limit else "")
+            df = _read_sql_to_polars(conn, q)
+            out[f"{key_prefix}:table:{t}"] = df
+    return out
+
+
+def _load_pg_sql_into_dfs(
+    *, user_id: str, name: str = "default", queries: List[Tuple[str, str]], key_prefix: str = "pg"
+) -> Dict[str, pl.DataFrame]:
+    if not _SQLALCHEMY_AVAILABLE:
+        return {}
+    meta = _pg_get_decrypted_conn(user_id, name=name)
+    if not meta:
+        return {}
+    engine = create_engine(_pg_build_engine_url(meta), poolclass=NullPool, connect_args={"sslmode": meta.get("sslmode","require")})
+    out = {}
+    with engine.connect() as conn:
+        for qname, query in queries:
+            df = _read_sql_to_polars(conn, query)
+            out[f"{key_prefix}:query:{qname}"] = df
+    return out
+
+
 def _load_domain_dataframes(
     domain: str, dataset_filters: Optional[set]
 ) -> Tuple[Dict[str, pl.DataFrame], Dict[str, str], Dict[str, str]]:
@@ -891,16 +1029,26 @@ def _load_domain_dataframes(
     data_info: Dict[str, str] = {}
     data_describe: Dict[str, str] = {}
 
+    # ✅ a0.0.8: PostgreSQL unification — allow dataset filters like:
+    # "pg:*" (all tables), "pg:table:<name>", and "pg:query:<name>|<SQL>"
+    # If body contains {"pg": {...}} it'll be handled in /query before calling this.
+    _pg_targets = []
+    if dataset_filters:
+        for token in list(dataset_filters):
+            if isinstance(token, str) and token.startswith("pg:"):
+                _pg_targets.append(token)
+
     # GCS first
     try:
         if GCS_BUCKET:
-            for b in list_gcs_csvs(domain):
-                if not b.name.lower().endswith(".csv"):
+            for b in list_gcs_tabulars(domain):  # ✅ a0.0.8 (CSV + Excel)
+                name_lower = b.name.lower()
+                if not (name_lower.endswith(".csv") or name_lower.endswith(".xlsx") or name_lower.endswith(".xls")):
                     continue
                 key = os.path.basename(b.name)
-                if dataset_filters and key not in dataset_filters:
+                if dataset_filters and key not in dataset_filters and not key.startswith("pg:"):
                     continue
-                df = read_gcs_csv_to_pl_df(b.name)
+                df = read_gcs_tabular_to_pl_df(b.name)  # ✅ a0.0.8
                 dfs[key] = df
                 info_str = _polars_info_string(df)
                 data_info[key] = info_str
@@ -912,10 +1060,11 @@ def _load_domain_dataframes(
     except Exception:
         pass
 
-    # Local fallback
+    # Local fallback (CSV + Excel)
     domain_dir = ensure_dir(os.path.join(DATASETS_ROOT, slug(domain)))
     for name in sorted(os.listdir(domain_dir)):
-        if not name.lower().endswith(".csv"):
+        name_l = name.lower()
+        if not (name_l.endswith(".csv") or name_l.endswith(".xlsx") or name_l.endswith(".xls")):
             continue
         if dataset_filters and name not in dataset_filters:
             continue
@@ -923,7 +1072,12 @@ def _load_domain_dataframes(
             continue
         path = os.path.join(domain_dir, name)
         try:
-            df = _read_local_csv_to_polars(path)
+            with open(path, "rb") as f:
+                data = f.read()
+            if _is_excel_filename(name):
+                df = _read_excel_bytes_to_polars(data)
+            else:
+                df = _read_csv_bytes_to_polars(data)
             dfs[name] = df
             info_str = _polars_info_string(df)
             data_info[name] = info_str
@@ -935,11 +1089,44 @@ def _load_domain_dataframes(
         except Exception:
             pass
 
+    # ✅ a0.0.8: apply any inline Postgres dataset tokens collected above
+    if _pg_targets:
+        # requires userId on /query; routed through via global temp set in /query call
+        _ctx = globals().get("_PG_QUERY_CONTEXT") or {}
+        user_id = _ctx.get("userId")
+        name = _ctx.get("name", "default")
+        if user_id:
+            # pg:*  -> all tables
+            if any(t == "pg:*" for t in _pg_targets):
+                try:
+                    pg_dfs = _load_pg_tables_into_dfs(user_id=user_id, name=name)
+                    dfs.update(pg_dfs)
+                except Exception:
+                    pass
+            # pg:table:XYZ
+            table_targets = [t.split("pg:table:",1)[1] for t in _pg_targets if t.startswith("pg:table:") and len(t.split("pg:table:",1)[1])>0]
+            if table_targets:
+                try:
+                    pg_dfs = _load_pg_tables_into_dfs(user_id=user_id, name=name, tables=table_targets)
+                    dfs.update(pg_dfs)
+                except Exception:
+                    pass
+            # pg:query:<alias>|<SQL>
+            for t in _pg_targets:
+                if t.startswith("pg:query:"):
+                    try:
+                        payload = t.split("pg:query:",1)[1]
+                        alias, sql = payload.split("|",1)
+                        pg_dfs = _load_pg_sql_into_dfs(user_id=user_id, name=name, queries=[(alias, sql)])
+                        dfs.update(pg_dfs)
+                    except Exception:
+                        pass
+
     return dfs, data_info, data_describe
 
 
 # =========================
-# Router (a0.0.7) - UPDATED: accept llm model & api_key
+# Router — a0.0.8 (accept llm model & api_key)
 # =========================
 def _run_router(user_prompt: str, data_info, data_describe, state: dict, *, llm_model: str, llm_api_key: Optional[str]) -> dict:
     """
@@ -1011,7 +1198,7 @@ def _run_router(user_prompt: str, data_info, data_describe, state: dict, *, llm_
     return plan
 
 # =========================
-# Orchestrate (a0.0.7) - UPDATED: accept llm model & api_key
+# Orchestrate — a0.0.8 (accept llm model & api_key)
 # =========================
 def _run_orchestrator(
     user_prompt: str,
@@ -1120,7 +1307,7 @@ def validate_key():
     """
     Validate & save API key for a given provider.
     - No provider name hardcoding.
-    - Providers sorted like the populate script (alphabetical).
+    - Providers sorted like the populate file (alphabetical).
     """
     try:
         data = request.get_json()
@@ -1131,7 +1318,7 @@ def validate_key():
         if not provider or not api_key or not user_id:
             return jsonify({"valid": False, "error": "Missing provider, apiKey, or userId"}), 400
 
-        # Ensure provider exists in litellm provider list (sorted behavior like populate file)
+        # Ensure provider exists in litellm provider list (sorted behavior)
         providers_sorted = _sorted_providers()
         if provider not in providers_sorted:
             return jsonify({"valid": False, "error": f"Provider not supported: {provider}"}), 400
@@ -1327,7 +1514,7 @@ def list_domains():
         for d in sorted(os.listdir(DATASETS_ROOT)):
             p = os.path.join(DATASETS_ROOT, d)
             if os.path.isdir(p):
-                csvs = [f for f in sorted(os.listdir(p)) if f.lower().endswith(".csv")]
+                csvs = [f for f in sorted(os.listdir(p)) if f.lower().endswith((".csv",".xlsx",".xls"))]  # ✅ a0.0.8
                 if csvs:
                     result[d] = csvs
         # gcs merge
@@ -1411,8 +1598,15 @@ def datasets_list():
                         _, bucket_name, *rest = gs_uri.replace("gs://", "").split("/")
                         blob_name = "/".join(rest)
                         blob = _storage_client.bucket(bucket_name).blob(blob_name)
+                        # determine content type based on extension
+                        fname = it["filename"].lower()
+                        ctype = "text/csv"
+                        if fname.endswith(".xlsx"):
+                            ctype = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                        elif fname.endswith(".xls"):
+                            ctype = "application/vnd.ms-excel"
                         it["signed_url"] = _signed_url(
-                            blob, it["filename"], "text/csv", GCS_SIGNED_URL_TTL_SECONDS
+                            blob, it["filename"], ctype, GCS_SIGNED_URL_TTL_SECONDS
                         )
                     except Exception:
                         it.setdefault("signed_url", "")
@@ -1423,7 +1617,7 @@ def datasets_list():
         try:
             if domain and GCS_BUCKET:
                 known = {(i.get("domain"), i.get("filename")) for i in items}
-                for b in list_gcs_csvs(domain):
+                for b in list_gcs_tabulars(domain):  # ✅ a0.0.8
                     fname = os.path.basename(b.name)
                     key = (slug(domain), fname)
                     if key in known:
@@ -1437,8 +1631,14 @@ def datasets_list():
                     }
                     if add_signed:
                         try:
+                            ctype = "text/csv"
+                            fl = fname.lower()
+                            if fl.endswith(".xlsx"):
+                                ctype = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                            elif fl.endswith(".xls"):
+                                ctype = "application/vnd.ms-excel"
                             rec["signed_url"] = _signed_url(
-                                b, fname, "text/csv", GCS_SIGNED_URL_TTL_SECONDS
+                                b, fname, ctype, GCS_SIGNED_URL_TTL_SECONDS
                             )
                         except Exception:
                             pass
@@ -1452,7 +1652,7 @@ def datasets_list():
             if os.path.isdir(domain_dir):
                 known = {(i.get("domain"), i.get("filename")) for i in items}
                 for name in sorted(os.listdir(domain_dir)):
-                    if name.lower().endswith(".csv") and (slug(domain), name) not in known:
+                    if name.lower().endswith((".csv",".xlsx",".xls")) and (slug(domain), name) not in known:
                         path = os.path.join(domain_dir, name)
                         size = os.path.getsize(path)
                         items.append(
@@ -1465,7 +1665,6 @@ def datasets_list():
                             }
                         )
 
-        # IMPORTANT: kembalikan *dua* key supaya FE lama/baru sama-sama jalan
         return jsonify({"items": items, "datasets": items})
     except Exception as e:
         return jsonify({"detail": str(e)}), 500
@@ -1499,8 +1698,14 @@ def datasets_list_all(domain):
                         _, bucket_name, *rest = gs_uri.replace("gs://", "").split("/")
                         blob_name = "/".join(rest)
                         blob = _storage_client.bucket(bucket_name).blob(blob_name)
+                        fname = it["filename"].lower()
+                        ctype = "text/csv"
+                        if fname.endswith(".xlsx"):
+                            ctype = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                        elif fname.endswith(".xls"):
+                            ctype = "application/vnd.ms-excel"
                         it["signed_url"] = _signed_url(
-                            blob, it["filename"], "text/csv", GCS_SIGNED_URL_TTL_SECONDS
+                            blob, it["filename"], ctype, GCS_SIGNED_URL_TTL_SECONDS
                         )
                     except Exception:
                         it.setdefault("signed_url", "")
@@ -1511,7 +1716,7 @@ def datasets_list_all(domain):
         try:
             if GCS_BUCKET:
                 known = {(i.get("domain"), i.get("filename")) for i in items}
-                for b in list_gcs_csvs(domain):
+                for b in list_gcs_tabulars(domain):  # ✅ a0.0.8
                     fname = os.path.basename(b.name)
                     key = (slug(domain), fname)
                     if key in known:
@@ -1525,8 +1730,14 @@ def datasets_list_all(domain):
                     }
                     if add_signed:
                         try:
+                            fl = fname.lower()
+                            ctype = "text/csv"
+                            if fl.endswith(".xlsx"):
+                                ctype = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                            elif fl.endswith(".xls"):
+                                ctype = "application/vnd.ms-excel"
                             rec["signed_url"] = _signed_url(
-                                b, fname, "text/csv", GCS_SIGNED_URL_TTL_SECONDS
+                                b, fname, ctype, GCS_SIGNED_URL_TTL_SECONDS
                             )
                         except Exception:
                             pass
@@ -1539,7 +1750,7 @@ def datasets_list_all(domain):
         if os.path.isdir(domain_dir):
             known = {(i.get("domain"), i.get("filename")) for i in items}
             for name in sorted(os.listdir(domain_dir)):
-                if name.lower().endswith(".csv") and (slug(domain), name) not in known:
+                if name.lower().endswith((".csv",".xlsx",".xls")) and (slug(domain), name) not in known:
                     path = os.path.join(domain_dir, name)
                     size = os.path.getsize(path)
                     items.append(
@@ -1570,10 +1781,8 @@ def datasets_delete_all(domain):
         # 1️⃣ GCS delete
         try:
             if GCS_BUCKET:
-                blobs = list_gcs_csvs(safe_domain)
+                blobs = list_gcs_tabulars(safe_domain)  # ✅ a0.0.8
                 for b in blobs:
-                    if not b.name.lower().endswith(".csv"):
-                        continue
                     fname = os.path.basename(b.name)
                     try:
                         b.delete()
@@ -1591,7 +1800,7 @@ def datasets_delete_all(domain):
         local_dir = os.path.join(DATASETS_ROOT, safe_domain)
         if os.path.isdir(local_dir):
             for name in sorted(os.listdir(local_dir)):
-                if not name.lower().endswith(".csv"):
+                if not name.lower().endswith((".csv",".xlsx",".xls")):
                     continue
                 path = os.path.join(local_dir, name)
                 try:
@@ -1612,12 +1821,17 @@ def datasets_read(domain, filename):
         as_fmt = request.args.get("as", "json")
         if GCS_BUCKET:
             blob_name = f"{GCS_DATASETS_PREFIX}/{slug(domain)}/{filename}"
-            df = read_gcs_csv_to_pl_df(blob_name)
+            df = read_gcs_tabular_to_pl_df(blob_name)  # ✅ a0.0.8
         else:
             local_path = os.path.join(DATASETS_ROOT, slug(domain), filename)
             if not os.path.exists(local_path):
                 return jsonify({"detail": "File not found"}), 404
-            df = _read_local_csv_to_polars(local_path)
+            with open(local_path, "rb") as f:
+                data = f.read()
+            if _is_excel_filename(filename):
+                df = _read_excel_bytes_to_polars(data)
+            else:
+                df = _read_csv_bytes_to_polars(data)
         if n > 0:
             df = df.head(n)
         if as_fmt == "csv":
@@ -1650,7 +1864,6 @@ def datasets_delete(domain, filename):
         return jsonify({"detail": str(e)}), 500
 
 
-# FE compatibility
 @app.post("/upload_datasets/<domain>")
 def compat_upload_datasets(domain: str):
     try:
@@ -1694,8 +1907,14 @@ def compat_list_domain_datasets(domain: str):
                         _, bucket_name, *rest = gs_uri.replace("gs://", "").split("/")
                         blob_name = "/".join(rest)
                         blob = _storage_client.bucket(bucket_name).blob(blob_name)
+                        fname = it["filename"].lower()
+                        ctype = "text/csv"
+                        if fname.endswith(".xlsx"):
+                            ctype = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                        elif fname.endswith(".xls"):
+                            ctype = "application/vnd.ms-excel"
                         it["signed_url"] = _signed_url(
-                            blob, it["filename"], "text/csv", GCS_SIGNED_URL_TTL_SECONDS
+                            blob, it["filename"], ctype, GCS_SIGNED_URL_TTL_SECONDS
                         )
                     except Exception:
                         it.setdefault("signed_url", "")
@@ -1708,7 +1927,7 @@ def compat_list_domain_datasets(domain: str):
             if os.path.isdir(domain_dir):
                 known_names = {i.get("filename") for i in items}
                 for name in sorted(os.listdir(domain_dir)):
-                    if name.lower().endswith(".csv") and name not in known_names:
+                    if name.lower().endswith((".csv",".xlsx",".xls")) and name not in known_names:
                         path = os.path.join(domain_dir, name)
                         size = os.path.getsize(path)
                         items.append(
@@ -1857,7 +2076,7 @@ def query_cancel():
 
 
 # =========================
-# NEW: Suggestion Endpoint (a0.0.7) — UPDATED to use dynamic provider+model+apiKey
+# NEW: Suggestion Endpoint (a0.0.8) — dynamic provider+model+apiKey
 # =========================
 @app.post("/suggest")
 def suggest():
@@ -1954,8 +2173,7 @@ def suggest():
 
 
 # =========================
-# NEW: Query/Inferencing Endpoint (a0.0.7, Polars pipeline)
-# UPDATED: honors provider/model/userId OR per-request apiKey; NO env fallback
+# NEW: Query/Inferencing Endpoint (a0.0.8, Polars pipeline)
 # =========================
 @app.post("/query")
 def query():
@@ -1964,12 +2182,13 @@ def query():
       - domain (str, required)
       - prompt (str, required)
       - session_id (str, optional)
-      - dataset (str | [str], optional)
-      - provider (str, optional)          # e.g., "google"|"openai"|"anthropic"|...
-      - model (str, optional)             # e.g., "gemini-2.5-pro", "gpt-4o-mini", or "provider/model"
-      - userId (str, optional)            # used to fetch provider token from Firestore
-      - apiKey (str, optional)            # per-request direct API key (preferred if provided)
+      - dataset (str | [str], optional)            # CSV/XLSX/XLS file names; also supports inline "pg:*" / "pg:table:..." / "pg:query:alias|SQL"
+      - provider (str, optional)                    # e.g., "google"|"openai"|"anthropic"|...
+      - model (str, optional)                       # e.g., "gemini-2.5-pro", "gpt-4o-mini", or "provider/model"
+      - userId (str, optional)                      # used to fetch provider token from Firestore; also PG creds if using "pg:*" etc
+      - apiKey (str, optional)                      # per-request direct API key (preferred if provided)
       - includeInsight (bool, optional)
+      - pg (dict, optional, ✅ a0.0.8)               # {"name":"default", "tables":["t1","t2"], "schema":"public", "limit":500} or {"name":"default","queries":[{"name":"q1","sql":"SELECT ..."}]}
     Returns:
       - session_id, response (HTML), diagram_* fields, timing & flags
     """
@@ -2010,6 +2229,17 @@ def query():
 
         domain = slug(domain_in)
 
+        # ✅ a0.0.8: capture optional PG context for dfs unification
+        _pg_ctx = {}
+        if isinstance(body.get("pg"), dict):
+            _pg_ctx["userId"] = (body.get("userId") or "").strip() or None
+            _pg_ctx["name"] = (body["pg"].get("name") or "default").strip()
+            globals()["_PG_QUERY_CONTEXT"] = _pg_ctx
+        else:
+            # still allow dataset tokens "pg:*" etc by passing userId
+            if any(isinstance(x, str) and x.startswith("pg:") for x in (datasets or [])):
+                globals()["_PG_QUERY_CONTEXT"] = {"userId": (body.get("userId") or "").strip() or None, "name": "default"}
+
         # state & history
         state = _get_conv_state(session_id)
         _append_history(state, "user", prompt)
@@ -2019,13 +2249,38 @@ def query():
 
         # load data (Polars)
         dfs, data_info, data_describe = _load_domain_dataframes(domain, dataset_filters)
+
+        # ✅ a0.0.8: if /query.pg provided, merge those PG sources too
+        if isinstance(body.get("pg"), dict) and (body.get("userId")):
+            pg_name = (body["pg"].get("name") or "default").strip()
+            if body["pg"].get("tables"):
+                tbls = [t for t in body["pg"]["tables"] if isinstance(t, str) and t.strip()]
+                try:
+                    pg_dfs = _load_pg_tables_into_dfs(user_id=body["userId"], name=pg_name, tables=tbls, schema=body["pg"].get("schema","public"), limit=body["pg"].get("limit"))
+                    dfs.update(pg_dfs)
+                except Exception:
+                    pass
+            if body["pg"].get("queries"):
+                qspecs = []
+                for q in body["pg"]["queries"]:
+                    nm = q.get("name") or f"q{len(qspecs)+1}"
+                    sql = q.get("sql") or ""
+                    if sql.strip():
+                        qspecs.append((nm, sql))
+                if qspecs:
+                    try:
+                        pg_dfs = _load_pg_sql_into_dfs(user_id=body["userId"], name=pg_name, queries=qspecs)
+                        dfs.update(pg_dfs)
+                    except Exception:
+                        pass
+
         if not dfs:
             if dataset_filters:
                 available = []
                 domain_dir = os.path.join(DATASETS_ROOT, domain)
                 if os.path.isdir(domain_dir):
                     available.extend(
-                        sorted([f for f in os.listdir(domain_dir) if f.lower().endswith(".csv")])
+                        sorted([f for f in os.listdir(domain_dir) if f.lower().endswith((".csv",".xlsx",".xls"))])
                     )
                 try:
                     if GCS_BUCKET:
@@ -2033,8 +2288,8 @@ def query():
                             sorted(
                                 {
                                     os.path.basename(b.name)
-                                    for b in list_gcs_csvs(domain)
-                                    if b.name.lower().endswith(".csv")
+                                    for b in list_gcs_tabulars(domain)
+                                    if b.name.lower().endswith((".csv",".xlsx",".xls"))
                                 }
                             )
                         )
@@ -2055,7 +2310,7 @@ def query():
                 jsonify(
                     {
                         "code": "NEED_UPLOAD",
-                        "detail": f"No CSV files found in domain '{domain}'",
+                        "detail": f"No CSV/XLSX files found in domain '{domain}'",
                         "domain": domain,
                     }
                 ),
@@ -2103,7 +2358,8 @@ def query():
         analyzer_prompt = spec.get("analyzer_prompt", "")
         compiler_instruction = spec.get("compiler_instruction", "")
 
-        need_plan_explainer = bool(agent_plan.get("need_plan_explainer", False))
+        # ✅ a0.0.8: Explainer (thinking) connected to router
+        need_plan_explainer = True  # keep enabled as in pipeline a0.0.8
         plan_explainer_model = agent_plan.get("plan_explainer_model") or chosen_model_id
 
         if need_plan_explainer:
@@ -2158,7 +2414,7 @@ def query():
             state["last_plan_explainer"] = plan_explainer_content
             _save_conv_state(session_id, state)
         else:
-                print("Plan Explainer skipped (router decision).")
+            print("Plan Explainer skipped (router decision).")
 
         # Shared LLM (PandasAI via LiteLLM) - use chosen model & user key
         llm = LiteLLM(model=chosen_model_id, api_key=chosen_api_key)

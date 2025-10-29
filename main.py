@@ -663,7 +663,7 @@ def upload_diagram_to_gcs(
 # =========================
 router_system_configuration = """Make sure all of the information below is applied.
 1. You are the Orchestration Router: decide which agents/LLMs to run for a business data prompt.
-2. Output must be STRICT one-line JSON with keys: need_manipulator, need_visualizer, need_analyzer, need_plan_explainer, need_compiler, compiler_model, visual_hint, reason.
+2. Output must be STRICT one-line JSON with keys: need_manipulator, need_visualizer, need_analyzer, need_compiler, compiler_model, visual_hint, reason.
 3. Precedence & overrides: Direct user prompt > Router USER config > Router DOMAIN config > Router SYSTEM defaults.
 4. Flexibility: treat system defaults as fallbacks (e.g., default colors, currency, timezone). If the user or domain requests a different value, obey that without changing core routing logic.
 5. Use recent conversation context when deciding (short follow-ups may reuse prior data/visual).
@@ -848,15 +848,7 @@ def _load_domain_dataframes(
 # =========================
 # Router (a0.0.7) - UPDATED: accept llm model & api_key
 # =========================
-def _run_router(
-    user_prompt: str,
-    data_info,
-    data_describe,
-    state: dict,
-    *,
-    llm_model: str,
-    llm_api_key: Optional[str],
-) -> dict:
+def _run_router(user_prompt: str, data_info, data_describe, state: dict, *, llm_model: str, llm_api_key: Optional[str]) -> dict:
     """
     Returns a dict:
       {
@@ -878,21 +870,16 @@ def _run_router(
         model=llm_model,
         messages=[
             {"role": "system", "content": router_system_configuration.strip()},
-            {
-                "role": "user",
-                "content": f"""Make sure all of the information below is applied.
+            {"role": "user", "content":
+                f"""Make sure all of the information below is applied.
                 User Prompt: {user_prompt}
                 Recent Context: {recent_context}
                 Data Info (summary): {data_info}
-                Data Describe (summary): {data_describe}""",
+                Data Describe (summary): {data_describe}"""
             },
         ],
-        seed=1,
-        stream=False,
-        verbosity="low",
-        drop_params=True,
-        reasoning_effort="high",
-        api_key=llm_api_key,
+        seed=1, stream=False, verbosity="low", drop_params=True, reasoning_effort="high",
+        api_key=llm_api_key
     )
     router_content = get_content(router_response)
     try:
@@ -900,32 +887,14 @@ def _run_router(
     except Exception:
         p = user_prompt.lower()
         need_visual = bool(re.search(r"\b(chart|plot|graph|visual|bar|line|table)\b", p))
-        optimize_terms = bool(
-            re.search(
-                r"\b(allocate|allocation|optimal|optimi[sz]e|plan|planning|min(?:imum)? number|minimum number|close (?:the )?gap|gap closure|takers?)\b",
-                p,
-            )
-        )
-        need_analyze = (
-            bool(re.search(r"\b(why|driver|explain|root cause|trend|surprise|reason)\b", p))
-            or optimize_terms
-        )
-        follow_up = (
-            bool(re.search(r"\b(what about|and|how about|ok but|also)\b", p)) or len(p.split()) <= 8
-        )
+        optimize_terms = bool(re.search(r"\b(allocate|allocation|optimal|optimi[sz]e|plan|planning|min(?:imum)? number|minimum number|close (?:the )?gap|gap closure|takers?)\b", p))
+        need_analyze = bool(re.search(r"\b(why|driver|explain|root cause|trend|surprise|reason)\b", p)) or optimize_terms
+        follow_up = bool(re.search(r"\b(what about|and|how about|ok but|also)\b", p)) or len(p.split()) <= 8
         need_manip = not follow_up  # reuse if follow-up
-        visual_hint = (
-            "bar"
-            if "bar" in p
-            else (
-                "line" if "line" in p else ("table" if ("table" in p or optimize_terms) else "auto")
-            )
-        )
+        visual_hint = "bar" if "bar" in p else ("line" if "line" in p else ("table" if ("table" in p or optimize_terms) else "auto"))
         plan = {
             "need_manipulator": bool(need_manip),
-            "need_visualizer": bool(
-                need_visual or ("ranked plan" in p) or ("showing [" in p) or optimize_terms
-            ),
+            "need_visualizer": bool(need_visual or ("ranked plan" in p) or ("showing [" in p) or optimize_terms),
             "need_analyzer": bool(need_analyze or not need_visual),
             "need_plan_explainer": True,
             "need_compiler": True,
@@ -937,17 +906,9 @@ def _run_router(
 
     # Hard guard for allocation/gap prompts
     p_low = user_prompt.lower()
-    if re.search(
-        r"\b(min(?:imum)? number|minimum number of additional takers|additional takers|close (?:the )?gap|gap closure|optimal allocation|allocate|allocation|optimi[sz]e)\b",
-        p_low,
-    ):
+    if re.search(r"\b(min(?:imum)? number|minimum number of additional takers|additional takers|close (?:the )?gap|gap closure|optimal allocation|allocate|allocation|optimi[sz]e)\b", p_low):
         plan["need_analyzer"] = True
-        plan["need_visualizer"] = (
-            True
-            if "need_visualizer" not in plan or not plan["need_visualizer"]
-            else plan["need_visualizer"]
-        )
-        plan["need_plan_explainer"] = bool(plan.get("need_plan_explainer", True))
+        plan["need_visualizer"] = True if "need_visualizer" not in plan or not plan["need_visualizer"] else plan["need_visualizer"]
         if plan.get("visual_hint", "auto") == "auto":
             plan["visual_hint"] = "table"
         plan["reason"] = (plan.get("reason") or "") + " + analyzer-for-gap/allocation tasks"
@@ -955,7 +916,6 @@ def _run_router(
     router_end = time.time()
     plan["_elapsed"] = float(router_end - router_start)
     return plan
-
 
 # =========================
 # Orchestrate (a0.0.7) - UPDATED: accept llm model & api_key
@@ -2138,25 +2098,19 @@ def query():
         analyzer_prompt = spec.get("analyzer_prompt", "")
         compiler_instruction = spec.get("compiler_instruction", "")
 
-        force_explain = body.get("forceExplain", True)
-        need_plan_explainer = bool(agent_plan.get("need_plan_explainer", True)) and bool(
-            force_explain
-        )
+        need_plan_explainer = bool(agent_plan.get("need_plan_explainer", False))
         plan_explainer_model = agent_plan.get("plan_explainer_model") or chosen_model_id
 
         if need_plan_explainer:
+            plan_explainer_start_time = time.time()
 
             # isi detail instruksi untuk ketiga agen
-            initial_content = json.dumps(
-                {
-                    "manipulator_prompt": manipulator_prompt,
-                    "visualizer_prompt": visualizer_prompt,
-                    "analyzer_prompt": analyzer_prompt,
-                    "compiler_instruction": compiler_instruction,
-                },
-                ensure_ascii=False,
-                indent=2,
-            )
+            initial_content = json.dumps({
+                "manipulator_prompt": manipulator_prompt,
+                "visualizer_prompt": visualizer_prompt,
+                "analyzer_prompt": analyzer_prompt,
+                "compiler_instruction": compiler_instruction,
+            }, ensure_ascii=False, indent=2)
 
             plan_explainer_response = completion(
                 model=plan_explainer_model,
@@ -2165,9 +2119,10 @@ def query():
                         "role": "system",
                         "content": """Make sure all of the information below is applied.
                         1. The prompt that will be given to you is the details of what the system is going to do to respond to the user prompt.
-                        2. Your objective is to summarize that plan into an easy-to-understand, thought-process-style explanation of what you (the system) are going to do for the user to read while they wait.
+                        2. Your objective is to summarize that plan into an easy-to-understand, thought-process-style explanation
+                        of what you (the system) are going to do for the user to read while they wait.
                         3. Respond in a single, human-readable paragraph.
-                        4. Include reasoning behind each crucial step taken.""",
+                        4. Include reasoning behind each crucial step taken."""
                     },
                     {
                         "role": "user",
@@ -2178,7 +2133,7 @@ def query():
                             f"Data Describe: {data_describe}\n"
                             f"Agent Plan: {json.dumps(agent_plan, ensure_ascii=False)}\n"
                             f"Detailed instructions for each agent:\n{initial_content}"
-                        ),
+                        )
                     },
                 ],
                 seed=1,
@@ -2186,52 +2141,19 @@ def query():
                 verbosity="medium",
                 drop_params=True,
                 reasoning_effort="high",
-                api_key=chosen_api_key,
+                api_key=chosen_api_key
             )
 
-            # --- ambil & sanitasi output explainer ---
-            plan_explainer_content = (get_content(plan_explainer_response) or "").strip()
+            plan_explainer_content = get_content(plan_explainer_response)
+            plan_explainer_end_time = time.time()
+            plan_explainer_elapsed_time = plan_explainer_end_time - plan_explainer_start_time
+            print(f"Elapsed time: {plan_explainer_elapsed_time:.2f} seconds")
 
-            # buang filler pembuka yang sering muncul
-            try:
-                import re
-
-                plan_explainer_content = re.sub(
-                    r"^\s*(?:of course[.,]?\s*)+", "", plan_explainer_content, flags=re.I
-                )
-            except Exception:
-                pass
-
-            # Fallback kalau tetap kosong → buat explainer ringkas dari konteks lokal
-            if not plan_explainer_content:
-                vh = (agent_plan.get("visual_hint") or "auto").lower()
-                viz_txt = (
-                    "a table"
-                    if vh == "table"
-                    else (
-                        "a line chart"
-                        if vh == "line"
-                        else ("a bar chart" if vh == "bar" else "a chart")
-                    )
-                )
-                # coba sebut dataset yang aktif (kalau ada)
-                ds_txt = (
-                    ", ".join(sorted(datasets))
-                    if datasets
-                    else "the most relevant dataset(s) in this domain"
-                )
-                plan_explainer_content = (
-                    f"First, I will identify {ds_txt}, parse dates and normalize labels to build a tidy dataframe. "
-                    f"Next, I’ll aggregate to the right period and create {viz_txt} for a clear comparison. "
-                    "Finally, I’ll quantify totals/deltas, surface notable spikes, and compile a concise answer with next steps."
-                )
-
-            # simpan ke state + history
+            # optionally simpan ke state agar bisa dikirim ke FE
             state["last_plan_explainer"] = plan_explainer_content
-            _append_history(state, "assistant", plan_explainer_content)
             _save_conv_state(session_id, state)
         else:
-            print("Plan Explainer skipped (router decision).")
+                print("Plan Explainer skipped (router decision).")
 
         # Shared LLM (PandasAI via LiteLLM) - use chosen model & user key
         llm = LiteLLM(model=chosen_model_id, api_key=chosen_api_key)
@@ -2392,7 +2314,6 @@ def query():
                 "llm_model_used": chosen_model_id,
                 "provider": provider_in,
                 "plan_explainer": state.get("last_plan_explainer", ""),
-                "need_plan_explainer": need_plan_explainer,
             }
         )
     except RuntimeError as rexc:

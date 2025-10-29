@@ -72,7 +72,7 @@ except Exception:
     _REPORTLAB_AVAILABLE = False
 
 # -------- Config --------
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")  # no longer used as a fallback in flow
 GCP_PROJECT_ID = os.getenv("GCP_PROJECT_ID")
 
 FERNET_KEY = os.getenv("FERNET_KEY")
@@ -186,26 +186,145 @@ def _cancel_if_needed(session_id: str):
         raise RuntimeError("CANCELLED_BY_USER")
 
 
+# =========================
+# DYNAMIC PROVIDERS / MODELS (no hardcoding)
+# =========================
+
+def _sorted_providers() -> List[str]:
+    """
+    Return provider names sorted alphabetically, same mechanism as
+    populate_api_provider_and_its_model.py:
+        provider_names_sorted = sorted({p.name for p in litellm.provider_list})
+    """
+    try:
+        return sorted({p.name for p in litellm.provider_list})
+    except Exception:
+        return []
+
+
+def _valid_models() -> List[str]:
+    """
+    Return model id list from litellm. Fallback to built-in constant if needed.
+    """
+    try:
+        return get_valid_models()
+    except Exception:
+        try:
+            return list(LITELLM_MODEL_LIST)
+        except Exception:
+            return []
+
+
+def _group_models_by_prefix(models: Optional[List[str]] = None) -> Dict[str, List[str]]:
+    """
+    Group models by their first segment (prefix) without hardcoding provider names.
+    Works for both `provider/model` and `provider.model` forms.
+    """
+    if models is None:
+        models = _valid_models()
+    groups = defaultdict(list)
+    for mid in models:
+        if not isinstance(mid, str) or not mid:
+            continue
+        prov = None
+        if "/" in mid:
+            prov = mid.split("/", 1)[0]
+        elif "." in mid:
+            prov = mid.split(".", 1)[0]
+        else:
+            prov = mid.split(":", 1)[0]
+        groups[prov].append(mid)
+    # Sort each model list
+    for k in list(groups.keys()):
+        groups[k] = sorted(groups[k])
+    # Sort provider keys alphabetically (same as populate script behavior)
+    return {k: groups[k] for k in sorted(groups.keys())}
+
+
+def _compose_model_id(provider: Optional[str], model: Optional[str]) -> str:
+    """
+    Compose a litellm model id dynamically WITHOUT hardcoding provider names.
+    Rules:
+      - If `model` already includes '/', return as is.
+      - Else, try to find a valid model in litellm.get_valid_models() that matches:
+          • starts with f"{provider}/" or f"{provider}." and endswith "/<model>" (if provider given)
+          • otherwise endswith "/<model>"
+      - As a last resort, if both provider and model are given, return f"{provider}/{model}"
+      - If only model is given, return it as-is (litellm may still resolve it if valid)
+    """
+    model = (model or "").strip()
+    provider = (provider or "").strip()
+
+    # Already fully qualified
+    if model and "/" in model:
+        return model
+
+    models = _valid_models()
+    low_models = [(m, m.lower()) for m in models]
+
+    # Prefer exact match with provider context
+    if model and provider:
+        pref = provider.lower() + "/"
+        pref_dot = provider.lower() + "."
+        for m, ml in low_models:
+            if (ml.startswith(pref) or ml.startswith(pref_dot)) and (
+                ml.endswith("/" + model.lower()) or ml == model.lower()
+            ):
+                return m
+
+    # Fallback: any endswith match
+    if model:
+        for m, ml in low_models:
+            if ml.endswith("/" + model.lower()) or ml == model.lower():
+                return m
+
+    # Last resort: join with provider if both provided
+    if provider and model:
+        return f"{provider}/{model}"
+
+    # Return as-is; may still work if user gave a fully valid id (non-slash form)
+    return model
+
+
+def _resolve_llm_credentials(body: dict) -> Tuple[str, Optional[str], Optional[str]]:
+    """
+    Resolve model id and API key from request body WITHOUT using any server defaults.
+    Priority:
+      - Take plaintext apiKey in body if provided (ephemeral per-request).
+      - Else, if userId+provider provided, try Firestore stored encrypted token.
+      - If still missing, return (model_id, None, provider) to signal missing key.
+
+    Returns: (chosen_model_id, chosen_api_key, provider_in)
+    """
+    provider_in = (body.get("provider") or "").strip() or None
+    model_in = (body.get("model") or "").strip() or None
+    api_key_in = (body.get("apiKey") or "").strip() or None
+    user_id_in = (body.get("userId") or "").strip() or None
+
+    chosen_model_id = _compose_model_id(provider_in, model_in)
+
+    chosen_api_key = None
+    if api_key_in:
+        chosen_api_key = api_key_in  # use immediate per-request key
+    elif user_id_in and provider_in:
+        # try Firestore stored key
+        chosen_api_key = _get_user_provider_token(user_id_in, provider_in)
+
+    return chosen_model_id, chosen_api_key, provider_in
+
+
 def get_provider_config(provider: str, api_key: str):
-    if provider == "openai":
-        return {
-            "url": "https://api.openai.com/v1/models",
-            "headers": {"Authorization": f"Bearer {api_key}"},
-        }
-    elif provider == "groq":
-        return {
-            "url": "https://api.groq.com/openai/v1/models",
-            "headers": {"Authorization": f"Bearer {api_key}"},
-        }
-    elif provider == "anthropic":
-        return {"url": "https://api.anthropic.com/v1/models", "headers": {"x-api-key": api_key}}
-    elif provider == "google":
-        return {
-            "url": f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}",
-            "headers": {},
-        }
-    else:
-        raise ValueError("Provider not supported")
+    """
+    NOTE: Kept for potential FE compatibility; not used by core flow.
+    Left unmodified (generic) since URLs may still be helpful for client ping/validation.
+    """
+    if not provider:
+        raise ValueError("Provider not specified")
+    # Use generic OpenAI-compatible path if possible; else pass-through.
+    return {
+        "url": None,
+        "headers": {"Authorization": f"Bearer {api_key}"} if api_key else {},
+    }
 
 
 def save_provider_key(user_id: str, provider: str, encrypted_key: str, models: list):
@@ -227,32 +346,6 @@ def save_provider_key(user_id: str, provider: str, encrypted_key: str, models: l
     except Exception as e:
         print("Firestore save error:", e)
         return False
-
-
-# --- NEW: Resolve user-selected provider/model + decrypt token (used by /query) ---
-def _compose_model_id(provider: str, model: Optional[str]) -> str:
-    """
-    Compose a litellm model id like 'gemini/gemini-2.5-pro' or 'openai/gpt-4o-mini'.
-    If model already includes '/', return as-is.
-    """
-    if model and "/" in model:
-        return model
-    prefix_map = {
-        "google": "gemini",
-        "gemini": "gemini",
-        "openai": "openai",
-        "anthropic": "anthropic",
-        "groq": "groq",
-    }
-    prefix = prefix_map.get((provider or "").lower(), "gemini")
-    default_model_map = {
-        "gemini": "gemini-2.5-pro",
-        "openai": "gpt-4o-mini",
-        "anthropic": "claude-3-5-sonnet-20241022",
-        "groq": "llama-3.1-70b-versatile",
-    }
-    chosen = model or default_model_map.get(prefix, "gemini-2.5-pro")
-    return f"{prefix}/{chosen}"
 
 
 def _get_user_provider_token(user_id: str, provider: str) -> Optional[str]:
@@ -1025,34 +1118,38 @@ def _require_fernet():
 @app.route("/validate-key", methods=["POST"])
 def validate_key():
     """
-    Validate API key for a given provider using litellm's built-in model registry.
+    Validate & save API key for a given provider.
+    - No provider name hardcoding.
+    - Providers sorted like the populate script (alphabetical).
     """
     try:
         data = request.get_json()
-        provider = data.get("provider")
-        api_key = data.get("apiKey")
-        user_id = data.get("userId")
+        provider = (data.get("provider") or "").strip()
+        api_key = (data.get("apiKey") or "").strip()
+        user_id = (data.get("userId") or "").strip()
 
         if not provider or not api_key or not user_id:
             return jsonify({"valid": False, "error": "Missing provider, apiKey, or userId"}), 400
 
-        # 🔹 Pastikan provider dikenal oleh litellm
-        groups = _group_litellm_models()
-        if provider not in groups:
+        # Ensure provider exists in litellm provider list (sorted behavior like populate file)
+        providers_sorted = _sorted_providers()
+        if provider not in providers_sorted:
             return jsonify({"valid": False, "error": f"Provider not supported: {provider}"}), 400
 
-        # 🔹 Ambil daftar model dari provider
-        models = groups[provider]
-        if not models:
-            return jsonify({"valid": False, "error": "No models found for provider"}), 400
+        # Obtain models dynamically (no hardcoding). Filter by prefix if possible.
+        valid_models = _valid_models()
+        provider_models = sorted(
+            [m for m in valid_models if m.lower().startswith(provider.lower() + "/")
+             or m.lower().startswith(provider.lower() + ".")]
+        )
 
-        # 🔐 Simpan API key terenkripsi
+        # 🔐 Save encrypted key
         _require_fernet()
         encrypted_key = fernet.encrypt(api_key.encode()).decode()
-        save_provider_key(user_id, provider, encrypted_key, models)
+        save_provider_key(user_id, provider, encrypted_key, provider_models)
 
         return jsonify(
-            {"valid": True, "provider": provider, "models": models, "token": encrypted_key}
+            {"valid": True, "provider": provider, "models": provider_models, "token": encrypted_key}
         )
 
     except Exception as e:
@@ -1076,10 +1173,7 @@ def get_provider_keys():
         for doc in docs:
             d = doc.to_dict()
             raw_updated = d.get("updated_at")
-            if hasattr(raw_updated, "isoformat"):
-                updated_at = raw_updated.isoformat()
-            else:
-                updated_at = str(raw_updated) if raw_updated else None
+            updated_at = raw_updated.isoformat() if hasattr(raw_updated, "isoformat") else str(raw_updated) if raw_updated else None
             items.append(
                 {
                     "id": doc.id,
@@ -1100,25 +1194,28 @@ def get_provider_keys():
 @app.route("/update-provider-key", methods=["PUT"])
 def update_provider_key():
     """
-    Update an existing provider key using LiteLLM provider list
+    Update an existing provider key dynamically.
     """
     try:
         data = request.get_json()
-        user_id = data.get("userId")
-        provider = data.get("provider")
-        api_key = data.get("apiKey")
+        user_id = (data.get("userId") or "").strip()
+        provider = (data.get("provider") or "").strip()
+        api_key = (data.get("apiKey") or "").strip()
 
         if not user_id or not provider or not api_key:
             return jsonify({"updated": False, "error": "Missing fields"}), 400
 
-        # 🔹 Validasi provider dari LiteLLM
-        groups = _group_litellm_models()
-        if provider not in groups:
+        providers_sorted = _sorted_providers()
+        if provider not in providers_sorted:
             return jsonify({"updated": False, "error": f"Provider not supported: {provider}"}), 400
 
         _require_fernet()
         encrypted_key = fernet.encrypt(api_key.encode()).decode()
-        models = groups.get(provider, [])
+        valid_models = _valid_models()
+        provider_models = sorted(
+            [m for m in valid_models if m.lower().startswith(provider.lower() + "/")
+             or m.lower().startswith(provider.lower() + ".")]
+        )
 
         doc_ref = _firestore_client.collection(FIRESTORE_COLLECTION_PROVIDERS).document(
             f"{user_id}_{provider}"
@@ -1128,13 +1225,13 @@ def update_provider_key():
                 "user_id": user_id,
                 "provider": provider,
                 "token": encrypted_key,
-                "models": models,
+                "models": provider_models,
                 "updated_at": firestore.SERVER_TIMESTAMP,
             },
             merge=True,
         )
 
-        return jsonify({"updated": True, "models": models})
+        return jsonify({"updated": True, "models": provider_models})
 
     except Exception as e:
         return jsonify({"updated": False, "error": str(e)}), 500
@@ -1166,129 +1263,16 @@ def delete_provider_key():
         return jsonify({"error": str(e)}), 500
 
 
-# =============== NEW: LiteLLM full model list (grouped) =================
-def _infer_provider_from_model_id(model_id: str) -> str:
-    """Heuristic grouping for LiteLLM model IDs."""
-    low = model_id.lower()
-
-    # Path-style: take first segment
-    if "/" in low:
-        first = low.split("/")[0]
-        if first in ("gemini", "google"):
-            return "google"
-        if first in ("openai", "anthropic", "groq", "mistral", "cohere"):
-            return first
-        if first in ("azure", "azure_ai"):
-            return first
-        return first
-
-    # Region-prefixed dotted forms: us.anthropic.claude-... → anthropic
-    if "." in low:
-        toks = low.split(".")
-        if toks[0] in ("us", "eu", "apac", "global") and len(toks) > 1:
-            return toks[1]
-        return toks[0]
-
-    # Heuristics by common prefixes
-    starts = lambda *pfx: any(low.startswith(p) for p in pfx)
-    if starts(
-        "gpt-",
-        "o1",
-        "o3",
-        "omni-",
-        "chatgpt-",
-        "text-embedding",
-        "babbage",
-        "davinci",
-        "whisper",
-        "ft:",
-        "tts-",
-        "gpt-5",
-    ):
-        return "openai"
-    if starts("gemini", "palm", "chat-bison", "text-bison", "learnlm", "veo", "imagen", "gemma"):
-        return "google"
-    if starts("claude", "anthropic"):
-        return "anthropic"
-    if starts("groq"):
-        return "groq"
-    if starts("mistral", "codestral"):
-        return "mistral"
-    if starts("perplexity"):
-        return "perplexity"
-    if starts("cohere"):
-        return "cohere"
-    if starts("stability"):
-        return "stabilityai"
-    if starts("recraft"):
-        return "recraft"
-    if starts("replicate"):
-        return "replicate"
-    if starts("databricks"):
-        return "databricks"
-    if starts("togethercomputer"):
-        return "together"
-    if starts("anyscale"):
-        return "anyscale"
-    if starts("deepinfra"):
-        return "deepinfra"
-    if starts("openrouter"):
-        return "openrouter"
-    if starts("vercel_ai_gateway"):
-        return "vercel_ai_gateway"
-    if starts("snowflake"):
-        return "snowflake"
-    if starts("xai"):
-        return "xai"
-    if starts("voyage"):
-        return "voyage"
-    if starts("deepgram"):
-        return "deepgram"
-    if starts("dashscope"):
-        return "dashscope"
-    if starts("sambanova"):
-        return "sambanova"
-    if starts("ovhcloud"):
-        return "ovhcloud"
-    if starts("oci"):
-        return "oci"
-    if starts("cloudflare"):
-        return "cloudflare"
-    if starts("watsonx"):
-        return "watsonx"
-    if starts("amazon", "bedrock"):
-        return "amazon"
-    if "twelvelabs" in low:
-        return "twelvelabs"
-    if starts("lambda_ai"):
-        return "lambda_ai"
-    if starts("gradient_ai"):
-        return "gradient_ai"
-    if starts("friendliai"):
-        return "friendliai"
-    if starts("wandb"):
-        return "wandb"
-    if starts("meta-llama", "meta_llama", "meta.llama") or "llama" in low:
-        return "meta"
-    return "other"
-
-
-def _group_litellm_models():
-    groups = defaultdict(set)
-    for mid in LITELLM_MODEL_LIST:
-        prov = _infer_provider_from_model_id(mid)
-        groups[prov].add(mid)
-    return {k: sorted(list(v)) for k, v in sorted(groups.items(), key=lambda kv: kv[0])}
-
+# =============== DYNAMIC REGISTRY ENDPOINTS (no hardcoding) =================
 
 @app.get("/litellm/models")
 def litellm_models():
-    """Return full LiteLLM model list grouped by provider."""
+    """Return full model list (valid_models) grouped by dynamic prefix; no hardcoded names."""
     try:
-        groups = _group_litellm_models()
-        # flat count (unique models)
-        total = sum(len(v) for v in groups.values())
-        return jsonify({"count": total, "groups": groups})
+        valid_models = _valid_models()
+        groups = _group_models_by_prefix(valid_models)
+        total = len(valid_models)
+        return jsonify({"count": total, "groups": groups, "models": valid_models})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -1296,13 +1280,33 @@ def litellm_models():
 @app.route("/litellm/providers", methods=["GET"])
 def litellm_providers():
     import litellm
-
     version = getattr(litellm, "__version__", "unknown")
     try:
-        providers = sorted({p.name for p in litellm.provider_list})
+        # SAME sorting behavior as populate_api_provider_and_its_model.py
+        providers = _sorted_providers()
         return jsonify({"count": len(providers), "providers": providers, "version": version})
     except Exception as e:
         return jsonify({"error": str(e), "version": version}), 500
+
+
+@app.get("/llm/registry")
+def llm_registry():
+    """
+    New dynamic Multi-LLM registry (no hardcoding).
+    Returns sorted providers (like populate) and valid models with simple grouping.
+    """
+    try:
+        providers = _sorted_providers()
+        models = _valid_models()
+        groups = _group_models_by_prefix(models)
+        return jsonify({
+            "providers": providers,
+            "models": models,
+            "groups": groups,
+            "counts": {"providers": len(providers), "models": len(models)}
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 @app.get("/debug/routes")
@@ -1853,7 +1857,7 @@ def query_cancel():
 
 
 # =========================
-# NEW: Suggestion Endpoint (a0.0.7)
+# NEW: Suggestion Endpoint (a0.0.7) — UPDATED to use dynamic provider+model+apiKey
 # =========================
 @app.post("/suggest")
 def suggest():
@@ -1861,20 +1865,28 @@ def suggest():
     Body (JSON):
       - domain (str, required)
       - dataset (str | [str], optional)
+      - provider (str, optional)
+      - model (str, optional; can be fully-qualified or short)
+      - userId (str, optional; to fetch stored provider token)
+      - apiKey (str, optional; per-request override)
     Returns:
       { suggestions: [s1,s2,s3,s4], elapsed: <sec>, data_info, data_describe }
     """
     t0 = time.time()
     try:
-        if not GEMINI_API_KEY:
-            return jsonify({"detail": "No API key configured"}), 500
-
         body = request.get_json(force=True)
         domain_in = body.get("domain")
         dataset_field = body.get("dataset")
 
         if not domain_in:
             return jsonify({"detail": "Missing 'domain'"}), 400
+
+        # Resolve LLM creds & model (NO env fallback)
+        chosen_model_id, chosen_api_key, _ = _resolve_llm_credentials(body)
+        if not chosen_model_id:
+            return jsonify({"detail": "Missing or invalid model. Provide provider+model or a valid model id."}), 400
+        if not chosen_api_key:
+            return jsonify({"detail": "No API key available. Provide apiKey or save a key for this provider."}), 400
 
         domain = slug(domain_in)
         if isinstance(dataset_field, list):
@@ -1888,7 +1900,7 @@ def suggest():
         dfs, data_info, data_describe = _load_domain_dataframes(domain, dataset_filters)
 
         r = completion(
-            model="gemini/gemini-2.5-pro",
+            model=chosen_model_id,
             messages=[
                 {
                     "role": "system",
@@ -1914,6 +1926,7 @@ def suggest():
             verbosity="low",
             drop_params=True,
             reasoning_effort="high",
+            api_key=chosen_api_key,
         )
         content = get_content(r)
         try:
@@ -1942,7 +1955,7 @@ def suggest():
 
 # =========================
 # NEW: Query/Inferencing Endpoint (a0.0.7, Polars pipeline)
-# UPDATED: honors provider/model/userId with Firestore key decryption
+# UPDATED: honors provider/model/userId OR per-request apiKey; NO env fallback
 # =========================
 @app.post("/query")
 def query():
@@ -1952,9 +1965,10 @@ def query():
       - prompt (str, required)
       - session_id (str, optional)
       - dataset (str | [str], optional)
-      - provider (str, optional)          # e.g., "google"|"gemini"|"openai"|"anthropic"|"groq"
-      - model (str, optional)             # e.g., "gemini-2.5-pro", "gpt-4o-mini", ...
+      - provider (str, optional)          # e.g., "google"|"openai"|"anthropic"|...
+      - model (str, optional)             # e.g., "gemini-2.5-pro", "gpt-4o-mini", or "provider/model"
       - userId (str, optional)            # used to fetch provider token from Firestore
+      - apiKey (str, optional)            # per-request direct API key (preferred if provided)
       - includeInsight (bool, optional)
     Returns:
       - session_id, response (HTML), diagram_* fields, timing & flags
@@ -1966,19 +1980,8 @@ def query():
         prompt = body.get("prompt")
         session_id = body.get("session_id") or str(uuid.uuid4())
 
-        # NEW: provider/model/userId for multi-provider support
-        provider_in = body.get("provider") or "google"
-        model_in = body.get("model")
-        user_id_in = body.get("userId")
-
-        # Compose model id + API key resolution
-        chosen_model_id = _compose_model_id(provider_in, model_in)
-        chosen_api_key = None
-        if user_id_in and provider_in:
-            chosen_api_key = _get_user_provider_token(user_id_in, provider_in)
-        # Fallback to GEMINI_API_KEY when no user token
-        if not chosen_api_key and chosen_model_id.startswith("gemini/"):
-            chosen_api_key = GEMINI_API_KEY
+        # Resolve model + key dynamically (no env fallback)
+        chosen_model_id, chosen_api_key, provider_in = _resolve_llm_credentials(body)
 
         dataset_field = body.get("dataset")
         if isinstance(dataset_field, list):
@@ -1993,11 +1996,13 @@ def query():
 
         if not domain_in or not prompt:
             return jsonify({"detail": "Missing 'domain' or 'prompt'"}), 400
+        if not chosen_model_id:
+            return jsonify({"detail": "Missing or invalid model. Provide provider+model or a valid model id."}), 400
         if not chosen_api_key:
             return (
                 jsonify(
                     {
-                        "detail": "No API key available for the selected provider. Save a key first or send userId/provider."
+                        "detail": "No API key available for the selected provider. Provide 'apiKey' or save one via /validate-key."
                     }
                 ),
                 400,

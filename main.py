@@ -248,6 +248,20 @@ def _group_models_by_prefix(models: Optional[List[str]] = None) -> Dict[str, Lis
     # Sort provider keys alphabetically (same as populate script behavior)
     return {k: groups[k] for k in sorted(groups.keys())}
 
+# 🔧 NEW: gabungkan provider dari provider_list + prefix model (agar 'gemini' dll lolos)
+def _all_supported_providers() -> List[str]:
+    names = set()
+    try:
+        names.update({p.name for p in litellm.provider_list})
+    except Exception:
+        pass
+    try:
+        names.update(_group_models_by_prefix().keys())
+    except Exception:
+        pass
+    # bersihkan kosong/None, lalu sort
+    return sorted({n.strip() for n in names if isinstance(n, str) and n.strip()})
+
 
 def _compose_model_id(provider: Optional[str], model: Optional[str]) -> str:
     """
@@ -1318,9 +1332,9 @@ def validate_key():
         if not provider or not api_key or not user_id:
             return jsonify({"valid": False, "error": "Missing provider, apiKey, or userId"}), 400
 
-        # Ensure provider exists in litellm provider list (sorted behavior)
-        providers_sorted = _sorted_providers()
-        if provider not in providers_sorted:
+        # 🔧 CHANGE: dukung provider yang hanya muncul sebagai prefix model (contoh: 'gemini')
+        providers_all = _all_supported_providers()
+        if provider not in providers_all:
             return jsonify({"valid": False, "error": f"Provider not supported: {provider}"}), 400
 
         # Obtain models dynamically (no hardcoding). Filter by prefix if possible.
@@ -1392,8 +1406,9 @@ def update_provider_key():
         if not user_id or not provider or not api_key:
             return jsonify({"updated": False, "error": "Missing fields"}), 400
 
-        providers_sorted = _sorted_providers()
-        if provider not in providers_sorted:
+        # 🔧 CHANGE: gunakan gabungan provider agar 'gemini' dll diterima
+        providers_all = _all_supported_providers()
+        if provider not in providers_all:
             return jsonify({"updated": False, "error": f"Provider not supported: {provider}"}), 400
 
         _require_fernet()
@@ -1947,7 +1962,8 @@ def compat_list_domain_datasets(domain: str):
         return jsonify({"detail": str(e)}), 500
 
 
-@app.get("/domains/<domain>/datasets")
+# 🔧 trailing-slash variant to avoid duplicate route collision
+@app.get("/domains/<domain>/datasets/")
 def compat_list_domain_datasets_trailing(domain: str):
     return compat_list_domain_datasets(domain)
 

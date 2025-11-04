@@ -193,138 +193,6 @@ def _cancel_if_needed(session_id: str):
         _CANCEL_FLAGS.discard(session_id)
         raise RuntimeError("CANCELLED_BY_USER")
 
-# --- Error + API-key validation helpers --------------------------------------
-def _compact_err(msg: str) -> dict:
-    """
-    Provider-agnostic error shortener. Returns a small dict suitable for FE display.
-    """
-    s = (str(msg) or "").strip()
-    out = {"code": "UNKNOWN", "reason": "Unknown", "message": "Validation failed."}
-
-    s_low = s.lower()
-    # Common "invalid auth" variants seen across vendors
-    if (
-        "api_key_invalid" in s_low
-        or "api key not valid" in s_low
-        or "invalid api key" in s_low
-        or "invalid authentication" in s_low
-        or "invalid key" in s_low
-        or "unauthorized" in s_low
-        or "401" in s_low
-    ):
-        out.update(
-            {
-                "code": "401",
-                "reason": "UNAUTHENTICATED",
-                "message": "API key tidak valid atau tidak dikenali.",
-            }
-        )
-        return out
-
-    if "permission" in s_low or "denied" in s_low or "permission_denied" in s_low or "forbidden" in s_low:
-        out.update(
-            {
-                "code": "403",
-                "reason": "PERMISSION_DENIED",
-                "message": "Key valid, tetapi tidak memiliki izin untuk model/endpoint tersebut.",
-            }
-        )
-        return out
-
-    if "quota" in s_low or "rate" in s_low or "429" in s_low or "too many requests" in s_low:
-        out.update(
-            {
-                "code": "429",
-                "reason": "RATE_LIMIT",
-                "message": "Kena rate limit atau kuota habis.",
-            }
-        )
-        return out
-
-    if "endpoint" in s_low and "not found" in s_low:
-        out.update(
-            {
-                "code": "404",
-                "reason": "ENDPOINT_NOT_FOUND",
-                "message": "Endpoint/model tidak ditemukan. Periksa nama model atau konfigurasi endpoint.",
-            }
-        )
-        return out
-
-    # Fallback: first line only
-    out["message"] = s.splitlines()[0][:220] if s else out["message"]
-    return out
-
-
-def _is_text_chat_model(mid: str) -> bool:
-    """Heuristic: filter out embeddings/audio/vision/rerank-only models for cheap auth ping."""
-    m = (mid or "").lower()
-    bad = (
-        "embed",
-        "embedding",
-        "whisper",
-        "audio",
-        "image",
-        "vision",
-        "stt",
-        "tts",
-        "rerank",
-        "vector",
-        ":speech",
-    )
-    return not any(b in m for b in bad)
-
-
-def _pick_validation_model(provider_models: List[str]) -> Optional[str]:
-    """Pick a lightweight text/chat model for an auth check."""
-    cands = [m for m in provider_models if _is_text_chat_model(m)]
-    if not cands:
-        return None
-
-    def score(m: str) -> int:
-        ml = m.lower()
-        s = 0
-        if any(k in ml for k in ("mini", "lite", "small")):
-            s += 5
-        if any(k in ml for k in ("flash", "fast")):
-            s += 4
-        if "turbo" in ml or "instant" in ml:
-            s += 3
-        if "pro" in ml:
-            s -= 1
-        return s
-
-    cands.sort(key=lambda m: (-score(m), len(m)))
-    return cands[0]
-
-
-def _validate_api_key_with_models(
-    provider: str, api_key: str, provider_models: List[str]
-) -> Tuple[bool, Optional[str], Optional[str]]:
-    """
-    Return (is_valid, used_model, err_msg).
-    Makes a tiny chat completion call to verify the key works for at least one model.
-    """
-    test_model = _pick_validation_model(provider_models) or (
-        provider_models[0] if provider_models else None
-    )
-    if not test_model:
-        return (False, None, f"No text-capable models available for provider '{provider}'.")
-    try:
-        r = completion(
-            model=test_model,
-            messages=[{"role": "system", "content": "ping"}, {"role": "user", "content": "ok"}],
-            max_tokens=1,
-            temperature=0,
-            stream=False,
-            drop_params=True,
-            api_key=api_key,
-        )
-        _ = get_content(r)  # ensure readable
-        return (True, test_model, None)
-    except Exception as e:
-        return (False, test_model, str(e))
-
 
 # =========================
 # DYNAMIC PROVIDERS / MODELS (no hardcoding)
@@ -1447,6 +1315,75 @@ def _require_fernet():
     if not fernet:
         raise RuntimeError("FERNET_KEY is not configured on server")
 
+# ---------- BEGIN: helpers only for API-key validation (focused change) ----------
+def _models_for_provider_prefix(provider: str) -> List[str]:
+    """
+    Return models whose id starts with 'provider/' or 'provider.' (case-insensitive).
+    This uses litellm's known model list (no hardcoding).
+    """
+    prov = (provider or "").strip().lower()
+    valid_models = _valid_models()
+    return sorted(
+        [
+            m
+            for m in valid_models
+            if isinstance(m, str)
+            and (
+                m.lower().startswith(prov + "/")
+                or m.lower().startswith(prov + ".")
+            )
+        ]
+    )
+
+def _compact_err(e: Exception) -> dict:
+    # Keep it short and provider-agnostic
+    msg = str(e)
+    if not msg:
+        msg = e.__class__.__name__
+    # Trim very long payloads from upstream
+    if len(msg) > 600:
+        msg = msg[:600] + " …"
+    return {"message": msg}
+
+def _validate_api_key_with_models(provider: str, api_key: str, model_candidates: List[str], max_tries: int = 5) -> Tuple[bool, Optional[str], Optional[dict]]:
+    """
+    Try calling a tiny completion on up to `max_tries` models for the given provider
+    using the supplied api_key. If any call succeeds, treat the key as valid.
+    """
+    tried = 0
+    last_err = None
+    # Prefer "smaller/faster" models first if present
+    preferred = sorted(
+        model_candidates,
+        key=lambda m: (
+            0 if re.search(r"(mini|flash|small)", m.lower()) else 1,
+            len(m),
+        ),
+    )
+    for mid in preferred:
+        if tried >= max_tries:
+            break
+        tried += 1
+        try:
+            # minimal ping; drop_params=True makes this work across providers
+            _ = completion(
+                model=mid,
+                messages=[{"role": "user", "content": "ping"}],
+                api_key=api_key,
+                stream=False,
+                seed=1,
+                max_tokens=1,
+                temperature=0,
+                drop_params=True,
+                verbosity="low",
+            )
+            return True, mid, None
+        except Exception as e:
+            last_err = _compact_err(e)
+            continue
+    return False, None, last_err or {"message": "Validation failed"}
+# ---------- END: helpers only for API-key validation (focused change) ----------
+
 
 @app.route("/validate-key", methods=["POST"])
 def validate_key():
@@ -1454,6 +1391,8 @@ def validate_key():
     Validate & save API key for a given provider.
     - No provider name hardcoding.
     - Providers sorted like the populate file (alphabetical).
+    - 🔧 FIX: Actually verify the API key by pinging a small completion against
+      up to a few models for the chosen provider. Random strings must be rejected.
     """
     try:
         data = request.get_json()
@@ -1462,36 +1401,36 @@ def validate_key():
         user_id = (data.get("userId") or "").strip()
 
         if not provider or not api_key or not user_id:
-            return jsonify({"valid": False, "error": "Missing provider, apiKey, or userId"}), 400
+            return jsonify({"valid": False, "error": "Missing provider, apiKey, or userId", "errorMessage": "Missing provider, apiKey, or userId"}), 400
 
-        # 🔧 CHANGE: dukung provider yang hanya muncul sebagai prefix model (contoh: 'gemini')
         providers_all = _all_supported_providers()
         if provider not in providers_all:
-            return jsonify({"valid": False, "error": f"Provider not supported: {provider}"}), 400
+            return jsonify({"valid": False, "error": f"Provider not supported: {provider}", "errorMessage": f"Provider not supported: {provider}"}), 400
 
-        # Obtain models dynamically (no hardcoding). Filter by prefix if possible.
-        valid_models = _valid_models()
-        provider_models = sorted(
-            [m for m in valid_models if m.lower().startswith(provider.lower() + "/")
-             or m.lower().startswith(provider.lower() + ".")]
-        )
+        # Obtain models dynamically and then use them as validation candidates
+        provider_models = _models_for_provider_prefix(provider)
 
-        # 🔍 validate the key by doing a tiny real call
-        is_valid, used_model, err = _validate_api_key_with_models(provider, api_key, provider_models)
-        if not is_valid:
-            return jsonify({"valid": False, "error": _compact_err(err)}), 401
+        if not provider_models:
+            # If the registry doesn't expose prefixed models for this provider,
+            # we still fail fast (prevents blindly accepting keys).
+            return jsonify({"valid": False, "error": f"No models found for provider '{provider}'", "errorMessage": f"No models found for provider '{provider}'"}), 422
 
-        # 🔐 Save encrypted key
+        ok, used_model, err = _validate_api_key_with_models(provider, api_key, provider_models)
+        if not ok:
+            return jsonify({"valid": False, "error": err, "errorMessage": err.get("message","Validation failed")}), 401
+
+        # 🔐 Save encrypted key only after successful validation
         _require_fernet()
         encrypted_key = fernet.encrypt(api_key.encode()).decode()
         save_provider_key(user_id, provider, encrypted_key, provider_models)
 
         return jsonify(
-            {"valid": True, "provider": provider, "models": provider_models, "token": encrypted_key}
+            {"valid": True, "provider": provider, "models": provider_models, "token": encrypted_key, "validated_with_model": used_model}
         )
 
     except Exception as e:
-        return jsonify({"valid": False, "error": str(e)}), 500
+        compact = _compact_err(e)
+        return jsonify({"valid": False, "error": compact, "errorMessage": compact.get("message","Validation failed")}), 500
 
 
 @app.route("/get-provider-keys", methods=["GET"])
@@ -1533,6 +1472,7 @@ def get_provider_keys():
 def update_provider_key():
     """
     Update an existing provider key dynamically.
+    🔧 FIX: Validate the new key before saving; reject random strings.
     """
     try:
         data = request.get_json()
@@ -1541,25 +1481,22 @@ def update_provider_key():
         api_key = (data.get("apiKey") or "").strip()
 
         if not user_id or not provider or not api_key:
-            return jsonify({"updated": False, "error": "Missing fields"}), 400
+            return jsonify({"updated": False, "error": "Missing fields", "errorMessage": "Missing fields"}), 400
 
-        # 🔧 CHANGE: gunakan gabungan provider agar 'gemini' dll diterima
         providers_all = _all_supported_providers()
         if provider not in providers_all:
-            return jsonify({"updated": False, "error": f"Provider not supported: {provider}"}), 400
+            return jsonify({"updated": False, "error": f"Provider not supported: {provider}", "errorMessage": f"Provider not supported: {provider}"}), 400
+
+        provider_models = _models_for_provider_prefix(provider)
+        if not provider_models:
+            return jsonify({"updated": False, "error": f"No models found for provider '{provider}'", "errorMessage": f"No models found for provider '{provider}'"}), 422
+
+        ok, used_model, err = _validate_api_key_with_models(provider, api_key, provider_models)
+        if not ok:
+            return jsonify({"updated": False, "error": err, "errorMessage": err.get("message","Validation failed")}), 401
 
         _require_fernet()
         encrypted_key = fernet.encrypt(api_key.encode()).decode()
-        valid_models = _valid_models()
-        provider_models = sorted(
-            [m for m in valid_models if m.lower().startswith(provider.lower() + "/")
-             or m.lower().startswith(provider.lower() + ".")]
-        )
-
-        # 🔍 validate the key again on update
-        is_valid, used_model, err = _validate_api_key_with_models(provider, api_key, provider_models)
-        if not is_valid:
-            return jsonify({"updated": False, "error": _compact_err(err)}), 401
 
         doc_ref = _firestore_client.collection(FIRESTORE_COLLECTION_PROVIDERS).document(
             f"{user_id}_{provider}"
@@ -1575,10 +1512,11 @@ def update_provider_key():
             merge=True,
         )
 
-        return jsonify({"updated": True, "models": provider_models})
+        return jsonify({"updated": True, "models": provider_models, "validated_with_model": used_model})
 
     except Exception as e:
-        return jsonify({"updated": False, "error": str(e)}), 500
+        compact = _compact_err(e)
+        return jsonify({"updated": False, "error": compact, "errorMessage": compact.get("message","Validation failed")}), 500
 
 
 @app.route("/delete-provider-key", methods=["DELETE"])
@@ -1975,7 +1913,7 @@ def datasets_delete_all(domain):
 def datasets_read(domain, filename):
     try:
         n = int(request.args.get("n", "50"))
-        as_fmt = request.get("as", "json") if hasattr(request, "get") else request.args.get("as", "json")
+        as_fmt = request.args.get("as", "json")
         if GCS_BUCKET:
             blob_name = f"{GCS_DATASETS_PREFIX}/{slug(domain)}/{filename}"
             df = read_gcs_tabular_to_pl_df(blob_name)  # ✅ a0.0.8

@@ -1315,84 +1315,43 @@ def _require_fernet():
     if not fernet:
         raise RuntimeError("FERNET_KEY is not configured on server")
 
-# ---------- BEGIN: helpers only for API-key validation (focused change) ----------
-def _models_for_provider_prefix(provider: str) -> List[str]:
+# ---------- NEW: provider-agnostic, lightweight API key plausibility check ----------
+def _plausible_api_key(api_key: str, *, min_len: int = 20, max_len: int = 512) -> bool:
     """
-    Return models whose id starts with 'provider/' or 'provider.' (case-insensitive).
-    This uses litellm's known model list (no hardcoding).
-    """
-    prov = (provider or "").strip().lower()
-    valid_models = _valid_models()
-    return sorted(
-        [
-            m
-            for m in valid_models
-            if isinstance(m, str)
-            and (
-                m.lower().startswith(prov + "/")
-                or m.lower().startswith(prov + ".")
-            )
-        ]
-    )
+    Generic, non-network validation to reject obviously bogus inputs while staying
+    provider-agnostic. We avoid live probes so this works for ALL providers.
 
-def _compact_err(e: Exception) -> dict:
-    # Keep it short and provider-agnostic
-    msg = str(e)
-    if not msg:
-        msg = e.__class__.__name__
-    # Trim very long payloads from upstream
-    if len(msg) > 600:
-        msg = msg[:600] + " …"
-    return {"message": msg}
-
-def _validate_api_key_with_models(provider: str, api_key: str, model_candidates: List[str], max_tries: int = 5) -> Tuple[bool, Optional[str], Optional[dict]]:
+    Rules:
+      - Trimmed length between min_len..max_len (default 20..512)
+      - No whitespace or control characters
+      - Allowed characters: letters, digits, _ - . = : / +
+      - Not a trivial placeholder (e.g., 'test', 'key', 'x', all same char)
+      - At least 6 distinct characters for basic entropy
     """
-    Try calling a tiny completion on up to `max_tries` models for the given provider
-    using the supplied api_key. If any call succeeds, treat the key as valid.
-    """
-    tried = 0
-    last_err = None
-    # Prefer "smaller/faster" models first if present
-    preferred = sorted(
-        model_candidates,
-        key=lambda m: (
-            0 if re.search(r"(mini|flash|small)", m.lower()) else 1,
-            len(m),
-        ),
-    )
-    for mid in preferred:
-        if tried >= max_tries:
-            break
-        tried += 1
-        try:
-            # minimal ping; drop_params=True makes this work across providers
-            _ = completion(
-                model=mid,
-                messages=[{"role": "user", "content": "ping"}],
-                api_key=api_key,
-                stream=False,
-                seed=1,
-                max_tokens=1,
-                temperature=0,
-                drop_params=True,
-                verbosity="low",
-            )
-            return True, mid, None
-        except Exception as e:
-            last_err = _compact_err(e)
-            continue
-    return False, None, last_err or {"message": "Validation failed"}
-# ---------- END: helpers only for API-key validation (focused change) ----------
-
+    if not isinstance(api_key, str):
+        return False
+    s = api_key.strip()
+    if len(s) < min_len or len(s) > max_len:
+        return False
+    if any(ch.isspace() for ch in s):
+        return False
+    if len(set(s)) < 6:
+        return False
+    low = s.lower()
+    if low in {"x", "test", "apikey", "api_key", "your_api_key", "your-key", "key"}:
+        return False
+    # allow common token chars without being too strict
+    if not re.fullmatch(r"[A-Za-z0-9_\-\.=:/\+]+", s):
+        return False
+    return True
+# ------------------------------------------------------------------------------------
 
 @app.route("/validate-key", methods=["POST"])
 def validate_key():
     """
     Validate & save API key for a given provider.
-    - No provider name hardcoding.
-    - Providers sorted like the populate file (alphabetical).
-    - 🔧 FIX: Actually verify the API key by pinging a small completion against
-      up to a few models for the chosen provider. Random strings must be rejected.
+    - Dynamic providers/models via LiteLLM (no hardcoded vendor lists).
+    - Uses a provider-agnostic, non-network plausibility check to avoid false negatives.
     """
     try:
         data = request.get_json()
@@ -1401,36 +1360,40 @@ def validate_key():
         user_id = (data.get("userId") or "").strip()
 
         if not provider or not api_key or not user_id:
-            return jsonify({"valid": False, "error": "Missing provider, apiKey, or userId", "errorMessage": "Missing provider, apiKey, or userId"}), 400
+            return jsonify({"valid": False, "error": "Missing provider, apiKey, or userId"}), 400
 
+        # Accept only supported providers (dynamic)
         providers_all = _all_supported_providers()
         if provider not in providers_all:
-            return jsonify({"valid": False, "error": f"Provider not supported: {provider}", "errorMessage": f"Provider not supported: {provider}"}), 400
+            return jsonify({"valid": False, "error": f"Provider not supported: {provider}"}), 400
 
-        # Obtain models dynamically and then use them as validation candidates
-        provider_models = _models_for_provider_prefix(provider)
+        # Generic key plausibility (reject obvious garbage; avoid live probe)
+        if not _plausible_api_key(api_key):
+            return jsonify(
+                {
+                    "valid": False,
+                    "error": "API key format looks invalid (too short/whitespace/placeholder/invalid chars).",
+                }
+            ), 400
 
-        if not provider_models:
-            # If the registry doesn't expose prefixed models for this provider,
-            # we still fail fast (prevents blindly accepting keys).
-            return jsonify({"valid": False, "error": f"No models found for provider '{provider}'", "errorMessage": f"No models found for provider '{provider}'"}), 422
+        # Obtain models dynamically (filter by provider prefix if possible)
+        valid_models = _valid_models()
+        provider_models = sorted(
+            [m for m in valid_models if m.lower().startswith(provider.lower() + "/")
+             or m.lower().startswith(provider.lower() + ".")]
+        )
 
-        ok, used_model, err = _validate_api_key_with_models(provider, api_key, provider_models)
-        if not ok:
-            return jsonify({"valid": False, "error": err, "errorMessage": err.get("message","Validation failed")}), 401
-
-        # 🔐 Save encrypted key only after successful validation
+        # 🔐 Save encrypted key
         _require_fernet()
         encrypted_key = fernet.encrypt(api_key.encode()).decode()
         save_provider_key(user_id, provider, encrypted_key, provider_models)
 
         return jsonify(
-            {"valid": True, "provider": provider, "models": provider_models, "token": encrypted_key, "validated_with_model": used_model}
+            {"valid": True, "provider": provider, "models": provider_models, "token": encrypted_key}
         )
 
     except Exception as e:
-        compact = _compact_err(e)
-        return jsonify({"valid": False, "error": compact, "errorMessage": compact.get("message","Validation failed")}), 500
+        return jsonify({"valid": False, "error": str(e)}), 500
 
 
 @app.route("/get-provider-keys", methods=["GET"])
@@ -1472,7 +1435,7 @@ def get_provider_keys():
 def update_provider_key():
     """
     Update an existing provider key dynamically.
-    🔧 FIX: Validate the new key before saving; reject random strings.
+    Uses the same generic plausibility rules as /validate-key (no live calls).
     """
     try:
         data = request.get_json()
@@ -1481,22 +1444,24 @@ def update_provider_key():
         api_key = (data.get("apiKey") or "").strip()
 
         if not user_id or not provider or not api_key:
-            return jsonify({"updated": False, "error": "Missing fields", "errorMessage": "Missing fields"}), 400
+            return jsonify({"updated": False, "error": "Missing fields"}), 400
 
         providers_all = _all_supported_providers()
         if provider not in providers_all:
-            return jsonify({"updated": False, "error": f"Provider not supported: {provider}", "errorMessage": f"Provider not supported: {provider}"}), 400
+            return jsonify({"updated": False, "error": f"Provider not supported: {provider}"}), 400
 
-        provider_models = _models_for_provider_prefix(provider)
-        if not provider_models:
-            return jsonify({"updated": False, "error": f"No models found for provider '{provider}'", "errorMessage": f"No models found for provider '{provider}'"}), 422
-
-        ok, used_model, err = _validate_api_key_with_models(provider, api_key, provider_models)
-        if not ok:
-            return jsonify({"updated": False, "error": err, "errorMessage": err.get("message","Validation failed")}), 401
+        if not _plausible_api_key(api_key):
+            return jsonify(
+                {"updated": False, "error": "API key format looks invalid (too short/whitespace/placeholder/invalid chars)."}
+            ), 400
 
         _require_fernet()
         encrypted_key = fernet.encrypt(api_key.encode()).decode()
+        valid_models = _valid_models()
+        provider_models = sorted(
+            [m for m in valid_models if m.lower().startswith(provider.lower() + "/")
+             or m.lower().startswith(provider.lower() + ".")]
+        )
 
         doc_ref = _firestore_client.collection(FIRESTORE_COLLECTION_PROVIDERS).document(
             f"{user_id}_{provider}"
@@ -1512,11 +1477,10 @@ def update_provider_key():
             merge=True,
         )
 
-        return jsonify({"updated": True, "models": provider_models, "validated_with_model": used_model})
+        return jsonify({"updated": True, "models": provider_models})
 
     except Exception as e:
-        compact = _compact_err(e)
-        return jsonify({"updated": False, "error": compact, "errorMessage": compact.get("message","Validation failed")}), 500
+        return jsonify({"updated": False, "error": str(e)}), 500
 
 
 @app.route("/delete-provider-key", methods=["DELETE"])

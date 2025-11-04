@@ -1316,6 +1316,65 @@ def _require_fernet():
         raise RuntimeError("FERNET_KEY is not configured on server")
 
 
+# ---------- NEW HELPERS FOR REAL API-KEY VALIDATION (generic; no provider hardcoding) ----------
+def _pick_validation_models(provider: str, provider_models: List[str]) -> List[str]:
+    """
+    Heuristically pick up to 5 'small/cheap' models for a provider to validate keys against.
+    Does NOT hardcode provider names; only uses substrings commonly used for small tiers.
+    """
+    if not provider_models:
+        return []
+    def score(m: str) -> tuple:
+        ml = m.lower()
+        # prefer models that look "small"/"cheap"
+        small_signals = ["mini", "flash", "small", "lite", "nano", "instant", "speed", "fast"]
+        s = 0
+        for i,kw in enumerate(small_signals):
+            if kw in ml:
+                s -= (10 - i)  # earlier keywords weigh a bit more
+        # shorter names first as a proxy for "base"/"core"
+        return (s, len(ml))
+    cands = sorted([m for m in provider_models if m.lower().startswith(provider.lower())], key=score)
+    # fallback to whatever exists for this provider if above filter empties
+    if not cands:
+        cands = sorted(provider_models, key=score)
+    return cands[:5]
+
+def _validate_api_key_with_models(provider: str, api_key: str, provider_models: List[str]) -> Tuple[bool, Optional[str], Optional[str]]:
+    """
+    Try making a tiny litellm completion against a few candidate models for this provider.
+    Returns (is_valid, used_model, error_message_if_any).
+    """
+    candidates = _pick_validation_models(provider, provider_models)
+    if not candidates:
+        return False, None, "No models available for provider"
+    last_err = None
+    for mid in candidates:
+        try:
+            # A minimal, cheap, provider-agnostic prompt
+            r = completion(
+                model=mid,
+                messages=[{"role":"user","content":"Reply with OK"}],
+                max_tokens=2,
+                temperature=0,
+                timeout=8,
+                stream=False,
+                drop_params=True,
+                verbosity="low",
+                api_key=api_key,
+            )
+            # If the call didn't raise, the key is usable for at least one model.
+            _ = get_content(r)
+            return True, mid, None
+        except Exception as e:
+            err_s = str(e)
+            last_err = err_s
+            # For auth/permission errors, try the next model; if all fail, return invalid.
+            continue
+    return False, None, last_err or "Unknown error during validation"
+# ------------------------------------------------------------------------------------------------
+
+
 @app.route("/validate-key", methods=["POST"])
 def validate_key():
     """
@@ -1343,14 +1402,21 @@ def validate_key():
             [m for m in valid_models if m.lower().startswith(provider.lower() + "/")
              or m.lower().startswith(provider.lower() + ".")]
         )
+        if not provider_models:
+            return jsonify({"valid": False, "error": f"No models found for provider: {provider}"}), 400
 
-        # 🔐 Save encrypted key
+        # ✅ REAL VALIDATION STEP: make a tiny completion with the provided key.
+        is_valid, used_model, err = _validate_api_key_with_models(provider, api_key, provider_models)
+        if not is_valid:
+            return jsonify({"valid": False, "error": f"API key validation failed: {err}"}), 401
+
+        # 🔐 Save encrypted key (only after validation success)
         _require_fernet()
         encrypted_key = fernet.encrypt(api_key.encode()).decode()
         save_provider_key(user_id, provider, encrypted_key, provider_models)
 
         return jsonify(
-            {"valid": True, "provider": provider, "models": provider_models, "token": encrypted_key}
+            {"valid": True, "provider": provider, "models": provider_models, "token": encrypted_key, "validated_with_model": used_model}
         )
 
     except Exception as e:
@@ -1411,13 +1477,21 @@ def update_provider_key():
         if provider not in providers_all:
             return jsonify({"updated": False, "error": f"Provider not supported: {provider}"}), 400
 
-        _require_fernet()
-        encrypted_key = fernet.encrypt(api_key.encode()).decode()
         valid_models = _valid_models()
         provider_models = sorted(
             [m for m in valid_models if m.lower().startswith(provider.lower() + "/")
              or m.lower().startswith(provider.lower() + ".")]
         )
+        if not provider_models:
+            return jsonify({"updated": False, "error": f"No models found for provider: {provider}"}), 400
+
+        # ✅ VALIDATE first before saving update
+        is_valid, used_model, err = _validate_api_key_with_models(provider, api_key, provider_models)
+        if not is_valid:
+            return jsonify({"updated": False, "error": f"API key validation failed: {err}"}), 401
+
+        _require_fernet()
+        encrypted_key = fernet.encrypt(api_key.encode()).decode()
 
         doc_ref = _firestore_client.collection(FIRESTORE_COLLECTION_PROVIDERS).document(
             f"{user_id}_{provider}"
@@ -1433,7 +1507,7 @@ def update_provider_key():
             merge=True,
         )
 
-        return jsonify({"updated": True, "models": provider_models})
+        return jsonify({"updated": True, "models": provider_models, "validated_with_model": used_model})
 
     except Exception as e:
         return jsonify({"updated": False, "error": str(e)}), 500

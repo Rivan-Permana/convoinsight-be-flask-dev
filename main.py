@@ -1512,6 +1512,37 @@ def update_provider_key():
     except Exception as e:
         return jsonify({"updated": False, "error": str(e)}), 500
 
+@app.route("/update-provider-model", methods=["PUT"])
+def update_provider_model():
+    """
+    Update selected model for an existing provider key (without revalidating API key).
+    """
+    try:
+        data = request.get_json()
+        user_id = (data.get("userId") or "").strip()
+        provider = (data.get("provider") or "").strip()
+        model = (data.get("model") or "").strip()
+
+        if not user_id or not provider or not model:
+            return jsonify({"updated": False, "error": "Missing fields"}), 400
+
+        doc_id = f"{user_id}_{provider}"
+        doc_ref = _firestore_client.collection(FIRESTORE_COLLECTION_PROVIDERS).document(doc_id)
+        doc = doc_ref.get()
+        if not doc.exists:
+            return jsonify({"updated": False, "error": "Provider key not found"}), 404
+
+        # Update only model field
+        doc_ref.set(
+            {"selected_model": model, "updated_at": firestore.SERVER_TIMESTAMP},
+            merge=True,
+        )
+
+        return jsonify({"updated": True})
+    except Exception as e:
+        return jsonify({"updated": False, "error": str(e)}), 500
+
+
 
 @app.route("/delete-provider-key", methods=["DELETE"])
 def delete_provider_key():

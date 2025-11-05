@@ -307,6 +307,33 @@ def _compose_model_id(provider: Optional[str], model: Optional[str]) -> str:
     return model
 
 
+def _resolve_llm_credentials(body: dict) -> Tuple[str, Optional[str], Optional[str]]:
+    """
+    Resolve model id and API key from request body WITHOUT using any server defaults.
+    Priority:
+      - Take plaintext apiKey in body if provided (ephemeral per-request).
+      - Else, if userId+provider provided, try Firestore stored encrypted token.
+      - If still missing, return (model_id, None, provider) to signal missing key.
+
+    Returns: (chosen_model_id, chosen_api_key, provider_in)
+    """
+    provider_in = (body.get("provider") or "").strip() or None
+    model_in = (body.get("model") or "").strip() or None
+    api_key_in = (body.get("apiKey") or "").strip() or None
+    user_id_in = (body.get("userId") or "").strip() or None
+
+    chosen_model_id = _compose_model_id(provider_in, model_in)
+
+    chosen_api_key = None
+    if api_key_in:
+        chosen_api_key = api_key_in  # use immediate per-request key
+    elif user_id_in and provider_in:
+        # try Firestore stored key
+        chosen_api_key = _get_user_provider_token(user_id_in, provider_in)
+
+    return chosen_model_id, chosen_api_key, provider_in
+
+
 def get_provider_config(provider: str, api_key: str):
     """
     NOTE: Kept for potential FE compatibility; not used by core flow.
@@ -356,64 +383,6 @@ def _get_user_provider_token(user_id: str, provider: str) -> Optional[str]:
         if not enc or not fernet:
             return None
         return fernet.decrypt(enc.encode()).decode()
-    except Exception:
-        return None
-
-# 🔧 NEW: helper to resolve active provider+model+key for a user (used when FE doesn't pass them)
-def _get_active_provider_entry(user_id: str) -> Optional[dict]:
-    """
-    Returns active provider entry for user_id, with decrypted api_key if present.
-    Fallback to most recently updated provider if none is marked active.
-    """
-    try:
-        # Try active first
-        q = (
-            _firestore_client.collection(FIRESTORE_COLLECTION_PROVIDERS)
-            .where("user_id", "==", user_id)
-            .where("is_active", "==", True)
-            .limit(1)
-            .stream()
-        )
-        docs = list(q)
-        if not docs:
-            # Fallback: most recently updated
-            try:
-                q2 = (
-                    _firestore_client.collection(FIRESTORE_COLLECTION_PROVIDERS)
-                    .where("user_id", "==", user_id)
-                    .order_by("updated_at", direction=firestore.Query.DESCENDING)
-                    .limit(1)
-                    .stream()
-                )
-                docs = list(q2)
-            except Exception:
-                # Final fallback: any provider for the user
-                q3 = (
-                    _firestore_client.collection(FIRESTORE_COLLECTION_PROVIDERS)
-                    .where("user_id", "==", user_id)
-                    .limit(1)
-                    .stream()
-                )
-                docs = list(q3)
-
-        if not docs:
-            return None
-
-        d = docs[0].to_dict() or {}
-        token_plain = None
-        token_enc = d.get("token")
-        if token_enc and fernet:
-            try:
-                token_plain = fernet.decrypt(token_enc.encode()).decode()
-            except Exception:
-                token_plain = None
-
-        return {
-            "provider": d.get("provider"),
-            "api_key": token_plain,
-            "selectedModel": d.get("selectedModel"),
-            "models": d.get("models", []),
-        }
     except Exception:
         return None
 
@@ -2940,69 +2909,6 @@ def charts_sb_delete():
 
 
 # --- Entry point ---------------------------------------------------------------
-
-def _resolve_llm_credentials(body: dict) -> Tuple[str, Optional[str], Optional[str]]:
-    """
-    Resolve model id and API key from request body WITHOUT using any server defaults.
-    Priority:
-      - If apiKey provided in body, use it (ephemeral).
-      - Else, if userId+provider provided, try Firestore stored encrypted token.
-      - Else, try user's ACTIVE provider entry (provider+selectedModel+token) from Firestore.
-    Also tries to infer model id from:
-      - body.model
-      - active.selectedModel
-      - provider's known models list (saved or litellm.get_valid_models)
-    Returns: (chosen_model_id, chosen_api_key, provider_used)
-    """
-    provider_in = (body.get("provider") or "").strip() or None
-    model_in = (body.get("model") or "").strip() or None
-    api_key_in = (body.get("apiKey") or "").strip() or None
-    user_id_in = (body.get("userId") or "").strip() or None
-
-    active_entry = None
-    if user_id_in and (not provider_in or not model_in or not api_key_in):
-        active_entry = _get_active_provider_entry(user_id_in)
-
-    # Provider: prefer explicit; else fall back to active provider
-    provider_used = provider_in or (active_entry.get("provider") if active_entry else None)
-
-    # API key resolution
-    chosen_api_key = None
-    if api_key_in:
-        chosen_api_key = api_key_in
-    elif user_id_in and provider_used:
-        chosen_api_key = _get_user_provider_token(user_id_in, provider_used)
-    elif active_entry and not provider_in:
-        # Only adopt active provider token implicitly if provider wasn't specified
-        chosen_api_key = active_entry.get("api_key")
-
-    # Model resolution
-    model_candidate = model_in
-    if not model_candidate and active_entry and active_entry.get("selectedModel"):
-        model_candidate = active_entry["selectedModel"]
-
-    # If still missing, try first model from saved list for the (resolved) provider
-    if not model_candidate and active_entry and provider_used:
-        saved_models = active_entry.get("models") or []
-        prov_lower = provider_used.lower()
-        provider_models = [m for m in saved_models if m.lower().startswith(prov_lower + "/") or m.lower().startswith(prov_lower + ".")]
-        if provider_models:
-            model_candidate = provider_models[0].split("/", 1)[-1] if "/" in provider_models[0] else provider_models[0]
-
-    # As a last inference, use litellm's registry for provider prefix
-    if not model_candidate and provider_used:
-        valid = _valid_models()
-        prov_lower = provider_used.lower()
-        matches = [m for m in valid if m.lower().startswith(prov_lower + "/") or m.lower().startswith(prov_lower + ".")]
-        if matches:
-            # keep full id
-            model_candidate = matches[0]
-
-    chosen_model_id = _compose_model_id(provider_used, model_candidate)
-
-    return chosen_model_id, chosen_api_key, provider_used
-
-
 if __name__ == "__main__":
     host = os.getenv("HOST", "127.0.0.1")
     port = int(os.getenv("PORT", "8000"))

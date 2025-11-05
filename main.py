@@ -261,6 +261,64 @@ def _all_supported_providers() -> List[str]:
     # bersihkan kosong/None, lalu sort
     return sorted({n.strip() for n in names if isinstance(n, str) and n.strip()})
 
+# ---------- NEW HELPERS (provider normalization + user defaults) ----------
+def _normalize_provider(p: Optional[str]) -> Optional[str]:
+    return p.strip().lower() if isinstance(p, str) else None
+
+
+def _fetch_user_provider_docs(user_id: str) -> List[dict]:
+    """Fetch all provider docs for a user (not raising)."""
+    try:
+        docs = (
+            _firestore_client.collection(FIRESTORE_COLLECTION_PROVIDERS)
+            .where("user_id", "==", user_id)
+            .stream()
+        )
+        return [d.to_dict() for d in docs if d.exists]
+    except Exception:
+        return []
+
+
+def _pick_active_or_latest_provider_doc(user_id: str) -> Optional[dict]:
+    docs = _fetch_user_provider_docs(user_id)
+    if not docs:
+        return None
+    active = [d for d in docs if d.get("is_active")]
+    if active:
+        # pick the most recently updated among active
+        return sorted(active, key=lambda x: str(x.get("updated_at", "")), reverse=True)[0]
+    # else pick latest by updated_at
+    return sorted(docs, key=lambda x: str(x.get("updated_at", "")), reverse=True)[0]
+
+
+def _score_model_name(name: str) -> int:
+    """Simple, provider-agnostic scoring to prefer stronger models."""
+    n = name.lower()
+    score = 0
+    for pos in ["pro", "sonnet", "gpt-4", "4o", "latest", "ultra", "2.5", "4.1"]:
+        if pos in n:
+            score += 3
+    for neg in ["mini", "lite", "small"]:
+        if neg in n:
+            score -= 2
+    return score
+
+
+def _choose_default_model_for_provider(provider: str, models_sources: List[str]) -> Optional[str]:
+    """Pick a reasonable default given a list of fully-qualified model ids."""
+    if not models_sources:
+        return None
+    # Keep only models matching the provider prefix (provider/ or provider.)
+    pfx = provider.lower() + "/"
+    pfx_dot = provider.lower() + "."
+    filtered = [m for m in models_sources if m.lower().startswith(pfx) or m.lower().startswith(pfx_dot)]
+    if not filtered:
+        filtered = models_sources[:]  # fallback to any
+    # Score and pick best
+    filtered.sort(key=lambda m: _score_model_name(m), reverse=True)
+    return filtered[0] if filtered else None
+# --------------------------------------------------------------------------
+
 
 def _compose_model_id(provider: Optional[str], model: Optional[str]) -> str:
     """
@@ -311,27 +369,71 @@ def _resolve_llm_credentials(body: dict) -> Tuple[str, Optional[str], Optional[s
     """
     Resolve model id and API key from request body WITHOUT using any server defaults.
     Priority:
-      - Take plaintext apiKey in body if provided (ephemeral per-request).
-      - Else, if userId+provider provided, try Firestore stored encrypted token.
-      - If still missing, return (model_id, None, provider) to signal missing key.
-
-    Returns: (chosen_model_id, chosen_api_key, provider_in)
+      1) apiKey in body (ephemeral)
+      2) userId + provider: use stored provider token and model (selectedModel or heuristic)
+      3) userId only: use ACTIVE provider doc (or latest) to get provider, token, and model
+    Returns: (chosen_model_id, chosen_api_key, provider)
     """
-    provider_in = (body.get("provider") or "").strip() or None
+    provider_in = _normalize_provider(body.get("provider") or "")
     model_in = (body.get("model") or "").strip() or None
     api_key_in = (body.get("apiKey") or "").strip() or None
     user_id_in = (body.get("userId") or "").strip() or None
 
-    chosen_model_id = _compose_model_id(provider_in, model_in)
+    # If request already has an apiKey, use it
+    chosen_api_key = api_key_in if api_key_in else None
+    chosen_provider = provider_in
+    chosen_model = model_in
 
-    chosen_api_key = None
-    if api_key_in:
-        chosen_api_key = api_key_in  # use immediate per-request key
-    elif user_id_in and provider_in:
-        # try Firestore stored key
-        chosen_api_key = _get_user_provider_token(user_id_in, provider_in)
+    # Helper: attempt to fill from Firestore doc (active or specified provider)
+    def _fill_from_user_defaults(user_id: str, provider: Optional[str]):
+        doc = None
+        if provider:
+            try:
+                # read the exact provider doc
+                doc_id = f"{user_id}_{_normalize_provider(provider)}"
+                snap = _firestore_client.collection(FIRESTORE_COLLECTION_PROVIDERS).document(doc_id).get()
+                if snap.exists:
+                    doc = snap.to_dict()
+            except Exception:
+                doc = None
+        if doc is None:
+            doc = _pick_active_or_latest_provider_doc(user_id)
+        return doc
 
-    return chosen_model_id, chosen_api_key, provider_in
+    # If no provider given but we have a user, try to pick their active provider
+    user_doc = None
+    if user_id_in and not chosen_provider:
+        user_doc = _fill_from_user_defaults(user_id_in, None)
+        if user_doc:
+            chosen_provider = _normalize_provider(user_doc.get("provider") or "")
+
+    # If we still don't have an API key, try fetching from Firestore using whatever provider we have
+    if user_id_in and not chosen_api_key and chosen_provider:
+        chosen_api_key = _get_user_provider_token(user_id_in, chosen_provider)
+
+    # If a provider is present but we did not fetch doc yet, fetch it now to discover model
+    if user_id_in and chosen_provider and user_doc is None:
+        user_doc = _fill_from_user_defaults(user_id_in, chosen_provider)
+
+    # If model not provided, try user_doc.selectedModel, then user_doc.models, then litellm list
+    if not chosen_model:
+        sel = (user_doc or {}).get("selectedModel")
+        if isinstance(sel, str) and sel.strip():
+            chosen_model = sel.strip()
+        else:
+            prov_models = (user_doc or {}).get("models") or []
+            if not prov_models:
+                # fallback to litellm model list grouped by provider
+                all_models = _valid_models()
+                prov_models = [m for m in all_models if chosen_provider and (m.lower().startswith(chosen_provider + "/") or m.lower().startswith(chosen_provider + "."))]
+            picked = _choose_default_model_for_provider(chosen_provider or "", prov_models) if prov_models else None
+            if picked:
+                chosen_model = picked
+
+    # Compose/normalize the model id
+    chosen_model_id = _compose_model_id(chosen_provider, chosen_model)
+
+    return chosen_model_id, chosen_api_key, chosen_provider
 
 
 def get_provider_config(provider: str, api_key: str):
@@ -350,11 +452,13 @@ def get_provider_config(provider: str, api_key: str):
 
 def save_provider_key(user_id: str, provider: str, encrypted_key: str, models: list):
     try:
-        doc_id = f"{user_id}_{provider}"
+        # normalize provider id to avoid case-mismatch across FE/BE
+        provider_norm = _normalize_provider(provider)
+        doc_id = f"{user_id}_{provider_norm}"
         doc_ref = _firestore_client.collection(FIRESTORE_COLLECTION_PROVIDERS).document(doc_id)
         data = {
             "user_id": user_id,
-            "provider": provider,
+            "provider": provider_norm,
             "token": encrypted_key,
             "models": models,
             "is_active": True,
@@ -375,7 +479,7 @@ def _get_user_provider_token(user_id: str, provider: str) -> Optional[str]:
     Returns plaintext token or None if not found/cannot decrypt.
     """
     try:
-        doc_id = f"{user_id}_{provider}"
+        doc_id = f"{user_id}_{_normalize_provider(provider)}"
         doc = _firestore_client.collection(FIRESTORE_COLLECTION_PROVIDERS).document(doc_id).get()
         if not doc.exists:
             return None
@@ -1354,17 +1458,18 @@ def validate_key():
     """
     try:
         data = request.get_json()
-        provider = (data.get("provider") or "").strip()
+        provider_raw = (data.get("provider") or "").strip()
+        provider = _normalize_provider(provider_raw)
         api_key = (data.get("apiKey") or "").strip()
         user_id = (data.get("userId") or "").strip()
 
         if not provider or not api_key or not user_id:
             return jsonify({"valid": False, "error": "Missing provider, apiKey, or userId"}), 400
 
-        # Accept only supported providers (dynamic)
-        providers_all = _all_supported_providers()
+        # Accept only supported providers (dynamic), case-insensitive
+        providers_all = {p.lower() for p in _all_supported_providers()}
         if provider not in providers_all:
-            return jsonify({"valid": False, "error": f"Provider not supported: {provider}"}), 400
+            return jsonify({"valid": False, "error": f"Provider not supported: {provider_raw}"}), 400
 
         # Generic key plausibility (reject obvious garbage; avoid live probe)
         if not _plausible_api_key(api_key):
@@ -1378,8 +1483,8 @@ def validate_key():
         # Obtain models dynamically (filter by provider prefix if possible)
         valid_models = _valid_models()
         provider_models = sorted(
-            [m for m in valid_models if m.lower().startswith(provider.lower() + "/")
-             or m.lower().startswith(provider.lower() + ".")]
+            [m for m in valid_models if m.lower().startswith(provider + "/")
+             or m.lower().startswith(provider + ".")]
         )
 
         # 🔐 Save encrypted key
@@ -1452,7 +1557,8 @@ def set_active_config():
     try:
         data = request.get_json()
         user_id = (data.get("userId") or "").strip()
-        provider = (data.get("provider") or "").strip()
+        provider_in = (data.get("provider") or "").strip()
+        provider = _normalize_provider(provider_in)
 
         if not user_id or not provider:
             return jsonify({
@@ -1469,7 +1575,7 @@ def set_active_config():
         batch = _firestore_client.batch()
 
         for doc in docs_query.stream():
-            doc_provider = doc.id.split(f"{user_id}_")[-1]  # Misal: "uid_gemini" -> "gemini"
+            doc_provider = (doc.id.split(f"{user_id}_")[-1]).lower()  # Misal: "uid_gemini" -> "gemini"
             if doc_provider != provider:
                 batch.update(doc.reference, {"is_active": False})
 
@@ -1513,15 +1619,16 @@ def update_provider_key():
     try:
         data = request.get_json()
         user_id = (data.get("userId") or "").strip()
-        provider = (data.get("provider") or "").strip()
+        provider_raw = (data.get("provider") or "").strip()
+        provider = _normalize_provider(provider_raw)
         api_key = (data.get("apiKey") or "").strip()
 
         if not user_id or not provider or not api_key:
             return jsonify({"updated": False, "error": "Missing fields"}), 400
 
-        providers_all = _all_supported_providers()
+        providers_all = {p.lower() for p in _all_supported_providers()}
         if provider not in providers_all:
-            return jsonify({"updated": False, "error": f"Provider not supported: {provider}"}), 400
+            return jsonify({"updated": False, "error": f"Provider not supported: {provider_raw}"}), 400
 
         if not _plausible_api_key(api_key):
             return jsonify(
@@ -1532,8 +1639,8 @@ def update_provider_key():
         encrypted_key = fernet.encrypt(api_key.encode()).decode()
         valid_models = _valid_models()
         provider_models = sorted(
-            [m for m in valid_models if m.lower().startswith(provider.lower() + "/")
-             or m.lower().startswith(provider.lower() + ".")]
+            [m for m in valid_models if m.lower().startswith(provider + "/")
+             or m.lower().startswith(provider + ".")]
         )
 
         doc_ref = _firestore_client.collection(FIRESTORE_COLLECTION_PROVIDERS).document(
@@ -1564,7 +1671,8 @@ def delete_provider_key():
     try:
         data = request.get_json()
         user_id = data.get("userId")
-        provider = data.get("provider")
+        provider_raw = data.get("provider")
+        provider = _normalize_provider(provider_raw) if provider_raw else None
 
         if not user_id or not provider:
             return jsonify({"error": "Missing userId or provider"}), 400
@@ -2396,6 +2504,7 @@ def query():
             if body["pg"].get("queries"):
                 qspecs = []
                 for q in body["pg"]["queries"]:
+
                     nm = q.get("name") or f"q{len(qspecs)+1}"
                     sql = q.get("sql") or ""
                     if sql.strip():

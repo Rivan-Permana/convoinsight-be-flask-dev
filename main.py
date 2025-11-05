@@ -25,16 +25,6 @@ import pandas as pd  # not used for pipeline; retained to avoid non-pipeline bre
 import litellm
 from litellm import get_valid_models
 
-# === NEW (minimal): auth error shim so we can return 401 on bad API key
-try:
-    from litellm import AuthenticationError as LLMAuthError  # recent litellm
-except Exception:
-    try:
-        from litellm.exceptions import AuthenticationError as LLMAuthError  # older litellm
-    except Exception:
-        class LLMAuthError(Exception):  # safe fallback if symbol not present
-            pass
-
 # --- ✅ a0.0.8: Optional SQLAlchemy for PostgreSQL unification into dfs
 try:
     from sqlalchemy import create_engine, text as sa_text
@@ -323,7 +313,6 @@ def _resolve_llm_credentials(body: dict) -> Tuple[str, Optional[str], Optional[s
     Priority:
       - Take plaintext apiKey in body if provided (ephemeral per-request).
       - Else, if userId+provider provided, try Firestore stored encrypted token.
-      - Else, if only userId provided, try ACTIVE provider config to auto-fill provider+model+key.
       - If still missing, return (model_id, None, provider) to signal missing key.
 
     Returns: (chosen_model_id, chosen_api_key, provider_in)
@@ -333,31 +322,16 @@ def _resolve_llm_credentials(body: dict) -> Tuple[str, Optional[str], Optional[s
     api_key_in = (body.get("apiKey") or "").strip() or None
     user_id_in = (body.get("userId") or "").strip() or None
 
-    chosen_provider = provider_in
-    chosen_model_text = model_in
-    chosen_api_key = None
+    chosen_model_id = _compose_model_id(provider_in, model_in)
 
-    # Prefer immediate per-request key
+    chosen_api_key = None
     if api_key_in:
-        chosen_api_key = api_key_in
+        chosen_api_key = api_key_in  # use immediate per-request key
     elif user_id_in and provider_in:
-        # try Firestore stored key for that provider
+        # try Firestore stored key
         chosen_api_key = _get_user_provider_token(user_id_in, provider_in)
 
-    # 🔧 NEW: auto-fallback to active provider config if missing bits
-    if user_id_in and (not chosen_api_key or not chosen_provider or not chosen_model_text):
-        active = _get_active_provider_config(user_id_in)
-        if active:
-            if not chosen_provider and active.get("provider"):
-                chosen_provider = active["provider"]
-            if not chosen_api_key and active.get("api_key"):
-                chosen_api_key = active["api_key"]
-            if not chosen_model_text:
-                chosen_model_text = active.get("selected_model") or (active.get("models") or [None])[0]
-
-    chosen_model_id = _compose_model_id(chosen_provider, chosen_model_text)
-
-    return chosen_model_id, chosen_api_key, chosen_provider
+    return chosen_model_id, chosen_api_key, provider_in
 
 
 def get_provider_config(provider: str, api_key: str):
@@ -411,32 +385,6 @@ def _get_user_provider_token(user_id: str, provider: str) -> Optional[str]:
         return fernet.decrypt(enc.encode()).decode()
     except Exception:
         return None
-
-
-# === NEW (minimal): get active provider config (provider + api_key + selectedModel)
-def _get_active_provider_config(user_id: str) -> Optional[dict]:
-    try:
-        col = _firestore_client.collection(FIRESTORE_COLLECTION_PROVIDERS)
-        docs = col.where("user_id", "==", user_id).where("is_active", "==", True).stream()
-        for d in docs:
-            rec = d.to_dict() or {}
-            provider = rec.get("provider")
-            token_enc = rec.get("token")
-            api_key = None
-            if token_enc and fernet:
-                try:
-                    api_key = fernet.decrypt(token_enc.encode()).decode()
-                except Exception:
-                    api_key = None
-            return {
-                "provider": provider,
-                "api_key": api_key,
-                "selected_model": rec.get("selectedModel"),
-                "models": rec.get("models") or [],
-            }
-    except Exception:
-        pass
-    return None
 
 
 # --- Firestore-backed conversation state -----------
@@ -2290,7 +2238,7 @@ def suggest():
         if not chosen_model_id:
             return jsonify({"detail": "Missing or invalid model. Provide provider+model or a valid model id."}), 400
         if not chosen_api_key:
-            return jsonify({"detail": "No API key available. Provide apiKey or save a key for this user (set active)."}), 400
+            return jsonify({"detail": "No API key available. Provide apiKey or save a key for this provider."}), 400
 
         domain = slug(domain_in)
         if isinstance(dataset_field, list):
@@ -2303,39 +2251,35 @@ def suggest():
 
         dfs, data_info, data_describe = _load_domain_dataframes(domain, dataset_filters)
 
-        try:
-            r = completion(
-                model=chosen_model_id,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": """
-                    Make sure all of the information below is applied.
-                    1. Based on the provided dataset(s), Suggest exactly 4 realistic user prompt in a format of a STRICT one-line JSON with keys: suggestion1, suggestion2, suggestion3, suggestion4.
-                    2. Each suggestion should be less than 100 characters. No prose beyond the JSON.
-                    3. Each value must be a single-line string. No extra keys, no prose, no markdown/code fences.
-                    """,
-                    },
-                    {
-                        "role": "user",
-                        "content": f"""Make sure all of the information below is applied.
-                        Datasets Domain name: {domain}.
-                        df.info of each dfs key(file name)-value pair:
-                        {data_info}.
-                        df.describe of each dfs key(file name)-value pair:
-                        {data_describe}.""",
-                    },
-                ],
-                seed=1,
-                stream=False,
-                verbosity="low",
-                drop_params=True,
-                reasoning_effort="high",
-                api_key=chosen_api_key,
-            )
-        except LLMAuthError as e:
-            return jsonify({"code": "INVALID_API_KEY", "detail": str(e)}), 401
-
+        r = completion(
+            model=chosen_model_id,
+            messages=[
+                {
+                    "role": "system",
+                    "content": """
+                Make sure all of the information below is applied.
+                1. Based on the provided dataset(s), Suggest exactly 4 realistic user prompt in a format of a STRICT one-line JSON with keys: suggestion1, suggestion2, suggestion3, suggestion4.
+                2. Each suggestion should be less than 100 characters. No prose beyond the JSON.
+                3. Each value must be a single-line string. No extra keys, no prose, no markdown/code fences.
+                """,
+                },
+                {
+                    "role": "user",
+                    "content": f"""Make sure all of the information below is applied.
+                    Datasets Domain name: {domain}.
+                    df.info of each dfs key(file name)-value pair:
+                    {data_info}.
+                    df.describe of each dfs key(file name)-value pair:
+                    {data_describe}.""",
+                },
+            ],
+            seed=1,
+            stream=False,
+            verbosity="low",
+            drop_params=True,
+            reasoning_effort="high",
+            api_key=chosen_api_key,
+        )
         content = get_content(r)
         try:
             m = re.search(r"\{.*\}", content, re.DOTALL)
@@ -2410,7 +2354,7 @@ def query():
             return (
                 jsonify(
                     {
-                        "detail": "No API key available for the selected provider. Provide 'apiKey' or save one via /validate-key and mark it active."
+                        "detail": "No API key available for the selected provider. Provide 'apiKey' or save one via /validate-key."
                     }
                 ),
                 400,
@@ -2507,18 +2451,14 @@ def query():
             )
 
         # Router
-        try:
-            agent_plan = _run_router(
-                prompt,
-                data_info,
-                data_describe,
-                state,
-                llm_model=chosen_model_id,
-                llm_api_key=chosen_api_key,
-            )
-        except LLMAuthError as e:
-            return jsonify({"code": "INVALID_API_KEY", "detail": str(e)}), 401
-
+        agent_plan = _run_router(
+            prompt,
+            data_info,
+            data_describe,
+            state,
+            llm_model=chosen_model_id,
+            llm_api_key=chosen_api_key,
+        )
         need_manip = bool(agent_plan.get("need_manipulator", True))
         need_visual = bool(agent_plan.get("need_visualizer", True))
         include_insight = body.get("includeInsight", True)
@@ -2536,20 +2476,16 @@ def query():
 
         # Orchestrator
         _cancel_if_needed(session_id)
-        try:
-            spec = _run_orchestrator(
-                prompt,
-                domain,
-                data_info,
-                data_describe,
-                visual_hint,
-                context_hint,
-                llm_model=chosen_model_id,
-                llm_api_key=chosen_api_key,
-            )
-        except LLMAuthError as e:
-            return jsonify({"code": "INVALID_API_KEY", "detail": str(e)}), 401
-
+        spec = _run_orchestrator(
+            prompt,
+            domain,
+            data_info,
+            data_describe,
+            visual_hint,
+            context_hint,
+            llm_model=chosen_model_id,
+            llm_api_key=chosen_api_key,
+        )
         manipulator_prompt = spec.get("manipulator_prompt", "")
         visualizer_prompt = spec.get("visualizer_prompt", "")
         analyzer_prompt = spec.get("analyzer_prompt", "")
@@ -2570,40 +2506,37 @@ def query():
                 "compiler_instruction": compiler_instruction,
             }, ensure_ascii=False, indent=2)
 
-            try:
-                plan_explainer_response = completion(
-                    model=plan_explainer_model,
-                    messages=[
-                        {
-                            "role": "system",
-                            "content": """Make sure all of the information below is applied.
-                            1. The prompt that will be given to you is the details of what the system is going to do to respond to the user prompt.
-                            2. Your objective is to summarize that plan into an easy-to-understand, thought-process-style explanation
-                            of what you (the system) are going to do for the user to read while they wait.
-                            3. Respond in a single, human-readable paragraph.
-                            4. Include reasoning behind each crucial step taken."""
-                        },
-                        {
-                            "role": "user",
-                            "content": (
-                                f"User Prompt: {prompt}\n"
-                                f"Domain: {domain}\n"
-                                f"Data Info: {data_info}\n"
-                                f"Data Describe: {data_describe}\n"
-                                f"Agent Plan: {json.dumps(agent_plan, ensure_ascii=False)}\n"
-                                f"Detailed instructions for each agent:\n{initial_content}"
-                            )
-                        },
-                    ],
-                    seed=1,
-                    stream=False,
-                    verbosity="medium",
-                    drop_params=True,
-                    reasoning_effort="high",
-                    api_key=chosen_api_key
-                )
-            except LLMAuthError as e:
-                return jsonify({"code": "INVALID_API_KEY", "detail": str(e)}), 401
+            plan_explainer_response = completion(
+                model=plan_explainer_model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": """Make sure all of the information below is applied.
+                        1. The prompt that will be given to you is the details of what the system is going to do to respond to the user prompt.
+                        2. Your objective is to summarize that plan into an easy-to-understand, thought-process-style explanation
+                        of what you (the system) are going to do for the user to read while they wait.
+                        3. Respond in a single, human-readable paragraph.
+                        4. Include reasoning behind each crucial step taken."""
+                    },
+                    {
+                        "role": "user",
+                        "content": (
+                            f"User Prompt: {prompt}\n"
+                            f"Domain: {domain}\n"
+                            f"Data Info: {data_info}\n"
+                            f"Data Describe: {data_describe}\n"
+                            f"Agent Plan: {json.dumps(agent_plan, ensure_ascii=False)}\n"
+                            f"Detailed instructions for each agent:\n{initial_content}"
+                        )
+                    },
+                ],
+                seed=1,
+                stream=False,
+                verbosity="medium",
+                drop_params=True,
+                reasoning_effort="high",
+                api_key=chosen_api_key
+            )
 
             plan_explainer_content = get_content(plan_explainer_response)
             plan_explainer_end_time = time.time()
@@ -2632,10 +2565,7 @@ def query():
                     pdf = d.to_pandas()
                     pdf.columns = [str(c) for c in pdf.columns]
                     semantic_dfs.append(pai.DataFrame(pdf))
-            try:
-                dm_resp = pai.chat(manipulator_prompt, *semantic_dfs)
-            except LLMAuthError as e:
-                return jsonify({"code": "INVALID_API_KEY", "detail": str(e)}), 401
+            dm_resp = pai.chat(manipulator_prompt, *semantic_dfs)
             val = getattr(dm_resp, "value", dm_resp)
             df_processed = _to_polars_dataframe(val)
 
@@ -2658,10 +2588,7 @@ def query():
                     500,
                 )
             data_visualizer = _as_pai_df(df_processed)
-            try:
-                dv_resp = data_visualizer.chat(visualizer_prompt)
-            except LLMAuthError as e:
-                return jsonify({"code": "INVALID_API_KEY", "detail": str(e)}), 401
+            dv_resp = data_visualizer.chat(visualizer_prompt)
 
             # Move produced HTML to CHARTS_ROOT (local dev) + upload to GCS
             chart_path = getattr(dv_resp, "value", None)
@@ -2714,10 +2641,7 @@ def query():
                     500,
                 )
             data_analyzer = _as_pai_df(df_processed)
-            try:
-                da_obj = data_analyzer.chat(analyzer_prompt)
-            except LLMAuthError as e:
-                return jsonify({"code": "INVALID_API_KEY", "detail": str(e)}), 401
+            da_obj = data_analyzer.chat(analyzer_prompt)
             da_resp = get_content(da_obj)
             state["last_analyzer_text"] = da_resp or ""
 
@@ -2728,31 +2652,27 @@ def query():
             if isinstance(df_processed, pl.DataFrame)
             else data_info
         )
-        try:
-            final_response = completion(
-                model=compiler_model or chosen_model_id,
-                messages=[
-                    {"role": "system", "content": compiler_instruction},
-                    {
-                        "role": "user",
-                        "content": f"User Prompt:{prompt}. \n"
-                        f"Datasets Domain name: {domain}. \n"
-                        f"df.info of each dfs key(file name)-value pair:\n{data_info_runtime}. \n"
-                        f"df.describe of each dfs key(file name)-value pair:\n{data_describe}. \n"
-                        f"Data Visualizer Response:{getattr(dv_resp, 'value', '')}. \n"
-                        f"Data Analyzer Response:{da_resp}.",
-                    },
-                ],
-                seed=1,
-                stream=False,
-                verbosity="medium",
-                drop_params=True,
-                reasoning_effort="high",
-                api_key=chosen_api_key,
-            )
-        except LLMAuthError as e:
-            return jsonify({"code": "INVALID_API_KEY", "detail": str(e)}), 401
-
+        final_response = completion(
+            model=compiler_model or chosen_model_id,
+            messages=[
+                {"role": "system", "content": compiler_instruction},
+                {
+                    "role": "user",
+                    "content": f"User Prompt:{prompt}. \n"
+                    f"Datasets Domain name: {domain}. \n"
+                    f"df.info of each dfs key(file name)-value pair:\n{data_info_runtime}. \n"
+                    f"df.describe of each dfs key(file name)-value pair:\n{data_describe}. \n"
+                    f"Data Visualizer Response:{getattr(dv_resp, 'value', '')}. \n"
+                    f"Data Analyzer Response:{da_resp}.",
+                },
+            ],
+            seed=1,
+            stream=False,
+            verbosity="medium",
+            drop_params=True,
+            reasoning_effort="high",
+            api_key=chosen_api_key,
+        )
         final_content = get_content(final_response)
 
         # Persist summary

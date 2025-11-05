@@ -1413,23 +1413,97 @@ def get_provider_keys():
         for doc in docs:
             d = doc.to_dict()
             raw_updated = d.get("updated_at")
-            updated_at = raw_updated.isoformat() if hasattr(raw_updated, "isoformat") else str(raw_updated) if raw_updated else None
-            items.append(
-                {
-                    "id": doc.id,
-                    "provider": d.get("provider"),
-                    "models": d.get("models", []),
-                    "is_active": d.get("is_active", True),
-                    "updated_at": updated_at,
-                }
-            )
 
-        return jsonify(
-            {"items": items, "count": len(items), "summary": f"{len(items)} provider keys found"}
-        )
+            # Pastikan format tanggal tetap aman jika None atau bukan datetime
+            if hasattr(raw_updated, "isoformat"):
+                updated_at = raw_updated.isoformat()
+            else:
+                updated_at = str(raw_updated) if raw_updated else None
+
+            items.append({
+                "id": doc.id,
+                "provider": d.get("provider"),
+                "models": d.get("models", []),
+                "is_active": d.get("is_active", False),  # Default ke False jika tidak ada
+                "updated_at": updated_at,
+
+                # ✅ Tambahan field konfigurasi model (optional, bisa None)
+                "selectedModel": d.get("selectedModel"),
+                "verbosity": d.get("verbosity"),
+                "reasoning": d.get("reasoning"),
+                "seed": d.get("seed"),
+            })
+
+        return jsonify({
+            "items": items,
+            "count": len(items),
+            "summary": f"{len(items)} provider keys found"
+        })
+
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+@app.route("/set-active-config", methods=["POST"])
+def set_active_config():
+    """
+    Menyimpan preferensi konfigurasi (selectedModel, verbosity, reasoning, seed)
+    dan menetapkannya sebagai konfigurasi aktif (is_active = True) untuk provider tertentu.
+    Semua konfigurasi provider lain milik user yang sama akan dinonaktifkan.
+    """
+    try:
+        data = request.get_json()
+        user_id = (data.get("userId") or "").strip()
+        provider = (data.get("provider") or "").strip()
+
+        if not user_id or not provider:
+            return jsonify({
+                "saved": False,
+                "error": "Missing userId or provider"
+            }), 400
+
+        # 1. Query semua config milik user → nonaktifkan semuanya terlebih dahulu
+        docs_query = (
+            _firestore_client.collection(FIRESTORE_COLLECTION_PROVIDERS)
+            .where("user_id", "==", user_id)
+        )
+
+        batch = _firestore_client.batch()
+
+        for doc in docs_query.stream():
+            doc_provider = doc.id.split(f"{user_id}_")[-1]  # Misal: "uid_gemini" -> "gemini"
+            if doc_provider != provider:
+                batch.update(doc.reference, {"is_active": False})
+
+        # 2. Aktifkan config untuk provider ini + simpan preferensinya
+        doc_ref = _firestore_client.collection(FIRESTORE_COLLECTION_PROVIDERS).document(
+            f"{user_id}_{provider}"
+        )
+
+        prefs = {
+            "is_active": True,
+            "selectedModel": data.get("selectedModel"),
+            "verbosity": data.get("verbosity"),
+            "reasoning": data.get("reasoning"),
+            "seed": data.get("seed"),
+            "updated_at": firestore.SERVER_TIMESTAMP,
+        }
+
+        batch.set(doc_ref, prefs, merge=True)
+
+        # 3. Commit ke Firestore
+        batch.commit()
+
+        return jsonify({
+            "saved": True,
+            "provider": provider,
+            "message": f"Active provider set to {provider}"
+        })
+
+    except Exception as e:
+        return jsonify({
+            "saved": False,
+            "error": str(e)
+        }), 500
 
 @app.route("/update-provider-key", methods=["PUT"])
 def update_provider_key():

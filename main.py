@@ -313,6 +313,9 @@ def _resolve_llm_credentials(body: dict) -> Tuple[str, Optional[str], Optional[s
     Priority:
       - Take plaintext apiKey in body if provided (ephemeral per-request).
       - Else, if userId+provider provided, try Firestore stored encrypted token.
+      - Else, if only userId provided, try the ACTIVE provider config (is_active=True).
+      - If model is missing, prefer active.selectedModel, else first saved model for that provider,
+        else first valid model for that provider in litellm.
       - If still missing, return (model_id, None, provider) to signal missing key.
 
     Returns: (chosen_model_id, chosen_api_key, provider_in)
@@ -322,14 +325,48 @@ def _resolve_llm_credentials(body: dict) -> Tuple[str, Optional[str], Optional[s
     api_key_in = (body.get("apiKey") or "").strip() or None
     user_id_in = (body.get("userId") or "").strip() or None
 
-    chosen_model_id = _compose_model_id(provider_in, model_in)
-
     chosen_api_key = None
+    active_conf = None
+
+    # 1) Direct per-request key wins
     if api_key_in:
-        chosen_api_key = api_key_in  # use immediate per-request key
-    elif user_id_in and provider_in:
-        # try Firestore stored key
+        chosen_api_key = api_key_in
+
+    # 2) If not provided, try stored token for specific provider
+    if not chosen_api_key and user_id_in and provider_in:
         chosen_api_key = _get_user_provider_token(user_id_in, provider_in)
+
+    # 3) If still not provided, use ACTIVE provider config for this user
+    if not chosen_api_key and user_id_in:
+        active_conf = _get_active_provider_config(user_id_in)
+        if active_conf:
+            # adopt active provider if request didn't specify one
+            if not provider_in:
+                provider_in = active_conf.get("provider")
+            # adopt its key
+            chosen_api_key = active_conf.get("api_key")
+            # adopt model if request didn't specify one
+            if not model_in:
+                model_in = active_conf.get("selectedModel") or None
+                if not model_in:
+                    prov_models = active_conf.get("models") or []
+                    # pick the first saved model for this provider if available
+                    if prov_models:
+                        model_in = prov_models[0]
+
+    # 4) If still no model, pick a reasonable one from litellm for the provider
+    if not model_in and provider_in:
+        try:
+            for m in _valid_models():
+                ml = m.lower()
+                if ml.startswith(provider_in.lower() + "/") or ml.startswith(provider_in.lower() + "."):
+                    model_in = m
+                    break
+        except Exception:
+            pass
+
+    # 5) Compose final model id
+    chosen_model_id = _compose_model_id(provider_in, model_in)
 
     return chosen_model_id, chosen_api_key, provider_in
 
@@ -383,6 +420,42 @@ def _get_user_provider_token(user_id: str, provider: str) -> Optional[str]:
         if not enc or not fernet:
             return None
         return fernet.decrypt(enc.encode()).decode()
+    except Exception:
+        return None
+
+# ✅ NEW: fetch user's ACTIVE provider config with decrypted token
+def _get_active_provider_config(user_id: str) -> Optional[dict]:
+    """
+    Returns {
+      "provider": <str>,
+      "api_key": <decrypted str or None>,
+      "selectedModel": <str or None>,
+      "models": <list[str]>
+    } for the first active provider config. None if not found or decrypt fails.
+    """
+    try:
+        q = (
+            _firestore_client.collection(FIRESTORE_COLLECTION_PROVIDERS)
+            .where("user_id", "==", user_id)
+            .where("is_active", "==", True)
+            .limit(1)
+        )
+        docs = list(q.stream())
+        if not docs:
+            return None
+        d = docs[0].to_dict() or {}
+        api_key = None
+        if fernet and d.get("token"):
+            try:
+                api_key = fernet.decrypt(d["token"].encode()).decode()
+            except Exception:
+                api_key = None
+        return {
+            "provider": d.get("provider"),
+            "api_key": api_key,
+            "selectedModel": d.get("selectedModel"),
+            "models": d.get("models", []),
+        }
     except Exception:
         return None
 

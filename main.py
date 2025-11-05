@@ -1,5 +1,4 @@
 # main.py — ConvoInsight BE (Flask, Cloud Run ready)
-# Polars + PandasAI wrappers; GCS/Firestore persistence; provider keys via Firestore (encrypted)
 
 import os, io, json, time, uuid, re, html
 from datetime import datetime, timedelta

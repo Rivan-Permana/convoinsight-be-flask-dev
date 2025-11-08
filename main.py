@@ -262,6 +262,30 @@ def _all_supported_providers() -> List[str]:
     return sorted({n.strip() for n in names if isinstance(n, str) and n.strip()})
 
 
+# ---------- NEW: detect & decrypt Fernet tokens safely ----------
+def _maybe_decrypt_api_key(token: str) -> str:
+    """
+    If FE accidentally sends our encrypted Fernet token as apiKey/token,
+    transparently decrypt it and return the plaintext API key. If decryption
+    fails or the result doesn't look like a real key, return the original.
+    """
+    if not token or not isinstance(token, str):
+        return token
+    # Quick reject for short/obviously plaintext keys
+    s = token.strip()
+    if not fernet:
+        return s
+    try:
+        dec = fernet.decrypt(s.encode()).decode()
+        # reuse the plausibility check below; define after function in file
+        if _plausible_api_key(dec):
+            return dec
+    except Exception:
+        pass
+    return s
+# ----------------------------------------------------------------
+
+
 def _compose_model_id(provider: Optional[str], model: Optional[str]) -> str:
     """
     Compose a litellm model id dynamically WITHOUT hardcoding provider names.
@@ -275,6 +299,11 @@ def _compose_model_id(provider: Optional[str], model: Optional[str]) -> str:
     """
     model = (model or "").strip()
     provider = (provider or "").strip()
+
+    # ✅ Provider alias nudge: FE may send provider="google" for Gemini models.
+    # Prefer LiteLLM's "gemini" provider for gemini-* models to avoid legacy google/palm routes.
+    if provider.lower() == "google" and model.lower().startswith("gemini"):
+        provider = "gemini"
 
     # Already fully qualified
     if model and "/" in model:
@@ -311,7 +340,7 @@ def _resolve_llm_credentials(body: dict) -> Tuple[str, Optional[str], Optional[s
     """
     Resolve model id and API key from request body WITHOUT using any server defaults.
     Priority:
-      - Take plaintext apiKey in body if provided (ephemeral per-request).
+      - Prefer per-request plaintext apiKey if provided (but auto-decrypt if FE sent Fernet token).
       - Else, if userId+provider provided, try Firestore stored encrypted token.
       - If still missing, return (model_id, None, provider) to signal missing key.
 
@@ -319,14 +348,18 @@ def _resolve_llm_credentials(body: dict) -> Tuple[str, Optional[str], Optional[s
     """
     provider_in = (body.get("provider") or "").strip() or None
     model_in = (body.get("model") or "").strip() or None
-    api_key_in = (body.get("apiKey") or "").strip() or None
+
+    # Accept either "apiKey" or (legacy FE) "token"
+    api_key_in = (body.get("apiKey") or body.get("token") or "").strip() or None
     user_id_in = (body.get("userId") or "").strip() or None
 
     chosen_model_id = _compose_model_id(provider_in, model_in)
 
     chosen_api_key = None
     if api_key_in:
-        chosen_api_key = api_key_in  # use immediate per-request key
+        # 🔑 Transparently decrypt Fernet token if that’s what FE passed
+        candidate = _maybe_decrypt_api_key(api_key_in)
+        chosen_api_key = candidate
     elif user_id_in and provider_in:
         # try Firestore stored key
         chosen_api_key = _get_user_provider_token(user_id_in, provider_in)
@@ -2657,8 +2690,7 @@ def query():
             messages=[
                 {"role": "system", "content": compiler_instruction},
                 {
-                    "role": "user",
-                    "content": f"User Prompt:{prompt}. \n"
+                    "role": "user", "content": f"User Prompt:{prompt}. \n"
                     f"Datasets Domain name: {domain}. \n"
                     f"df.info of each dfs key(file name)-value pair:\n{data_info_runtime}. \n"
                     f"df.describe of each dfs key(file name)-value pair:\n{data_describe}. \n"

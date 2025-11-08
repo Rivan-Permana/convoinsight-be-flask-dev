@@ -79,7 +79,7 @@ except Exception:
     _REPORTLAB_AVAILABLE = False
 
 # -------- Config --------
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")  # not used as a fallback for /query or /suggest
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")  # no longer used as a fallback in flow
 GCP_PROJECT_ID = os.getenv("GCP_PROJECT_ID")
 
 FERNET_KEY = os.getenv("FERNET_KEY")
@@ -307,31 +307,27 @@ def _compose_model_id(provider: Optional[str], model: Optional[str]) -> str:
     return model
 
 
-# ===== NEW: accept encrypted apiKey from FE and decrypt if needed =====
 def _maybe_decrypt_api_key(api_key_in: Optional[str]) -> Optional[str]:
     """
-    If FE passes the encrypted token (from /validate-key response),
-    transparently decrypt it using the server's Fernet key.
-    If it isn't Fernet-encrypted or decryption fails, use as-is.
+    Accept either plaintext or Fernet-encrypted token (created by this server).
+    If decryption fails (not our token), pass through as-is.
     """
     s = (api_key_in or "").strip()
     if not s:
         return None
     if not fernet:
-        return s  # no decryptor configured → assume plaintext
+        return s
     try:
-        # Will succeed only if token was encrypted with the same Fernet key
         return fernet.decrypt(s.encode()).decode()
     except Exception:
         return s
-# =====================================================================
 
 
 def _resolve_llm_credentials(body: dict) -> Tuple[str, Optional[str], Optional[str]]:
     """
     Resolve model id and API key from request body WITHOUT using any server defaults.
     Priority:
-      - Take plaintext or Fernet-encrypted apiKey in body if provided (ephemeral per-request).
+      - Take plaintext/encrypted apiKey in body if provided (ephemeral per-request).
       - Else, if userId+provider provided, try Firestore stored encrypted token.
       - If still missing, return (model_id, None, provider) to signal missing key.
 
@@ -346,7 +342,7 @@ def _resolve_llm_credentials(body: dict) -> Tuple[str, Optional[str], Optional[s
 
     chosen_api_key = None
     if api_key_in:
-        # 🔑 accept either plaintext or encrypted token
+        # 🔑 DECRYPT IF NEEDED — core fix so encrypted token works with providers
         chosen_api_key = _maybe_decrypt_api_key(api_key_in)
     elif user_id_in and provider_in:
         # try Firestore stored key (already decrypted in helper)
@@ -2241,7 +2237,7 @@ def suggest():
       - provider (str, optional)
       - model (str, optional; can be fully-qualified or short)
       - userId (str, optional; to fetch stored provider token)
-      - apiKey (str, optional; per-request override)
+      - apiKey (str, optional; per-request override; accepts plaintext OR Fernet-encrypted)
     Returns:
       { suggestions: [s1,s2,s3,s4], elapsed: <sec>, data_info, data_describe }
     """
@@ -2254,7 +2250,7 @@ def suggest():
         if not domain_in:
             return jsonify({"detail": "Missing 'domain'"}), 400
 
-        # Resolve LLM creds & model (NO env fallback)
+        # Resolve LLM creds & model (NO env fallback) — decrypt if needed
         chosen_model_id, chosen_api_key, _ = _resolve_llm_credentials(body)
         if not chosen_model_id:
             return jsonify({"detail": "Missing or invalid model. Provide provider+model or a valid model id."}), 400
@@ -2272,56 +2268,60 @@ def suggest():
 
         dfs, data_info, data_describe = _load_domain_dataframes(domain, dataset_filters)
 
-        r = completion(
-            model=chosen_model_id,
-            messages=[
-                {
-                    "role": "system",
-                    "content": """
-                Make sure all of the information below is applied.
-                1. Based on the provided dataset(s), Suggest exactly 4 realistic user prompt in a format of a STRICT one-line JSON with keys: suggestion1, suggestion2, suggestion3, suggestion4.
-                2. Each suggestion should be less than 100 characters. No prose beyond the JSON.
-                3. Each value must be a single-line string. No extra keys, no prose, no markdown/code fences.
-                """,
-                },
-                {
-                    "role": "user",
-                    "content": f"""Make sure all of the information below is applied.
-                    Datasets Domain name: {domain}.
-                    df.info of each dfs key(file name)-value pair:
-                    {data_info}.
-                    df.describe of each dfs key(file name)-value pair:
-                    {data_describe}.""",
-                },
-            ],
-            seed=1,
-            stream=False,
-            verbosity="low",
-            drop_params=True,
-            reasoning_effort="high",
-            api_key=chosen_api_key,
-        )
-        content = get_content(r)
         try:
-            m = re.search(r"\{.*\}", content, re.DOTALL)
-            js = json.loads(m.group(0)) if m else {}
-        except Exception:
-            js = {}
-        suggestions = [
-            js.get("suggestion1", ""),
-            js.get("suggestion2", ""),
-            js.get("suggestion3", ""),
-            js.get("suggestion4", ""),
-        ]
-        elapsed = time.time() - t0
-        return jsonify(
-            {
-                "suggestions": suggestions,
-                "elapsed": elapsed,
-                "data_info": data_info,
-                "data_describe": data_describe,
-            }
-        )
+            r = completion(
+                model=chosen_model_id,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": """
+                    Make sure all of the information below is applied.
+                    1. Based on the provided dataset(s), Suggest exactly 4 realistic user prompt in a format of a STRICT one-line JSON with keys: suggestion1, suggestion2, suggestion3, suggestion4.
+                    2. Each suggestion should be less than 100 characters. No prose beyond the JSON.
+                    3. Each value must be a single-line string. No extra keys, no prose, no markdown/code fences.
+                    """,
+                    },
+                    {
+                        "role": "user",
+                        "content": f"""Make sure all of the information below is applied.
+                        Datasets Domain name: {domain}.
+                        df.info of each dfs key(file name)-value pair:
+                        {data_info}.
+                        df.describe of each dfs key(file name)-value pair:
+                        {data_describe}.""",
+                    },
+                ],
+                seed=1,
+                stream=False,
+                verbosity="low",
+                drop_params=True,
+                reasoning_effort="high",
+                api_key=chosen_api_key,
+            )
+            content = get_content(r)
+            try:
+                m = re.search(r"\{.*\}", content, re.DOTALL)
+                js = json.loads(m.group(0)) if m else {}
+            except Exception:
+                js = {}
+            suggestions = [
+                js.get("suggestion1", ""),
+                js.get("suggestion2", ""),
+                js.get("suggestion3", ""),
+                js.get("suggestion4", ""),
+            ]
+            elapsed = time.time() - t0
+            return jsonify(
+                {
+                    "suggestions": [s for s in suggestions if isinstance(s, str) and s.strip()],
+                    "elapsed": elapsed,
+                    "data_info": data_info,
+                    "data_describe": data_describe,
+                }
+            )
+        except Exception as e:
+            # Return 400 for provider errors instead of 500 to help FE handle gracefully
+            return jsonify({"detail": f"LLM_ERROR: {str(e)}"}), 400
     except Exception as e:
         return jsonify({"detail": str(e)}), 500
 
@@ -2340,7 +2340,7 @@ def query():
       - provider (str, optional)                    # e.g., "google"|"openai"|"anthropic"|...
       - model (str, optional)                       # e.g., "gemini-2.5-pro", "gpt-4o-mini", or "provider/model"
       - userId (str, optional)                      # used to fetch provider token from Firestore; also PG creds if using "pg:*" etc
-      - apiKey (str, optional)                      # per-request direct API key (preferred if provided)
+      - apiKey (str, optional)                      # per-request direct API key (preferred if provided, encrypted or plaintext)
       - includeInsight (bool, optional)
       - pg (dict, optional, ✅ a0.0.8)               # {"name":"default", "tables":["t1","t2"], "schema":"public", "limit":500} or {"name":"default","queries":[{"name":"q1","sql":"SELECT ..."}]}
     Returns:
@@ -2353,7 +2353,7 @@ def query():
         prompt = body.get("prompt")
         session_id = body.get("session_id") or str(uuid.uuid4())
 
-        # Resolve model + key dynamically (no env fallback)
+        # Resolve model + key dynamically (no env fallback) — decrypt if needed
         chosen_model_id, chosen_api_key, provider_in = _resolve_llm_credentials(body)
 
         dataset_field = body.get("dataset")
@@ -2571,7 +2571,11 @@ def query():
             print("Plan Explainer skipped (router decision).")
 
         # Shared LLM (PandasAI via LiteLLM) - use chosen model & user key
-        llm = LiteLLM(model=chosen_model_id, api_key=chosen_api_key)
+        # 🔑 Ensure the PandasAI LiteLLM bridge gets the same api token (some versions expect api_token)
+        try:
+            llm = LiteLLM(model=chosen_model_id, api_token=chosen_api_key)
+        except TypeError:
+            llm = LiteLLM(model=chosen_model_id, api_key=chosen_api_key)
         pai.config.set({"llm": llm})
 
         # Manipulator (Polars-first via pai.DataFrame wrappers)
@@ -2678,7 +2682,8 @@ def query():
             messages=[
                 {"role": "system", "content": compiler_instruction},
                 {
-                    "role": "user", "content": f"User Prompt:{prompt}. \n"
+                    "role": "user",
+                    "content": f"User Prompt:{prompt}. \n"
                     f"Datasets Domain name: {domain}. \n"
                     f"df.info of each dfs key(file name)-value pair:\n{data_info_runtime}. \n"
                     f"df.describe of each dfs key(file name)-value pair:\n{data_describe}. \n"

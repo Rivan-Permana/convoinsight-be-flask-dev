@@ -14,7 +14,7 @@ import polars as pl
 import pandasai as pai
 from pandasai_litellm.litellm import LiteLLM
 from litellm import completion, model_list as LITELLM_MODEL_LIST
-from pandasai.core.response.dataframe import DataFrameResponse  # noqa: F401 (kept for compat)
+from pandasai.core.response.dataframe import DataFrameResponse  # noqa: F401
 
 # --- (pandas kept import for minimal surface compatibility, not used in pipeline)
 import pandas as pd  # retained to avoid non-pipeline breakages elsewhere
@@ -25,7 +25,6 @@ from litellm import get_valid_models
 try:
     from sqlalchemy import create_engine, text as sa_text
     from sqlalchemy.pool import NullPool
-
     _SQLALCHEMY_AVAILABLE = True
 except Exception:
     _SQLALCHEMY_AVAILABLE = False
@@ -55,7 +54,6 @@ from storage3.types import FileOptions  # type: ignore
 # -------- optional: load .env --------
 try:
     from dotenv import load_dotenv
-
     load_dotenv()
 except Exception:
     pass
@@ -67,7 +65,6 @@ try:
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
     from reportlab.lib.enums import TA_LEFT
     from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
-
     _REPORTLAB_AVAILABLE = True
 except Exception:
     _REPORTLAB_AVAILABLE = False
@@ -134,11 +131,9 @@ _CANCEL_FLAGS = set()  # holds session_id
 def slug(s: str) -> str:
     return "-".join(s.strip().split()).lower()
 
-
 def ensure_dir(p: str):
     os.makedirs(p, exist_ok=True)
     return p
-
 
 def get_content(r):
     """Extract content from LiteLLM response (robust)."""
@@ -159,7 +154,6 @@ def get_content(r):
     except Exception:
         return str(r)
 
-
 def _safe_json_loads(s: str):
     try:
         return json.loads(s)
@@ -170,10 +164,8 @@ def _safe_json_loads(s: str):
             return json.loads(s[start : end + 1])
         raise
 
-
 def _should_cancel(session_id: str) -> bool:
     return session_id in _CANCEL_FLAGS
-
 
 def _cancel_if_needed(session_id: str):
     if _should_cancel(session_id):
@@ -191,7 +183,6 @@ def _sorted_providers() -> List[str]:
     except Exception:
         return []
 
-
 def _valid_models() -> List[str]:
     """Return model id list from litellm. Fallback to built-in constant if needed."""
     try:
@@ -201,7 +192,6 @@ def _valid_models() -> List[str]:
             return list(LITELLM_MODEL_LIST)
         except Exception:
             return []
-
 
 def _group_models_by_prefix(models: Optional[List[str]] = None) -> Dict[str, List[str]]:
     """Group models by their first segment (prefix) without hardcoding provider names."""
@@ -221,7 +211,6 @@ def _group_models_by_prefix(models: Optional[List[str]] = None) -> Dict[str, Lis
     for k in list(groups.keys()):
         groups[k] = sorted(groups[k])
     return {k: groups[k] for k in sorted(groups.keys())}
-
 
 def _compose_model_id(provider: Optional[str], model: Optional[str]) -> str:
     """
@@ -255,11 +244,9 @@ def _compose_model_id(provider: Optional[str], model: Optional[str]) -> str:
 
     return model
 
-
 def _require_fernet():
     if not fernet:
         raise RuntimeError("FERNET_KEY is not configured on server")
-
 
 def _maybe_decrypt_api_key(api_key_in: Optional[str]) -> Optional[str]:
     """
@@ -296,7 +283,6 @@ def _maybe_decrypt_api_key(api_key_in: Optional[str]) -> Optional[str]:
         )
     return s
 
-
 def _get_user_provider_token(user_id: str, provider: str) -> Optional[str]:
     """
     Fetch encrypted token from Firestore and decrypt with Fernet.
@@ -317,7 +303,6 @@ def _get_user_provider_token(user_id: str, provider: str) -> Optional[str]:
         return fernet.decrypt(enc.encode()).decode()
     except Exception:
         return None
-
 
 def _resolve_llm_credentials(body: dict) -> Tuple[Optional[str], Optional[str], Optional[str]]:
     """
@@ -358,13 +343,11 @@ def _resolve_llm_credentials(body: dict) -> Tuple[Optional[str], Optional[str], 
 
     return chosen_model_id, chosen_api_key, provider_in
 
-
 def get_provider_config(provider: str, api_key: str):
     """Kept for potential FE compatibility."""
     if not provider:
         raise ValueError("Provider not specified")
     return {"url": None, "headers": {"Authorization": f"Bearer {api_key}"} if api_key else {}}
-
 
 def save_provider_key(user_id: str, provider: str, encrypted_key: str, models: list):
     try:
@@ -400,10 +383,8 @@ def _fs_default_state():
         "created_at": firestore.SERVER_TIMESTAMP,
     }
 
-
 def _fs_sess_ref(session_id: str):
     return _firestore_client.collection(FIRESTORE_COLLECTION_SESSIONS).document(session_id)
-
 
 def _get_conv_state(session_id: str) -> dict:
     doc = _fs_sess_ref(session_id).get()
@@ -418,12 +399,10 @@ def _get_conv_state(session_id: str) -> dict:
         _fs_sess_ref(session_id).set(state, merge=True)
         return state
 
-
 def _save_conv_state(session_id: str, state: dict):
     st = dict(state)
     st["updated_at"] = firestore.SERVER_TIMESTAMP
     _fs_sess_ref(session_id).set(st, merge=True)
-
 
 def _append_history(state: dict, role: str, content: str, max_len=10_000, keep_last=100):
     content = str(content)
@@ -440,7 +419,6 @@ def _gcs_bucket():
         raise RuntimeError("GCS_BUCKET is not set")
     return _storage_client.bucket(GCS_BUCKET)
 
-
 def _metadata_sa_email() -> Optional[str]:
     """Fetch the service account email from GCE metadata (Cloud Run)."""
     try:
@@ -454,7 +432,6 @@ def _metadata_sa_email() -> Optional[str]:
     except Exception:
         pass
     return None
-
 
 def _signed_url(blob, filename: str, content_type: str, ttl_seconds: int) -> str:
     """
@@ -504,10 +481,8 @@ def _signed_url(blob, filename: str, content_type: str, ttl_seconds: int) -> str
         response_type=content_type,
     )
 
-
 def _use_supabase_for_charts() -> bool:
     return (os.getenv("CHARTS_STORAGE", "gcs").lower() == "supabase") and (supabase_client is not None)
-
 
 def upload_diagram_to_supabase(
     local_path: str, *, domain: str, session_id: str, run_id: str, kind: str
@@ -557,7 +532,6 @@ def _upload_dataset_file_local(file_storage, *, domain: str) -> dict:
         "local_path": dest,
     }
 
-
 def _save_bytes_local(domain: str, filename: str, data: bytes) -> dict:
     safe_domain = slug(domain)
     folder = ensure_dir(os.path.join(DATASETS_ROOT, safe_domain))
@@ -583,7 +557,6 @@ def _normalize_columns_to_str(df: pl.DataFrame) -> pl.DataFrame:
         df = df.set_column_names(new_names)
     return df
 
-
 def _polars_info_string(df: pl.DataFrame) -> str:
     lines = [f"shape: {df.shape[0]} rows x {df.shape[1]} columns", "dtypes/nulls:"]
     try:
@@ -596,7 +569,6 @@ def _polars_info_string(df: pl.DataFrame) -> str:
         lines.append(f"  - {name}: {dtype} (nulls={n})")
     return "\n".join(lines)
 
-
 def _to_polars_dataframe(obj):
     if isinstance(obj, pl.DataFrame):
         return _normalize_columns_to_str(obj)
@@ -605,7 +577,6 @@ def _to_polars_dataframe(obj):
         return _normalize_columns_to_str(df)
     except Exception:
         return None
-
 
 def _as_pai_df(df):
     """
@@ -626,7 +597,6 @@ def _as_pai_df(df):
             pdf.columns = [str(c) for c in pdf.columns]
         return pai.DataFrame(pdf)
 
-
 def _read_csv_bytes_to_polars(
     data: bytes, sep_candidates: List[str] = (",", "|", ";", "\t")
 ) -> pl.DataFrame:
@@ -644,18 +614,15 @@ def _read_csv_bytes_to_polars(
     except Exception as e:
         raise last_err or e
 
-
 # ✅ a0.0.8: Excel readers (beside multi-separator CSV)
 def _is_excel_filename(name: str) -> bool:
     n = name.lower()
     return n.endswith(".xlsx") or n.endswith(".xls")
 
-
 def _read_excel_bytes_to_polars(data: bytes, sheet_name: Optional[str] = None) -> pl.DataFrame:
     with io.BytesIO(data) as bio:
         pdf = pd.read_excel(bio, sheet_name=sheet_name)  # requires openpyxl/xlrd
     return _normalize_columns_to_str(pl.from_pandas(pdf))
-
 
 def _read_local_csv_to_polars(
     path: str, sep_candidates: List[str] = (",", "|", ";", "\t")
@@ -714,12 +681,10 @@ def upload_dataset_file(file_storage, *, domain: str) -> dict:
         # Only if upload to GCS itself fails, fallback to local
         return _upload_dataset_file_local(file_storage, domain=domain)
 
-
 def list_gcs_csvs(domain: str) -> List[storage.Blob]:
     safe_domain = slug(domain)
     prefix = f"{GCS_DATASETS_PREFIX}/{safe_domain}/"
     return list(_gcs_bucket().list_blobs(prefix=prefix))
-
 
 # ✅ a0.0.8: list both CSV and Excel; kept CSV helper for compat
 def list_gcs_tabulars(domain: str) -> List[storage.Blob]:
@@ -730,7 +695,6 @@ def list_gcs_tabulars(domain: str) -> List[storage.Blob]:
         if n.endswith(".csv") or n.endswith(".xlsx") or n.endswith(".xls"):
             out.append(b)
     return out
-
 
 def read_gcs_csv_to_pl_df(
     gs_uri_or_blobname: str, *, sep_candidates: List[str] = (",", "|", ";", "\t")
@@ -745,7 +709,6 @@ def read_gcs_csv_to_pl_df(
     blob = bucket.blob(blob_name)
     data = blob.download_as_bytes()
     return _read_csv_bytes_to_polars(data, sep_candidates=sep_candidates)
-
 
 # ✅ a0.0.8: general tabular reader for GCS (CSV + Excel)
 def read_gcs_tabular_to_pl_df(
@@ -764,7 +727,6 @@ def read_gcs_tabular_to_pl_df(
     if name.endswith(".xlsx") or name.endswith(".xls"):
         return _read_excel_bytes_to_polars(data)
     return _read_csv_bytes_to_polars(data, sep_candidates=sep_candidates)
-
 
 def delete_gcs_object(blob_name_or_gs_uri: str):
     if blob_name_or_gs_uri.startswith("gs://"):
@@ -789,7 +751,6 @@ def _detect_diagram_kind(local_html_path: str, visual_hint: str) -> str:
     except Exception:
         pass
     return "tables" if str(visual_hint).lower().strip() == "table" else "charts"
-
 
 def upload_diagram_to_gcs(
     local_path: str, *, domain: str, session_id: str, run_id: str, kind: str
@@ -929,19 +890,10 @@ response_compiler_system_configuration = """1. Honor precedence: direct user pro
 39. Mention the dataset name involved of each statement.
 40. SHOULD BE STRICTLY ONLY respond in HTML format."""
 
-# --- User/Domain configs injected into Orchestrator ---
-USER_SPECIFIC_CONFIGURATION = """1. (no user-specific instructions provided yet)."""
+# ---- Defaults to avoid NameError and allow future overrides
+user_specific_configuration = "{}"
+domain_specific_configuration = "{}"
 
-DOMAIN_SPECIFIC_CONFIGURATION = """1. Use period labels like m0 (current month) and m1 (prior month) and apply consistently.
-2. Currency is IDR; format like: Rp93,000.00 or Rp354,500.00.
-3. Prefer blue themed colors for charts and tables.
-4. Targets shown in mn (million).
-5. %TUR means take-up-rate percentage.
-6. % Taker, % Transaction, and % Revenue squad are percentages of each product against all-product Revenue; 'all' is in bn (billion IDR).
-7. Revenue Squad values are in mn (million IDR).
-8. rev/subs and rev/trx are in thousands of IDR.
-9. MoM is month-over-month in percentage.
-10. 'Subs' = taker."""
 
 # =========================
 # Shared Data Loading (Polars-first)
@@ -961,7 +913,6 @@ def _pg_get_decrypted_conn(user_id: str, name: str = "default") -> Optional[dict
     except Exception:
         return None
 
-
 def _pg_build_engine_url(meta: dict) -> str:
     host = meta["host"]
     port = str(meta["port"])
@@ -970,11 +921,9 @@ def _pg_build_engine_url(meta: dict) -> str:
     password = meta["password"]
     return f"postgresql+psycopg2://{user}:{password}@{host}:{port}/{dbname}"
 
-
 def _read_sql_to_polars(conn, query: str) -> pl.DataFrame:
     pdf = pd.read_sql(sa_text(query), conn)
     return _normalize_columns_to_str(pl.from_pandas(pdf))
-
 
 def _load_pg_tables_into_dfs(
     *, user_id: str, name: str = "default", tables: Optional[List[str]] = None,
@@ -1004,7 +953,6 @@ def _load_pg_tables_into_dfs(
             out[f"{key_prefix}:table:{t}"] = df
     return out
 
-
 def _load_pg_sql_into_dfs(
     *, user_id: str, name: str = "default", queries: List[Tuple[str, str]], key_prefix: str = "pg"
 ) -> Dict[str, pl.DataFrame]:
@@ -1024,7 +972,6 @@ def _load_pg_sql_into_dfs(
             df = _read_sql_to_polars(conn, query)
             out[f"{key_prefix}:query:{qname}"] = df
     return out
-
 
 def _load_domain_dataframes(
     domain: str, dataset_filters: Optional[set]
@@ -1120,26 +1067,6 @@ def _load_domain_dataframes(
                         pass
 
     return dfs, data_info, data_describe
-
-
-# Helper: stringify PandasAI responses safely
-def _stringify_pai_response(resp) -> str:
-    """
-    Safely turn PandasAI responses into a short string.
-    Handles: StringResponse, DataFrameResponse, raw str/df.
-    """
-    if resp is None:
-        return ""
-    v = getattr(resp, "value", resp)
-    try:
-        if isinstance(v, pl.DataFrame):
-            return f"PolarsDF shape={v.shape} cols={list(map(str, v.columns))[:12]}"
-        import pandas as _pd  # type: ignore
-        if isinstance(v, _pd.DataFrame):
-            return f"PandasDF shape={v.shape} cols={list(map(str, v.columns))[:12]}"
-    except Exception:
-        pass
-    return str(v)
 
 
 # =========================
@@ -1239,10 +1166,10 @@ def _run_orchestrator(
             {response_compiler_system_configuration}
 
             user_specific_configuration:
-            {USER_SPECIFIC_CONFIGURATION}
+            {user_specific_configuration}
 
             domain_specific_configuration:
-            {DOMAIN_SPECIFIC_CONFIGURATION}""",
+            {domain_specific_configuration}""",
             },
             {
                 "role": "user",
@@ -1282,11 +1209,9 @@ def _run_orchestrator(
 def health():
     return jsonify({"status": "healthy", "ts": datetime.utcnow().isoformat()})
 
-
 @app.get("/")
 def root():
     return jsonify({"ok": True, "service": "ConvoInsight BE", "health": "/health"})
-
 
 @app.route("/charts/<path:relpath>")
 def serve_chart(relpath):
@@ -1316,7 +1241,6 @@ def _plausible_api_key(api_key: str, *, min_len: int = 20, max_len: int = 512) -
     if not re.fullmatch(r"[A-Za-z0-9_\-\.=:/\+]+", s):
         return False
     return True
-
 
 @app.route("/validate-key", methods=["POST"])
 def validate_key():
@@ -1352,7 +1276,6 @@ def validate_key():
     except Exception as e:
         return jsonify({"valid": False, "error": str(e)}), 500
 
-
 @app.route("/get-provider-keys", methods=["GET"])
 def get_provider_keys():
     try:
@@ -1387,7 +1310,6 @@ def get_provider_keys():
         return jsonify({"items": items, "count": len(items), "summary": f"{len(items)} provider keys found"})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-
 
 @app.route("/set-active-config", methods=["POST"])
 def set_active_config():
@@ -1434,7 +1356,6 @@ def set_active_config():
     except Exception as e:
         return jsonify({"saved": False, "error": str(e)}), 500
 
-
 @app.route("/update-provider-key", methods=["PUT"])
 def update_provider_key():
     """Update existing provider key dynamically."""
@@ -1475,7 +1396,6 @@ def update_provider_key():
     except Exception as e:
         return jsonify({"updated": False, "error": str(e)}), 500
 
-
 @app.route("/delete-provider-key", methods=["DELETE"])
 def delete_provider_key():
     try:
@@ -1510,7 +1430,6 @@ def litellm_models():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-
 @app.route("/litellm/providers", methods=["GET"])
 def litellm_providers():
     version = getattr(litellm, "__version__", "unknown")
@@ -1519,7 +1438,6 @@ def litellm_providers():
         return jsonify({"count": len(providers), "providers": providers, "version": version})
     except Exception as e:
         return jsonify({"error": str(e), "version": version}), 500
-
 
 @app.get("/llm/registry")
 def llm_registry():
@@ -1530,7 +1448,6 @@ def llm_registry():
         return jsonify({"providers": providers, "models": models, "groups": groups, "counts": {"providers": len(providers), "models": len(models)}})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-
 
 @app.get("/debug/routes")
 def debug_routes():
@@ -1569,11 +1486,9 @@ def list_domains():
     except Exception as e:
         return jsonify({"detail": str(e)}), 500
 
-
 def _ds_ref(domain: str, filename: str):
     key = f"{slug(domain)}::{filename}"
     return _firestore_client.collection(FIRESTORE_COLLECTION_DATASETS).document(key)
-
 
 def _save_dataset_meta(domain: str, filename: str, gs_uri: str, size: int):
     meta = {
@@ -1586,10 +1501,8 @@ def _save_dataset_meta(domain: str, filename: str, gs_uri: str, size: int):
     }
     _ds_ref(domain, filename).set(meta, merge=True)
 
-
 def _delete_dataset_meta(domain: str, filename: str):
     _ds_ref(domain, filename).delete()
-
 
 def _list_dataset_meta(domain: Optional[str] = None, limit: int = 200) -> List[dict]:
     col = _firestore_client.collection(FIRESTORE_COLLECTION_DATASETS)
@@ -1598,7 +1511,6 @@ def _list_dataset_meta(domain: Optional[str] = None, limit: int = 200) -> List[d
         q = q.where("domain", "==", slug(domain))
     docs = q.limit(limit).stream()
     return [d.to_dict() for d in docs if d.exists]
-
 
 @app.post("/datasets/upload")
 def datasets_upload():
@@ -1611,7 +1523,6 @@ def datasets_upload():
         return jsonify(uploaded), 201
     except Exception as e:
         return jsonify({"detail": str(e)}), 500
-
 
 @app.get("/datasets")
 def datasets_list():
@@ -1699,7 +1610,6 @@ def datasets_list():
     except Exception as e:
         return jsonify({"detail": str(e)}), 500
 
-
 # ✅ NEW: Return all datasets for a given domain (path-based)
 @app.get("/datasets/<domain>/all")
 def datasets_list_all(domain):
@@ -1785,7 +1695,6 @@ def datasets_list_all(domain):
     except Exception as e:
         return jsonify({"detail": str(e)}), 500
 
-
 @app.delete("/datasets/<domain>/all")
 def datasets_delete_all(domain):
     deleted = []
@@ -1827,7 +1736,6 @@ def datasets_delete_all(domain):
     except Exception as e:
         return jsonify({"detail": str(e)}), 500
 
-
 @app.get("/datasets/<domain>/<path:filename>")
 def datasets_read(domain, filename):
     try:
@@ -1856,7 +1764,6 @@ def datasets_read(domain, filename):
     except Exception as e:
         return jsonify({"detail": str(e)}), 500
 
-
 @app.delete("/datasets/<domain>/<path:filename>")
 def datasets_delete(domain, filename):
     try:
@@ -1876,7 +1783,6 @@ def datasets_delete(domain, filename):
         return jsonify({"deleted": True, "domain": slug(domain), "filename": filename})
     except Exception as e:
         return jsonify({"detail": str(e)}), 500
-
 
 @app.post("/upload_datasets/<domain>")
 def compat_upload_datasets(domain: str):
@@ -1906,7 +1812,6 @@ def compat_upload_datasets(domain: str):
         return jsonify({"items": uploads}), 201
     except Exception as e:
         return jsonify({"detail": str(e)}), 500
-
 
 @app.get("/domains/<domain>/datasets")
 def compat_list_domain_datasets(domain: str):
@@ -1958,7 +1863,6 @@ def compat_list_domain_datasets(domain: str):
     except Exception as e:
         return jsonify({"detail": str(e)}), 500
 
-
 @app.get("/domains/<domain>/datasets/")
 def compat_list_domain_datasets_trailing(domain: str):
     return compat_list_domain_datasets(domain)
@@ -1992,7 +1896,6 @@ def sessions_list():
     except Exception as e:
         return jsonify({"detail": str(e)}), 500
 
-
 @app.get("/sessions/<session_id>/history")
 def sessions_history(session_id):
     try:
@@ -2008,7 +1911,6 @@ def sessions_history(session_id):
         )
     except Exception as e:
         return jsonify({"detail": str(e)}), 500
-
 
 @app.get("/sessions/<session_id>/export/pdf")
 def sessions_export_pdf(session_id: str):
@@ -2054,7 +1956,6 @@ def sessions_export_pdf(session_id: str):
         return send_file(buf, mimetype="application/pdf", as_attachment=True, download_name=filename)
     except Exception as e:
         return jsonify({"detail": str(e)}), 500
-
 
 @app.post("/query/cancel")
 def query_cancel():
@@ -2157,7 +2058,7 @@ def suggest():
             ]
             return jsonify(
                 {
-                    "suggestions": [s for s in suggestions if isinstance(s, str) and s.strip()],
+                    "suggestions": [s for s in suggestions if isinstance(s, str) and s.strip() ],
                     "elapsed": time.time() - t0,
                     "data_info": data_info,
                     "data_describe": data_describe,
@@ -2346,13 +2247,12 @@ def query():
         compiler_instruction = spec.get("compiler_instruction", "")
 
         # ✅ a0.0.8: Explainer (thinking) connected to router
-        need_plan_explainer = True  # keep enabled as in pipeline a0.0.8
+        need_plan_explainer = True  # keep enabled
         plan_explainer_model = agent_plan.get("plan_explainer_model") or chosen_model_id
 
         if need_plan_explainer:
             plan_explainer_start_time = time.time()
 
-            # isi detail instruksi untuk ketiga agen
             initial_content = json.dumps({
                 "manipulator_prompt": manipulator_prompt,
                 "visualizer_prompt": visualizer_prompt,
@@ -2404,7 +2304,6 @@ def query():
             print("Plan Explainer skipped (router decision).")
 
         # Shared LLM (PandasAI via LiteLLM) - use chosen model & user key
-        # 🔑 Ensure the PandasAI LiteLLM bridge gets the same api token (some versions expect api_token)
         try:
             llm = LiteLLM(model=chosen_model_id, api_token=chosen_api_key)
         except TypeError:
@@ -2414,7 +2313,6 @@ def query():
         # Manipulator (Polars-first via pai.DataFrame wrappers)
         _cancel_if_needed(session_id)
         df_processed = None
-        dm_resp = None
         if need_manip or (need_visual or need_analyze):
             semantic_dfs = []
             for key, d in dfs.items():
@@ -2440,16 +2338,11 @@ def query():
 
         if need_visual:
             if df_processed is None:
-                return (
-                    jsonify(
-                        {"detail": "Visualization requested but no processed dataframe available."}
-                    ),
-                    500,
-                )
+                return jsonify({"detail": "Visualization requested but no processed dataframe available."}), 500
             data_visualizer = _as_pai_df(df_processed)
             dv_resp = data_visualizer.chat(visualizer_prompt)
 
-            # Move produced HTML to CHARTS_ROOT (local dev) + upload to GCS
+            # Move produced HTML to CHARTS_ROOT (local dev) + upload to GCS/Supabase
             chart_path = getattr(dv_resp, "value", None)
             if isinstance(chart_path, str) and os.path.exists(chart_path):
                 out_dir = ensure_dir(os.path.join(CHARTS_ROOT, domain))
@@ -2459,7 +2352,6 @@ def query():
                     os.replace(chart_path, dest)
                 except Exception:
                     import shutil
-
                     shutil.copyfile(chart_path, dest)
                 chart_url = f"/charts/{domain}/{filename}"
 
@@ -2492,25 +2384,18 @@ def query():
 
         # Analyzer
         _cancel_if_needed(session_id)
-        da_text = ""
+        da_resp = ""
         if need_analyze:
             if df_processed is None:
-                return (
-                    jsonify({"detail": "Analyzer requested but no processed dataframe available."}),
-                    500,
-                )
+                return jsonify({"detail": "Analyzer requested but no processed dataframe available."}), 500
             data_analyzer = _as_pai_df(df_processed)
             da_obj = data_analyzer.chat(analyzer_prompt)
-            da_text = _stringify_pai_response(da_obj)
-            state["last_analyzer_text"] = da_text or ""
+            da_resp = get_content(da_obj)
+            state["last_analyzer_text"] = da_resp or ""
 
         # Compiler (use chosen model & key)
         _cancel_if_needed(session_id)
-        data_info_runtime = (
-            _polars_info_string(df_processed)
-            if isinstance(df_processed, pl.DataFrame)
-            else data_info
-        )
+        data_info_runtime = _polars_info_string(df_processed) if isinstance(df_processed, pl.DataFrame) else data_info
         final_response = completion(
             model=compiler_model or chosen_model_id,
             messages=[
@@ -2521,9 +2406,8 @@ def query():
                     f"Datasets Domain name: {domain}. \n"
                     f"df.info of each dfs key(file name)-value pair:\n{data_info_runtime}. \n"
                     f"df.describe of each dfs key(file name)-value pair:\n{data_describe}. \n"
-                    f"Data Manipulator Response:{_stringify_pai_response(dm_resp)}. \n"
                     f"Data Visualizer Response:{getattr(dv_resp, 'value', '')}. \n"
-                    f"Data Analyzer Response:{da_text}.",
+                    f"Data Analyzer Response:{da_resp}.",
                 },
             ],
             seed=1,
@@ -2622,7 +2506,6 @@ def pg_save():
     except Exception as e:
         return jsonify({"saved": False, "error": str(e)}), 500
 
-
 @app.get("/pg/get")
 def pg_get():
     """
@@ -2657,7 +2540,6 @@ def pg_get():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-
 @app.post("/pg/test")
 def pg_test():
     """
@@ -2689,7 +2571,6 @@ def pg_test():
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
-
 @app.get("/charts/sb/list")
 def charts_sb_list():
     """
@@ -2706,7 +2587,6 @@ def charts_sb_list():
         items = supabase_client.storage.from_(SUPABASE_BUCKET_CHARTS).list(
             path=prefix or "", limit=limit
         )
-        # normalisasi output
         out = [
             {
                 "name": it.get("name"),
@@ -2721,7 +2601,6 @@ def charts_sb_list():
         return jsonify({"items": out, "prefix": prefix})
     except Exception as e:
         return jsonify({"detail": str(e)}), 500
-
 
 @app.get("/charts/sb/signed")
 def charts_sb_signed():
@@ -2747,7 +2626,6 @@ def charts_sb_signed():
         return jsonify({"path": path, "signed_url": signed, "public_url": public_url})
     except Exception as e:
         return jsonify({"detail": str(e)}), 500
-
 
 @app.delete("/charts/sb")
 def charts_sb_delete():

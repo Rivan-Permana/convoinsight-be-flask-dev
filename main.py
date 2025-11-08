@@ -315,14 +315,14 @@ def _require_fernet():
 def _maybe_decrypt_api_key(api_key_in: Optional[str]) -> Optional[str]:
     """
     Accept either plaintext or Fernet-encrypted token (created by this server).
-    If decryption fails and the token *looks* like a Fernet token, raise a clear error
+    If decryption fails and the token *looks* like a Fernet token, raise ValueError
     so FE can prompt the user to re-validate/save the key.
     """
     s = (api_key_in or "").strip()
     if not s:
         return None
 
-    looks_fernet = s.startswith("gAAAA")  # typical Fernet token prefix
+    looks_fernet = s.startswith("gAAAA")  # typical Fernet prefix
 
     if fernet:
         if looks_fernet:
@@ -332,13 +332,13 @@ def _maybe_decrypt_api_key(api_key_in: Optional[str]) -> Optional[str]:
                 raise ValueError(
                     "TOKEN_ENCRYPTED_BUT_CANNOT_DECRYPT: "
                     "This API key appears encrypted but could not be decrypted. "
-                    "Ensure the BE FERNET_KEY matches the one used when validating the key, "
+                    "Ensure server FERNET_KEY matches the one used when saving the key, "
                     "or send a plaintext 'apiKey' from the client."
                 )
-        # Not looking like Fernet → treat as plaintext
+        # treat as plaintext
         return s
 
-    # No Fernet configured on the server
+    # server does not have FERNET
     if looks_fernet:
         raise ValueError(
             "SERVER_MISSING_FERNET_KEY: "
@@ -346,6 +346,45 @@ def _maybe_decrypt_api_key(api_key_in: Optional[str]) -> Optional[str]:
             "Set FERNET_KEY or send a plaintext 'apiKey'."
         )
     return s
+
+
+def _resolve_llm_credentials(body: dict) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """
+    Resolve model id + API key, without env fallbacks.
+    Priority: apiKey from body (decrypt if needed) -> stored (userId+provider) -> None.
+    Returns: (chosen_model_id, chosen_api_key, provider_in)
+    """
+    provider_in = (body.get("provider") or "").strip() or None
+    model_in = (body.get("model") or "").strip() or None
+    api_key_in = (body.get("apiKey") or "").strip() or None
+    user_id_in = (body.get("userId") or "").strip() or None
+
+    chosen_model_id = _compose_model_id(provider_in, model_in)
+
+    chosen_api_key = None
+    if api_key_in:
+        chosen_api_key = _maybe_decrypt_api_key(api_key_in)
+    elif user_id_in and provider_in:
+        chosen_api_key = _get_user_provider_token(user_id_in, provider_in)  # should return plaintext
+
+    # extra guard for clarity (so we don't hit provider with bad token)
+    if chosen_api_key and chosen_api_key.startswith("gAAAA"):
+        # somehow passed through still encrypted
+        raise ValueError("ENCRYPTED_TOKEN_PASSED_THROUGH: server received an encrypted token that was not decrypted.")
+
+    # shape check for Google/Gemini keys
+    if (
+        chosen_api_key
+        and provider_in
+        and provider_in.lower() in ("google", "gemini")
+        and not chosen_api_key.startswith("AIza")
+    ):
+        raise ValueError(
+            "GOOGLE_API_KEY_SHAPE_INVALID: the provided key doesn't look like a Gemini (AI Studio) API key. "
+            "It should start with 'AIza'. Recheck the key you saved."
+        )
+
+    return chosen_model_id, chosen_api_key, provider_in
 
 
 def _resolve_llm_credentials(body: dict) -> Tuple[str, Optional[str], Optional[str]]:
@@ -2243,15 +2282,10 @@ def query_cancel():
 @app.post("/suggest")
 def suggest():
     """
-    Body (JSON):
+    Body:
       - domain (str, required)
       - dataset (str | [str], optional)
-      - provider (str, optional)
-      - model (str, optional; can be fully-qualified or short)
-      - userId (str, optional; to fetch stored provider token)
-      - apiKey (str, optional; per-request override; accepts plaintext OR Fernet-encrypted)
-    Returns:
-      { suggestions: [s1,s2,s3,s4], elapsed: <sec>, data_info, data_describe }
+      - provider, model, userId, apiKey (optional, but needed for LLM)
     """
     t0 = time.time()
     try:
@@ -2262,11 +2296,10 @@ def suggest():
         if not domain_in:
             return jsonify({"detail": "Missing 'domain'"}), 400
 
-        # Resolve creds (decrypt if needed)
+        # resolve creds (may raise ValueError with clear message)
         try:
             chosen_model_id, chosen_api_key, _ = _resolve_llm_credentials(body)
         except ValueError as e:
-            # token encrypted but can't decrypt / server missing FERNET_KEY
             return jsonify({"detail": str(e)}), 400
 
         if not chosen_model_id:
@@ -2291,21 +2324,21 @@ def suggest():
                 messages=[
                     {
                         "role": "system",
-                        "content": """
-                    Make sure all of the information below is applied.
-                    1. Based on the provided dataset(s), Suggest exactly 4 realistic user prompt in a format of a STRICT one-line JSON with keys: suggestion1, suggestion2, suggestion3, suggestion4.
-                    2. Each suggestion should be less than 100 characters. No prose beyond the JSON.
-                    3. Each value must be a single-line string. No extra keys, no prose, no markdown/code fences.
-                    """,
+                        "content": (
+                            "Make sure all of the information below is applied.\n"
+                            "1. Based on the provided dataset(s), Suggest exactly 4 realistic user prompt in a format of a STRICT one-line JSON with keys: suggestion1, suggestion2, suggestion3, suggestion4.\n"
+                            "2. Each suggestion should be less than 100 characters. No prose beyond the JSON.\n"
+                            "3. Each value must be a single-line string. No extra keys, no prose, no markdown/code fences."
+                        ),
                     },
                     {
                         "role": "user",
-                        "content": f"""Make sure all of the information below is applied.
-                        Datasets Domain name: {domain}.
-                        df.info of each dfs key(file name)-value pair:
-                        {data_info}.
-                        df.describe of each dfs key(file name)-value pair:
-                        {data_describe}.""",
+                        "content": (
+                            f"Make sure all of the information below is applied.\n"
+                            f"Datasets Domain name: {domain}.\n"
+                            f"df.info of each dfs key(file name)-value pair:\n{data_info}.\n"
+                            f"df.describe of each dfs key(file name)-value pair:\n{data_describe}."
+                        ),
                     },
                 ],
                 seed=1,
@@ -2316,29 +2349,30 @@ def suggest():
                 api_key=chosen_api_key,
             )
             content = get_content(r)
+
             try:
                 m = re.search(r"\{.*\}", content, re.DOTALL)
                 js = json.loads(m.group(0)) if m else {}
             except Exception:
                 js = {}
+
             suggestions = [
                 js.get("suggestion1", ""),
                 js.get("suggestion2", ""),
                 js.get("suggestion3", ""),
                 js.get("suggestion4", ""),
             ]
-            elapsed = time.time() - t0
             return jsonify(
                 {
                     "suggestions": [s for s in suggestions if isinstance(s, str) and s.strip()],
-                    "elapsed": elapsed,
+                    "elapsed": time.time() - t0,
                     "data_info": data_info,
                     "data_describe": data_describe,
                 }
             )
         except Exception as e:
-            # Return 400 for provider errors instead of 500 to help FE handle gracefully
             return jsonify({"detail": f"LLM_ERROR: {str(e)}"}), 400
+
     except Exception as e:
         return jsonify({"detail": str(e)}), 500
 
@@ -2349,19 +2383,7 @@ def suggest():
 @app.post("/query")
 def query():
     """
-    Body (JSON):
-      - domain (str, required)
-      - prompt (str, required)
-      - session_id (str, optional)
-      - dataset (str | [str], optional)            # CSV/XLSX/XLS file names; also supports inline "pg:*" / "pg:table:..." / "pg:query:alias|SQL"
-      - provider (str, optional)                    # e.g., "google"|"openai"|"anthropic"|...
-      - model (str, optional)                       # e.g., "gemini-2.5-pro", "gpt-4o-mini", or "provider/model"
-      - userId (str, optional)                      # used to fetch provider token from Firestore; also PG creds if using "pg:*" etc
-      - apiKey (str, optional)                      # per-request direct API key (preferred if provided, encrypted or plaintext)
-      - includeInsight (bool, optional)
-      - pg (dict, optional, ✅ a0.0.8)               # {"name":"default", "tables":["t1","t2"], "schema":"public", "limit":500} or {"name":"default","queries":[{"name":"q1","sql":"SELECT ..."}]}
-    Returns:
-      - session_id, response (HTML), diagram_* fields, timing & flags
+    Body: domain, prompt, dataset, provider, model, userId, apiKey, includeInsight, pg
     """
     t0 = time.time()
     try:
@@ -2370,6 +2392,7 @@ def query():
         prompt = body.get("prompt")
         session_id = body.get("session_id") or str(uuid.uuid4())
 
+        # resolve creds with explicit errors
         try:
             chosen_model_id, chosen_api_key, provider_in = _resolve_llm_credentials(body)
         except ValueError as e:
@@ -2391,14 +2414,9 @@ def query():
         if not chosen_model_id:
             return jsonify({"detail": "Missing or invalid model. Provide provider+model or a valid model id."}), 400
         if not chosen_api_key:
-            return (
-                jsonify(
-                    {
-                        "detail": "No API key available for the selected provider. Provide 'apiKey' or save one via /validate-key."
-                    }
-                ),
-                400,
-            )
+            return jsonify(
+                {"detail": "No API key available for the selected provider. Provide 'apiKey' or save one via /validate-key."}
+            ), 400
 
         domain = slug(domain_in)
 

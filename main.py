@@ -287,20 +287,29 @@ def _get_user_provider_token(user_id: str, provider: str) -> Optional[str]:
     """
     Fetch encrypted token from Firestore and decrypt with Fernet.
     Returns plaintext token or None if not found/cannot decrypt.
+    (Hardened to try common provider id casings.)
     """
     try:
-        doc_id = f"{user_id}_{provider}"
-        doc = (
-            _firestore_client.collection(FIRESTORE_COLLECTION_PROVIDERS)
-            .document(doc_id)
-            .get()
-        )
-        if not doc.exists:
-            return None
-        enc = (doc.to_dict() or {}).get("token")
-        if not enc or not fernet:
-            return None
-        return fernet.decrypt(enc.encode()).decode()
+        base = (provider or "").strip()
+        candidates = [
+            f"{user_id}_{base}",
+            f"{user_id}_{base.lower()}",
+            f"{user_id}_{base.upper()}",
+        ]
+        seen = set()
+        for doc_id in [c for c in candidates if not (c in seen or seen.add(c))]:
+            doc = (
+                _firestore_client.collection(FIRESTORE_COLLECTION_PROVIDERS)
+                .document(doc_id)
+                .get()
+            )
+            if not doc.exists:
+                continue
+            enc = (doc.to_dict() or {}).get("token")
+            if not enc or not fernet:
+                continue
+            return fernet.decrypt(enc.encode()).decode()
+        return None
     except Exception:
         return None
 
@@ -329,18 +338,7 @@ def _resolve_llm_credentials(body: dict) -> Tuple[Optional[str], Optional[str], 
             "ENCRYPTED_TOKEN_PASSED_THROUGH: server received an encrypted token that was not decrypted."
         )
 
-    # shape check (khusus Gemini/Google agar error lebih jelas)
-    if (
-        chosen_api_key
-        and provider_in
-        and provider_in.lower() in ("google", "gemini")
-        and not chosen_api_key.startswith("AIza")
-    ):
-        raise ValueError(
-            "GOOGLE_API_KEY_SHAPE_INVALID: the provided key doesn't look like a Gemini (AI Studio) API key. "
-            "It should start with 'AIza'. Recheck the key you saved."
-        )
-
+    # Tidak ada pengecekan bentuk/jenis key spesifik provider. Validasi generik saja.
     return chosen_model_id, chosen_api_key, provider_in
 
 def get_provider_config(provider: str, api_key: str):
@@ -793,7 +791,7 @@ router_system_configuration = """Make sure all of the information below is appli
 12. Rules of thumb: if prompt contains “why/driver/explain/root cause/trend/surprise” then need_analyzer=true.
 13. Rules of thumb: if prompt mentions allocation, optimization, plan, gap-closure, “minimum number of additional takers”, set need_analyzer=true and set visual_hint="table".
 14. If follow-up with no new data ops implied and a processed df exists, set need_manipulator=false to reuse the previous dataframe.
-15. Compiler always runs; default compiler_model="gemini/gemini-2.5-pro" unless the domain/user requires otherwise.
+15. Compiler always runs; default compiler_model="SAME_AS_SELECTED" (use the user's selected provider+model) unless the domain/user requires otherwise.
 16. visual_hint ∈ {"bar","line","table","auto"}; pick the closest fit and prefer "table" for plan/allocation outputs.
 17. Keep the reason short (≤120 chars). No prose beyond the JSON.
 18. In short: choose the most efficient set of agents/LLMs to answer the prompt well while respecting overrides.
@@ -1992,7 +1990,7 @@ def suggest():
 
         # resolve creds (may raise ValueError with clear message)
         try:
-            chosen_model_id, chosen_api_key, _ = _resolve_llm_credentials(body)
+            chosen_model_id, chosen_api_key, provider_in = _resolve_llm_credentials(body)
         except ValueError as e:
             return jsonify({"detail": str(e)}), 400
 
@@ -2218,7 +2216,12 @@ def query():
         need_visual = bool(agent_plan.get("need_visualizer", True))
         include_insight = body.get("includeInsight", True)
         need_analyze = include_insight and bool(agent_plan.get("need_analyzer", True))
+
+        # compiler model: hormati plan, tapi kalau "SAME_AS_SELECTED"/"AUTO"/"DEFAULT", pakai chosen_model_id
         compiler_model = agent_plan.get("compiler_model") or chosen_model_id
+        if isinstance(compiler_model, str) and compiler_model.strip().upper() in {"SAME_AS_SELECTED", "AUTO", "DEFAULT"}:
+            compiler_model = chosen_model_id
+
         visual_hint = agent_plan.get("visual_hint", "auto")
 
         context_hint = {

@@ -307,20 +307,45 @@ def _compose_model_id(provider: Optional[str], model: Optional[str]) -> str:
     return model
 
 
+def _require_fernet():
+    if not fernet:
+        raise RuntimeError("FERNET_KEY is not configured on server")
+
+
 def _maybe_decrypt_api_key(api_key_in: Optional[str]) -> Optional[str]:
     """
     Accept either plaintext or Fernet-encrypted token (created by this server).
-    If decryption fails (not our token), pass through as-is.
+    If decryption fails and the token *looks* like a Fernet token, raise a clear error
+    so FE can prompt the user to re-validate/save the key.
     """
     s = (api_key_in or "").strip()
     if not s:
         return None
-    if not fernet:
+
+    looks_fernet = s.startswith("gAAAA")  # typical Fernet token prefix
+
+    if fernet:
+        if looks_fernet:
+            try:
+                return fernet.decrypt(s.encode()).decode()
+            except Exception:
+                raise ValueError(
+                    "TOKEN_ENCRYPTED_BUT_CANNOT_DECRYPT: "
+                    "This API key appears encrypted but could not be decrypted. "
+                    "Ensure the BE FERNET_KEY matches the one used when validating the key, "
+                    "or send a plaintext 'apiKey' from the client."
+                )
+        # Not looking like Fernet → treat as plaintext
         return s
-    try:
-        return fernet.decrypt(s.encode()).decode()
-    except Exception:
-        return s
+
+    # No Fernet configured on the server
+    if looks_fernet:
+        raise ValueError(
+            "SERVER_MISSING_FERNET_KEY: "
+            "Received an encrypted token but the server has no FERNET_KEY. "
+            "Set FERNET_KEY or send a plaintext 'apiKey'."
+        )
+    return s
 
 
 def _resolve_llm_credentials(body: dict) -> Tuple[str, Optional[str], Optional[str]]:
@@ -342,10 +367,8 @@ def _resolve_llm_credentials(body: dict) -> Tuple[str, Optional[str], Optional[s
 
     chosen_api_key = None
     if api_key_in:
-        # 🔑 DECRYPT IF NEEDED — core fix so encrypted token works with providers
         chosen_api_key = _maybe_decrypt_api_key(api_key_in)
     elif user_id_in and provider_in:
-        # try Firestore stored key (already decrypted in helper)
         chosen_api_key = _get_user_provider_token(user_id_in, provider_in)
 
     return chosen_model_id, chosen_api_key, provider_in
@@ -1327,10 +1350,6 @@ def serve_chart(relpath):
 # =========================
 # Provider key management
 # =========================
-def _require_fernet():
-    if not fernet:
-        raise RuntimeError("FERNET_KEY is not configured on server")
-
 # ---------- NEW: provider-agnostic, lightweight API key plausibility check ----------
 def _plausible_api_key(api_key: str, *, min_len: int = 20, max_len: int = 512) -> bool:
     """
@@ -1368,6 +1387,7 @@ def validate_key():
     Validate & save API key for a given provider.
     - Dynamic providers/models via LiteLLM (no hardcoded vendor lists).
     - Uses a provider-agnostic, non-network plausibility check to avoid false negatives.
+    - RELAXED provider check: we accept unknown providers; we still persist and return any matching models we can find.
     """
     try:
         data = request.get_json()
@@ -1377,11 +1397,6 @@ def validate_key():
 
         if not provider or not api_key or not user_id:
             return jsonify({"valid": False, "error": "Missing provider, apiKey, or userId"}), 400
-
-        # Accept only supported providers (dynamic)
-        providers_all = _all_supported_providers()
-        if provider not in providers_all:
-            return jsonify({"valid": False, "error": f"Provider not supported: {provider}"}), 400
 
         # Generic key plausibility (reject obvious garbage; avoid live probe)
         if not _plausible_api_key(api_key):
@@ -1526,6 +1541,7 @@ def update_provider_key():
     """
     Update an existing provider key dynamically.
     Uses the same generic plausibility rules as /validate-key (no live calls).
+    RELAXED provider check: accept unknown providers and still persist.
     """
     try:
         data = request.get_json()
@@ -1535,10 +1551,6 @@ def update_provider_key():
 
         if not user_id or not provider or not api_key:
             return jsonify({"updated": False, "error": "Missing fields"}), 400
-
-        providers_all = _all_supported_providers()
-        if provider not in providers_all:
-            return jsonify({"updated": False, "error": f"Provider not supported: {provider}"}), 400
 
         if not _plausible_api_key(api_key):
             return jsonify(
@@ -1618,7 +1630,7 @@ def litellm_providers():
     import litellm
     version = getattr(litellm, "__version__", "unknown")
     try:
-        # SAME sorting behavior as populate_api_provider_and_its_model.py
+        # SAME sorting behavior as populate script; may be empty on some versions, which is fine
         providers = _sorted_providers()
         return jsonify({"count": len(providers), "providers": providers, "version": version})
     except Exception as e:
@@ -2250,8 +2262,13 @@ def suggest():
         if not domain_in:
             return jsonify({"detail": "Missing 'domain'"}), 400
 
-        # Resolve LLM creds & model (NO env fallback) — decrypt if needed
-        chosen_model_id, chosen_api_key, _ = _resolve_llm_credentials(body)
+        # Resolve creds (decrypt if needed)
+        try:
+            chosen_model_id, chosen_api_key, _ = _resolve_llm_credentials(body)
+        except ValueError as e:
+            # token encrypted but can't decrypt / server missing FERNET_KEY
+            return jsonify({"detail": str(e)}), 400
+
         if not chosen_model_id:
             return jsonify({"detail": "Missing or invalid model. Provide provider+model or a valid model id."}), 400
         if not chosen_api_key:
@@ -2353,8 +2370,10 @@ def query():
         prompt = body.get("prompt")
         session_id = body.get("session_id") or str(uuid.uuid4())
 
-        # Resolve model + key dynamically (no env fallback) — decrypt if needed
-        chosen_model_id, chosen_api_key, provider_in = _resolve_llm_credentials(body)
+        try:
+            chosen_model_id, chosen_api_key, provider_in = _resolve_llm_credentials(body)
+        except ValueError as e:
+            return jsonify({"detail": str(e)}), 400
 
         dataset_field = body.get("dataset")
         if isinstance(dataset_field, list):

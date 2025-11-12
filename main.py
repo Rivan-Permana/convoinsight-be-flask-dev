@@ -475,7 +475,7 @@ def _signed_url(blob, filename: str, content_type: str, ttl_seconds: int) -> str
         version="v4",
         expiration=timedelta(seconds=ttl_seconds),
         method="GET",
-        response_disposition=f'inline; filename="{filename}"',
+               response_disposition=f'inline; filename="{filename}"',
         response_type=content_type,
     )
 
@@ -830,7 +830,9 @@ router_system_configuration = """Make sure all of the information below is appli
 16. visual_hint ∈ {"bar","line","table","auto"}; pick the closest fit and prefer "table" for plan/allocation outputs.
 17. Keep the reason short (≤120 chars). No prose beyond the JSON.
 18. In short: choose the most efficient set of agents/LLMs to answer the prompt well while respecting overrides.
-19. By default, Manipulator and Analyzer should always be used in most scenario, because response compiler did not have access to the complete detailed data."""
+19. By default, Manipulator and Analyzer should always be used in most scenario, because response compiler did not have access to the complete detailed data.
+20. ABSOLUTE RULE: Do NOT write or execute SQL anywhere. Never call execute_sql_query. Always operate on in-memory DataFrames only.
+"""
 
 orchestrator_system_configuration = """1. Honor precedence: direct user prompt > USER specific configuration > DOMAIN specific configuration > SYSTEM defaults.
 2. Think step by step.
@@ -846,8 +848,10 @@ orchestrator_system_configuration = """1. Honor precedence: direct user prompt >
 12. Use the Router Context Hint and Visualization hint when applicable.
 13. Respect the user- and domain-level configurations injected below; overrides must not alter core process.
 14. All specialists operate in Python using PandasAI Semantic DataFrames (pai.DataFrame) backed by Polars DataFrames.
-15. Return STRICT JSON with keys: manipulator_prompt, visualizer_prompt, analyzer_prompt, compiler_instruction.
-16. Each value must be a single-line string. No extra keys, no prose, no markdown/code fences."""
+15. ABSOLUTE RULE for all agent prompts you emit: NEVER write or execute SQL, NEVER call execute_sql_query, NEVER import DB libraries. Use DataFrame (Polars/Pandas) operations only.
+16. Return STRICT JSON with keys: manipulator_prompt, visualizer_prompt, analyzer_prompt, compiler_instruction.
+17. Each value must be a single-line string. No extra keys, no prose, no markdown/code fences.
+"""
 
 data_manipulator_system_configuration = """1. Honor precedence: direct user prompt > USER specific configuration > DOMAIN specific configuration > SYSTEM defaults.
 2. Enforce data hygiene before analysis.
@@ -859,7 +863,9 @@ data_manipulator_system_configuration = """1. Honor precedence: direct user prom
 8. Include the percentage version of appropriate raw value columns (share-of-total where relevant).
 9. End by returning only:
     result = {"type":"dataframe","value": <THE_FINAL_DATAFRAME>}
-10. Honor any user-level and domain-level instructions injected below."""
+10. Honor any user-level and domain-level instructions injected below.
+11. ABSOLUTE RULE: Do NOT write or execute SQL and do NOT call execute_sql_query; use only Polars/Pandas DataFrame operations on the provided pai.DataFrame objects.
+"""
 
 data_visualizer_system_configuration = """1. Honor precedence: direct user prompt > USER specific configuration > DOMAIN specific configuration > SYSTEM defaults.
 2. Produce exactly ONE interactive visualization (a Plotly diagram or a table) per request.
@@ -874,13 +880,17 @@ data_visualizer_system_configuration = """1. Honor precedence: direct user promp
 11. Ensure file_path is a plain Python string; do not print/return anything else.
 12. The last line of code MUST be exactly:
     result = {"type": "string", "value": file_path}
-13. DO NOT rely on pandas-specific styling; prefer Plotly Table when a table is needed."""
+13. DO NOT rely on pandas-specific styling; prefer Plotly Table when a table is needed.
+14. ABSOLUTE RULE: Do NOT write or execute SQL, do NOT call execute_sql_query, do NOT use any DB connectors; only use the already-processed DataFrame in Python.
+"""
 
 data_analyzer_system_configuration = """1. Honor precedence: direct user prompt > USER configuration specific > DOMAIN specific configuration > SYSTEM defaults.
 2. Write like you’re speaking to a person; be concise and insight-driven.
 3. Quantify where possible (deltas, % contributions, time windows); reference exact columns/filters used.
 4. Return only:
-    result = {"type":"string","value":"<3–6 crisp bullets or 2 short paragraphs of insights>"}"""
+    result = {"type":"string","value":"<3–6 crisp bullets or 2 short paragraphs of insights>"}
+5. ABSOLUTE RULE: No SQL. Do not call execute_sql_query. Use only in-memory DataFrame operations already computed by the manipulator.
+"""
 
 response_compiler_system_configuration = """1. Honor precedence: direct user prompt > USER specific configuration > DOMAIN specific configuration > SYSTEM defaults.
 2. Brevity: ≤180 words; bullets preferred; no code blocks, no JSON, no screenshots.
@@ -895,7 +905,7 @@ response_compiler_system_configuration = """1. Honor precedence: direct user pro
 11. Show both absolute and % change where sensible (e.g., “+$120k (+8.4%)”).
 12. Round smartly (money to nearest K unless < $10k; rates 1–2 decimals).
 13. If any agent fails or data is incomplete, still produce the best insight; mark gaps in Caveats and adjust Confidence.
-14. If the user asks “how much/which/why,” the first sentence must provide the number/entity/reason.
+14. The user asks “how much/which/why,” the first sentence must provide the number/entity/reason.
 15. Exact compiler_instruction template the orchestrator should emit (single line; steps separated by ';'):
 16. Read the user prompt, data_info, and all three agent responses;
 17. Compute the direct answer including the main number and compare period;
@@ -921,7 +931,8 @@ response_compiler_system_configuration = """1. Honor precedence: direct user pro
 37. `data_analyzer_response` is a PandasAI StringResponse.
 38. Your goal in `compiler_instruction` is to force brevity, decisions, and insights.
 39. Mention the dataset name involved of each statement.
-40. SHOULD BE STRICTLY ONLY respond in HTML format."""
+40. SHOULD BE STRICTLY ONLY respond in HTML format.
+"""
 
 # ---- Defaults to avoid NameError and allow future overrides
 user_specific_configuration = "{}"
@@ -2291,6 +2302,16 @@ def query():
         analyzer_prompt = spec.get("analyzer_prompt", "")
         compiler_instruction = spec.get("compiler_instruction", "")
 
+        # ✅ FIX (NO-SQL guardrail): append a hard rule to every agent prompt to prevent any SQL usage.
+        SQL_GUARD = (
+            "Hard rule: NEVER write or execute SQL and NEVER call execute_sql_query. "
+            "Operate strictly on the provided pai.DataFrame objects with Polars/Pandas "
+            "(use groupby/agg/sort/filter/join as needed)."
+        )
+        manipulator_prompt = f"{(manipulator_prompt or '').strip()}\n\n{SQL_GUARD}".strip()
+        visualizer_prompt = f"{(visualizer_prompt or '').strip()}\n\n{SQL_GUARD}".strip()
+        analyzer_prompt = f"{(analyzer_prompt or '').strip()}\n\n{SQL_GUARD}".strip()
+
         # ✅ a0.0.8: Explainer
         need_plan_explainer = True  # keep enabled
         plan_explainer_model = agent_plan.get("plan_explainer_model") or chosen_model_id
@@ -2353,6 +2374,8 @@ def query():
         except TypeError:
             llm = LiteLLM(model=chosen_model_id, api_key=chosen_api_key)
         pai.config.set({"llm": llm})
+        # (Optional future) If PandasAI introduces a flag to disable SQL explicitly, set it here.
+        # pai.config.set({"enable_sql": False})  # left commented for compatibility across versions.
 
         # Manipulator (Polars-first via pai.DataFrame wrappers)
         _cancel_if_needed(session_id)

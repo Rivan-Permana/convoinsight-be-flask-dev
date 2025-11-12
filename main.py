@@ -117,6 +117,53 @@ if SUPABASE_URL and SUPABASE_KEY:
 app = Flask(__name__)
 CORS(app, origins=[o.strip() for o in CORS_ORIGINS if o.strip()], supports_credentials=True)
 
+# ===== CORS HARDENING (Cloud Run + preflight) =====
+# Ensures Access-Control-Allow-Origin headers are present even on errors and for OPTIONS preflights.
+import fnmatch
+
+_ALLOWED_ORIGINS = [o.strip().rstrip("/") for o in CORS_ORIGINS if o.strip()]
+
+def _origin_allowed(origin: Optional[str]) -> bool:
+    if not origin:
+        return False
+    ori = origin.strip().rstrip("/")
+    for pat in _ALLOWED_ORIGINS:
+        if pat == "*":
+            return True
+        if "*" in pat or "?" in pat:
+            if fnmatch.fnmatch(ori, pat.rstrip("/")):
+                return True
+        if ori == pat:
+            return True
+    return False
+
+def _add_cors_headers(resp):
+    origin = request.headers.get("Origin")
+    if _origin_allowed(origin):
+        # Reflect the requesting Origin when allowed (required for credentials)
+        resp.headers["Access-Control-Allow-Origin"] = origin
+        resp.headers["Vary"] = "Origin"
+        resp.headers["Access-Control-Allow-Credentials"] = "true"
+        resp.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,PATCH,DELETE,OPTIONS"
+        # Allow common headers; extend if FE needs more
+        resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Requested-With"
+        # Optional: improve perf for repeated preflights
+        resp.headers["Access-Control-Max-Age"] = "86400"
+    return resp
+
+@app.before_request
+def _handle_preflight():
+    # Short-circuit CORS preflight requests with proper headers
+    if request.method == "OPTIONS":
+        resp = app.make_response(("", 204))
+        return _add_cors_headers(resp)
+
+@app.after_request
+def _ensure_cors(resp):
+    # Add CORS headers to all responses (including errors)
+    return _add_cors_headers(resp)
+# ===== End CORS hardening =====
+
 # --- Init GCP clients ---
 _storage_client = storage.Client(project=GCP_PROJECT_ID) if GCP_PROJECT_ID else storage.Client()
 _firestore_client = firestore.Client(project=GCP_PROJECT_ID) if GCP_PROJECT_ID else firestore.Client()

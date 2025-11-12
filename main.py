@@ -70,7 +70,7 @@ except Exception:
     _REPORTLAB_AVAILABLE = False
 
 # -------- Config --------
-# (GEMINI_API_KEY tidak dipakai sebagai fallback; semua key datang dari FE/Firestore)
+# (GEMINI_API_KEY tidak dipakai sebagai fallback; semua key datang dari BE/Firestore)
 GCP_PROJECT_ID = os.getenv("GCP_PROJECT_ID")
 
 FERNET_KEY = os.getenv("FERNET_KEY")
@@ -568,10 +568,45 @@ def _polars_info_string(df: pl.DataFrame) -> str:
     return "\n".join(lines)
 
 def _to_polars_dataframe(obj):
+    """
+    Robustly coerce various dataframe-like objects (polars, pandas, PandasAI wrappers,
+    and {"type":"dataframe","value": ...}) into a Polars DataFrame.
+    Returns None if conversion is impossible.
+    """
+    # Already Polars
     if isinstance(obj, pl.DataFrame):
         return _normalize_columns_to_str(obj)
+
+    # Pandas DataFrame
     try:
-        df = pl.from_dataframe(obj)
+        if isinstance(obj, pd.DataFrame):
+            return _normalize_columns_to_str(pl.from_pandas(obj))
+    except Exception:
+        pass
+
+    # Dict payload from agents
+    if isinstance(obj, dict):
+        try:
+            if obj.get("type") == "dataframe" and "value" in obj:
+                return _to_polars_dataframe(obj.get("value"))
+        except Exception:
+            pass
+
+    # PandasAI DataFrame wrapper or any object exposing to_pandas()/dataframe
+    try:
+        if hasattr(obj, "to_pandas") and callable(getattr(obj, "to_pandas")):
+            pdf = obj.to_pandas()
+            return _normalize_columns_to_str(pl.from_pandas(pdf))
+        if hasattr(obj, "dataframe"):
+            base = getattr(obj, "dataframe")
+            if isinstance(base, pd.DataFrame):
+                return _normalize_columns_to_str(pl.from_pandas(base))
+    except Exception:
+        pass
+
+    # Last-ditch: let Polars try to read from pandas-like
+    try:
+        df = pl.from_pandas(obj)  # will raise for non-pandas objects
         return _normalize_columns_to_str(df)
     except Exception:
         return None
@@ -1093,11 +1128,17 @@ def _run_router(user_prompt: str, data_info, data_describe, state: dict, *, llm_
     try:
         plan = _safe_json_loads(router_content)
     except Exception:
+        # ---------- Heuristic fallback (hardened) ----------
         p = user_prompt.lower()
         need_visual = bool(re.search(r"\b(chart|plot|graph|visual|bar|line|table)\b", p))
         optimize_terms = bool(re.search(r"\b(allocate|allocation|optimal|optimi[sz]e|plan|planning|min(?:imum)? number|minimum number|close (?:the )?gap|gap closure|takers?)\b", p))
         need_analyze = bool(re.search(r"\b(why|driver|explain|root cause|trend|surprise|reason)\b", p)) or optimize_terms
-        follow_up = bool(re.search(r"\b(what about|and|how about|ok but|also)\b", p)) or len(p.split()) <= 8
+
+        # ✅ FIX: treat short prompts as "follow-up" only if we actually have a previous processed output in state
+        has_prev = bool((state.get("last_visual_kind") or "").strip() or (state.get("last_analyzer_text") or "").strip())
+        is_short = len(p.split()) <= 8
+        follow_up = (bool(re.search(r"\b(what about|and|how about|ok but|also)\b", p)) or is_short) and has_prev
+
         need_manip = not follow_up
         visual_hint = "bar" if "bar" in p else ("line" if "line" in p else ("table" if ("table" in p or optimize_terms) else "auto"))
         plan = {
@@ -1222,7 +1263,7 @@ def serve_chart(relpath):
 # =========================
 # Provider key management
 # =========================
-def _plausible_api_key(api_key: str, *, min_len: int = 20, max_len: int = 512) -> bool:
+def _plausible_api_key(api_key: str, *, min_len: int = 20, max_len: 512) -> bool:
     """Generic, non-network validation to reject obviously bogus inputs."""
     if not isinstance(api_key, str):
         return False
@@ -1744,14 +1785,15 @@ def datasets_read(domain, filename):
             df = read_gcs_tabular_to_pl_df(blob_name)
         else:
             local_path = os.path.join(DATASETS_ROOT, slug(domain), filename)
-            if not os.path.exists(local_path):
-                return jsonify({"detail": "File not found"}), 404
-            with open(local_path, "rb") as f:
-                data = f.read()
-            if _is_excel_filename(filename):
-                df = _read_excel_bytes_to_polars(data)
+            if os.path.exists(local_path):
+                with open(local_path, "rb") as f:
+                    data = f.read()
+                if _is_excel_filename(filename):
+                    df = _read_excel_bytes_to_polars(data)
+                else:
+                    df = _read_csv_bytes_to_polars(data)
             else:
-                df = _read_csv_bytes_to_polars(data)
+                return jsonify({"detail": "File not found"}), 404
         if n > 0:
             df = df.head(n)
         if as_fmt == "csv":
@@ -2217,7 +2259,7 @@ def query():
         include_insight = body.get("includeInsight", True)
         need_analyze = include_insight and bool(agent_plan.get("need_analyzer", True))
 
-        # compiler model: hormati plan, tapi kalau "SAME_AS_SELECTED"/"AUTO"/"DEFAULT", pakai chosen_model_id
+        # compiler model
         compiler_model = agent_plan.get("compiler_model") or chosen_model_id
         if isinstance(compiler_model, str) and compiler_model.strip().upper() in {"SAME_AS_SELECTED", "AUTO", "DEFAULT"}:
             compiler_model = chosen_model_id
@@ -2249,7 +2291,7 @@ def query():
         analyzer_prompt = spec.get("analyzer_prompt", "")
         compiler_instruction = spec.get("compiler_instruction", "")
 
-        # ✅ a0.0.8: Explainer (thinking) connected to router
+        # ✅ a0.0.8: Explainer
         need_plan_explainer = True  # keep enabled
         plan_explainer_model = agent_plan.get("plan_explainer_model") or chosen_model_id
 
@@ -2300,7 +2342,6 @@ def query():
             plan_explainer_elapsed_time = plan_explainer_end_time - plan_explainer_start_time
             print(f"Elapsed time: {plan_explainer_elapsed_time:.2f} seconds")
 
-            # optionally simpan ke state agar bisa dikirim ke FE
             state["last_plan_explainer"] = plan_explainer_content
             _save_conv_state(session_id, state)
         else:
@@ -2328,6 +2369,13 @@ def query():
             dm_resp = pai.chat(manipulator_prompt, *semantic_dfs)
             val = getattr(dm_resp, "value", dm_resp)
             df_processed = _to_polars_dataframe(val)
+
+            # ✅ Robust fallback: if the manipulator didn't yield a dataframe, use the first available df
+            if df_processed is None:
+                for _k, _d in dfs.items():
+                    df_processed = _to_polars_dataframe(_d)
+                    if df_processed is not None:
+                        break
 
         # Visualizer
         _cancel_if_needed(session_id)

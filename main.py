@@ -78,6 +78,18 @@ try:
 except Exception:
     _REPORTLAB_AVAILABLE = False
 
+try:
+    import pdfplumber
+    _PDF_EXTRACT_AVAILABLE = True
+except Exception:
+    _PDF_EXTRACT_AVAILABLE = False
+
+try:
+    import docx
+    _DOCX_EXTRACT_AVAILABLE = True
+except Exception:
+    _DOCX_EXTRACT_AVAILABLE = False
+
 # -------- Config --------
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")  # no longer used as a fallback in flow
 GCP_PROJECT_ID = os.getenv("GCP_PROJECT_ID")
@@ -656,11 +668,36 @@ def _read_csv_bytes_to_polars(
     except Exception as e:
         raise last_err or e
 
+def _extract_pdf_text(data: bytes, max_chars: int = 20000) -> str:
+    if not _PDF_EXTRACT_AVAILABLE:
+        return ""
+    with pdfplumber.open(io.BytesIO(data)) as pdf:
+        texts = [(page.extract_text() or "") for page in pdf.pages]
+    text = "\n\n".join(texts)
+    return text[:max_chars]
+
+def _extract_docx_text(data: bytes, max_chars: int = 20000) -> str:
+    if not _DOCX_EXTRACT_AVAILABLE:
+        return ""
+    doc = docx.Document(io.BytesIO(data))
+    text = "\n".join(p.text for p in doc.paragraphs)
+    return text[:max_chars]
 
 # ✅ a0.0.8: Excel readers (beside multi-separator CSV)
 def _is_excel_filename(name: str) -> bool:
     n = name.lower()
     return n.endswith(".xlsx") or n.endswith(".xls")
+
+TABULAR_EXTS = (".csv", ".xlsx", ".xls")
+ATTACHMENT_EXTS = (".pdf", ".docx", ".doc")
+
+
+def _is_tabular_filename(name: str) -> bool:
+    return os.path.splitext(name)[1].lower() in TABULAR_EXTS
+
+
+def _is_attachment_filename(name: str) -> bool:
+    return os.path.splitext(name)[1].lower() in ATTACHMENT_EXTS
 
 
 def _read_excel_bytes_to_polars(data: bytes, sheet_name: Optional[str] = None) -> pl.DataFrame:
@@ -689,6 +726,12 @@ def upload_dataset_file(file_storage, *, domain: str) -> dict:
             if ext == ".xlsx"
             else "application/vnd.ms-excel"
         )
+    elif ext == ".pdf":
+        content_type = "application/pdf"
+    elif ext == ".docx":
+        content_type = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    elif ext == ".doc":
+        content_type = "application/msword"
     else:
         content_type = "text/csv"
 
@@ -739,7 +782,7 @@ def list_gcs_tabulars(domain: str) -> List[storage.Blob]:
     out = []
     for b in blobs:
         n = b.name.lower()
-        if n.endswith(".csv") or n.endswith(".xlsx") or n.endswith(".xls"):
+        if n.endswith(".csv") or n.endswith(".xlsx") or n.endswith(".xls") or n.endswith(".pdf") or n.endswith(".docx") or n.endswith(".doc"):
             out.append(b)
     return out
 
@@ -1136,6 +1179,47 @@ def _load_domain_dataframes(
                         pass
 
     return dfs, data_info, data_describe
+
+def _load_domain_attachments_text(domain: str, dataset_filters=None, max_chars=8000) -> dict:
+    texts = {}
+
+    # --- GCS ---
+    if GCS_BUCKET:
+        for b in list_gcs_tabulars(domain):  # list_gcs_tabulars sekarang juga return pdf/docx/doc
+            fname = os.path.basename(b.name)
+            if dataset_filters and fname not in dataset_filters:
+                continue
+            ext = os.path.splitext(fname)[1].lower()
+            if ext not in (".pdf", ".docx", ".doc"):
+                continue
+            data = b.download_as_bytes()
+            if ext == ".pdf":
+                t = _extract_pdf_text(data)
+            else:
+                t = _extract_docx_text(data)
+            if t:
+                texts[fname] = t[:max_chars]
+
+    # --- local fallback ---
+    local_dir = os.path.join(DATASETS_ROOT, slug(domain))
+    if os.path.isdir(local_dir):
+        for name in sorted(os.listdir(local_dir)):
+            ext = os.path.splitext(name)[1].lower()
+            if ext not in (".pdf", ".docx", ".doc"):
+                continue
+            if dataset_filters and name not in dataset_filters:
+                continue
+            path = os.path.join(local_dir, name)
+            with open(path, "rb") as f:
+                data = f.read()
+            if ext == ".pdf":
+                t = _extract_pdf_text(data)
+            else:
+                t = _extract_docx_text(data)
+            if t:
+                texts[name] = t[:max_chars]
+
+    return texts
 
 
 # =========================
@@ -1646,7 +1730,7 @@ def list_domains():
         for d in sorted(os.listdir(DATASETS_ROOT)):
             p = os.path.join(DATASETS_ROOT, d)
             if os.path.isdir(p):
-                csvs = [f for f in sorted(os.listdir(p)) if f.lower().endswith((".csv",".xlsx",".xls"))]  # ✅ a0.0.8
+                csvs = [f for f in sorted(os.listdir(p)) if f.lower().endswith((".csv",".xlsx",".xls",".pdf",".docx",".doc"))]  # ✅ a0.0.8
                 if csvs:
                     result[d] = csvs
         # gcs merge
@@ -1737,6 +1821,12 @@ def datasets_list():
                             ctype = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                         elif fname.endswith(".xls"):
                             ctype = "application/vnd.ms-excel"
+                        elif fl.endswith(".pdf"):
+                            ctype = "application/pdf"
+                        elif fl.endswith(".docx"):
+                            ctype = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                        elif fl.endswith(".doc"):
+                            ctype = "application/msword"
                         it["signed_url"] = _signed_url(
                             blob, it["filename"], ctype, GCS_SIGNED_URL_TTL_SECONDS
                         )
@@ -1752,8 +1842,13 @@ def datasets_list():
                 for b in list_gcs_tabulars(domain):  # ✅ a0.0.8
                     fname = os.path.basename(b.name)
                     key = (slug(domain), fname)
+                    ext = os.path.splitext(fname)[1].lower()
+
+                    if ext not in (".csv", ".xlsx", ".xls", ".pdf", ".docx", ".doc"):
+                        continue
                     if key in known:
                         continue
+
                     rec = {
                         "domain": slug(domain),
                         "filename": fname,
@@ -1763,12 +1858,19 @@ def datasets_list():
                     }
                     if add_signed:
                         try:
-                            ctype = "text/csv"
                             fl = fname.lower()
-                            if fl.endswith(".xlsx"):
+                            if fl.endswith(".pdf"):
+                                ctype = "application/pdf"
+                            elif fl.endswith(".docx"):
+                                ctype = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                            elif fl.endswith(".doc"):
+                                ctype = "application/msword"
+                            elif fl.endswith(".xlsx"):
                                 ctype = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                             elif fl.endswith(".xls"):
                                 ctype = "application/vnd.ms-excel"
+                            else:
+                                ctype = "text/csv"
                             rec["signed_url"] = _signed_url(
                                 b, fname, ctype, GCS_SIGNED_URL_TTL_SECONDS
                             )
@@ -1784,7 +1886,7 @@ def datasets_list():
             if os.path.isdir(domain_dir):
                 known = {(i.get("domain"), i.get("filename")) for i in items}
                 for name in sorted(os.listdir(domain_dir)):
-                    if name.lower().endswith((".csv",".xlsx",".xls")) and (slug(domain), name) not in known:
+                    if name.lower().endswith((".csv",".xlsx",".xls",".pdf",".docx",".doc")) and (slug(domain), name) not in known:
                         path = os.path.join(domain_dir, name)
                         size = os.path.getsize(path)
                         items.append(
@@ -1836,6 +1938,12 @@ def datasets_list_all(domain):
                             ctype = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                         elif fname.endswith(".xls"):
                             ctype = "application/vnd.ms-excel"
+                        elif fl.endswith(".pfd"):
+                            ctype = "application/pdf"
+                        elif fl.endswith(".docx"):
+                            ctype = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                        elif fl.endswith(".doc"):
+                            ctype = "application/msword"
                         it["signed_url"] = _signed_url(
                             blob, it["filename"], ctype, GCS_SIGNED_URL_TTL_SECONDS
                         )
@@ -1851,8 +1959,13 @@ def datasets_list_all(domain):
                 for b in list_gcs_tabulars(domain):  # ✅ a0.0.8
                     fname = os.path.basename(b.name)
                     key = (slug(domain), fname)
+                    ext = os.path.splitext(fname)[1].lower()
+
+                    if ext not in (".csv", ".xlsx", ".xls", ".pdf", ".docx", ".doc"):
+                        continue
                     if key in known:
                         continue
+
                     rec = {
                         "domain": slug(domain),
                         "filename": fname,
@@ -1863,11 +1976,19 @@ def datasets_list_all(domain):
                     if add_signed:
                         try:
                             fl = fname.lower()
-                            ctype = "text/csv"
-                            if fl.endswith(".xlsx"):
+                            if fl.endswith(".pdf"):
+                                ctype = "application/pdf"
+                            elif fl.endswith(".docx"):
+                                ctype = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                            elif fl.endswith(".doc"):
+                                ctype = "application/msword"
+                            elif fl.endswith(".xlsx"):
                                 ctype = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                             elif fl.endswith(".xls"):
                                 ctype = "application/vnd.ms-excel"
+                            else:
+                                ctype = "text/csv"
+
                             rec["signed_url"] = _signed_url(
                                 b, fname, ctype, GCS_SIGNED_URL_TTL_SECONDS
                             )
@@ -1882,7 +2003,7 @@ def datasets_list_all(domain):
         if os.path.isdir(domain_dir):
             known = {(i.get("domain"), i.get("filename")) for i in items}
             for name in sorted(os.listdir(domain_dir)):
-                if name.lower().endswith((".csv",".xlsx",".xls")) and (slug(domain), name) not in known:
+                if name.lower().endswith((".csv",".xlsx",".xls",".pdf",".docx",".doc")) and (slug(domain), name) not in known:
                     path = os.path.join(domain_dir, name)
                     size = os.path.getsize(path)
                     items.append(
@@ -1916,6 +2037,9 @@ def datasets_delete_all(domain):
                 blobs = list_gcs_tabulars(safe_domain)  # ✅ a0.0.8
                 for b in blobs:
                     fname = os.path.basename(b.name)
+                    ext = os.path.splitext(fname)[1].lower()
+                    if ext not in (".csv", ".xlsx", ".xls", ".pdf", ".docx", ".doc"):
+                        continue
                     try:
                         b.delete()
                         deleted.append(fname)
@@ -1932,7 +2056,7 @@ def datasets_delete_all(domain):
         local_dir = os.path.join(DATASETS_ROOT, safe_domain)
         if os.path.isdir(local_dir):
             for name in sorted(os.listdir(local_dir)):
-                if not name.lower().endswith((".csv",".xlsx",".xls")):
+                if not name.lower().endswith((".csv",".xlsx",".xls",".pdf",".docx",".doc")):
                     continue
                 path = os.path.join(local_dir, name)
                 try:
@@ -1951,6 +2075,37 @@ def datasets_read(domain, filename):
     try:
         n = int(request.args.get("n", "50"))
         as_fmt = request.args.get("as", "json")
+        ext = os.path.splitext(filename)[1].lower()
+
+        if ext in (".pdf", ".docx", ".doc"):
+            if GCS_BUCKET:
+                blob_name = f"{GCS_DATASETS_PREFIX}/{slug(domain)}/{filename}"
+                bucket = _gcs_bucket()
+                blob = bucket.blob(blob_name)
+                if not blob.exists():
+                    return jsonify({"detail": "File not found"}), 404
+                data = blob.download_as_bytes()
+            else:
+                local_path = os.path.join(DATASETS_ROOT, slug(domain), filename)
+                if not os.path.exists(local_path):
+                    return jsonify({"detail": "File not found"}), 404
+                with open(local_path, "rb") as f:
+                    data = f.read()
+
+            if ext == ".pdf":
+                mime = "application/pdf"
+            elif ext == ".docx":
+                mime = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            else:  
+                mime = "application/msword"
+
+            return send_file(
+                io.BytesIO(data),
+                mimetype=mime,
+                as_attachment=False,      
+                download_name=filename,
+            )
+        
         if GCS_BUCKET:
             blob_name = f"{GCS_DATASETS_PREFIX}/{slug(domain)}/{filename}"
             df = read_gcs_tabular_to_pl_df(blob_name)  # ✅ a0.0.8
@@ -1970,6 +2125,7 @@ def datasets_read(domain, filename):
             out = io.StringIO()
             df.write_csv(out)
             return out.getvalue(), 200, {"Content-Type": "text/csv; charset=utf-8"}
+        
         return jsonify({"records": df.to_dicts()})
     except Exception as e:
         return jsonify({"detail": str(e)}), 500
@@ -2011,10 +2167,20 @@ def compat_upload_datasets(domain: str):
             uploads.append(upload_dataset_file(f, domain=domain))
 
         if not uploads and request.data:
+            content_type = (request.headers.get("Content-Type") or "").lower()
+            if "pdf" in content_type:
+                default_ext = ".pdf"
+            elif "wordprocessingml" in content_type:
+                default_ext = ".docx"
+            elif "msword" in content_type:
+                default_ext = ".doc"
+            else:
+                default_ext = ".csv"
+
             fname = (
                 request.args.get("filename")
                 or request.headers.get("X-Filename")
-                or f"upload_{int(time.time())}.csv"
+                or f"upload_{int(time.time())}{default_ext}"
             )
             uploads.append(_save_bytes_local(domain, fname, request.data))
 
@@ -2045,6 +2211,12 @@ def compat_list_domain_datasets(domain: str):
                             ctype = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                         elif fname.endswith(".xls"):
                             ctype = "application/vnd.ms-excel"
+                        elif fname.endswith(".pdf"):
+                            ctype = "application/pdf"
+                        elif fname.endswith(".docx"):
+                            ctype = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                        elif fname.endswith(".doc"):
+                            ctype = "application/msword"
                         it["signed_url"] = _signed_url(
                             blob, it["filename"], ctype, GCS_SIGNED_URL_TTL_SECONDS
                         )
@@ -2059,7 +2231,7 @@ def compat_list_domain_datasets(domain: str):
             if os.path.isdir(domain_dir):
                 known_names = {i.get("filename") for i in items}
                 for name in sorted(os.listdir(domain_dir)):
-                    if name.lower().endswith((".csv",".xlsx",".xls")) and name not in known_names:
+                    if name.lower().endswith((".csv",".xlsx",".xls",".pdf",".docx",".doc")) and name not in known_names:
                         path = os.path.join(domain_dir, name)
                         size = os.path.getsize(path)
                         items.append(
@@ -2250,6 +2422,10 @@ def suggest():
             dataset_filters = None
 
         dfs, data_info, data_describe = _load_domain_dataframes(domain, dataset_filters)
+        attachments_text = _load_domain_attachments_text(domain, dataset_filters)
+        attachments_summary = {
+            name: txt[:2000] for name, txt in attachments_text.items()
+        }
 
         r = completion(
             model=chosen_model_id,
@@ -2270,7 +2446,9 @@ def suggest():
                     df.info of each dfs key(file name)-value pair:
                     {data_info}.
                     df.describe of each dfs key(file name)-value pair:
-                    {data_describe}.""",
+                    {data_describe}.
+                    Attachment text (truncated): {json.dumps(attachments_summary, ensure_ascii=False)}
+                    """
                 },
             ],
             seed=1,
@@ -2382,6 +2560,7 @@ def query():
 
         # load data (Polars)
         dfs, data_info, data_describe = _load_domain_dataframes(domain, dataset_filters)
+        attachments_text = _load_domain_attachments_text(domain, dataset_filters)
 
         # ✅ a0.0.8: if /query.pg provided, merge those PG sources too
         if isinstance(body.get("pg"), dict) and (body.get("userId")):
@@ -2407,13 +2586,87 @@ def query():
                     except Exception:
                         pass
 
+        if not dfs and attachments_text:
+            # gabungkan semua teks lampiran
+            combined_reports = "\n\n".join(
+                f"=== {name} ===\n{text}"
+                for name, text in attachments_text.items()
+            )
+
+            # Simpan history dulu
+            _append_history(state, "assistant", {
+                "mode": "text_only",
+                "attachments": list(attachments_text.keys()),
+            })
+            _save_conv_state(session_id, state)
+
+            # Panggil LLM sekali untuk baca laporan + jawab prompt
+            final_response = completion(
+                model=chosen_model_id,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a business analyst. Read the following report text "
+                            "and answer the user question with concise, insight-focused HTML. "
+                            "Do NOT invent numbers that are not in the report. "
+                            "If the user doesn't ask anything specific, give a brief summary, "
+                            "key positives/negatives, and 2–3 recommended actions."
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": (
+                            f"User Prompt:\n{prompt}\n\n"
+                            f"Report Text (one or more PDF/DOCX files from domain '{domain}'):\n"
+                            f"{combined_reports[:12000]}"  
+                        ),
+                    },
+                ],
+                seed=1,
+                stream=False,
+                verbosity="medium",
+                drop_params=True,
+                reasoning_effort="high",
+                api_key=chosen_api_key,
+            )
+
+            final_content = get_content(final_response)
+
+            # Simpan ringkasan ke history
+            _append_history(state, "assistant", {
+                "mode": "text_only",
+                "final_preview": final_content[:600],
+                "attachments": list(attachments_text.keys()),
+            })
+            _save_conv_state(session_id, state)
+
+            exec_time = time.time() - t0
+            return jsonify({
+                "session_id": session_id,
+                "response": final_content,
+                "chart_url": None,
+                "diagram_kind": "",
+                "diagram_gs_uri": None,
+                "diagram_signed_url": None,
+                "diagram_public_url": "",
+                "execution_time": exec_time,
+                "need_visualizer": False,
+                "need_analyzer": True,   # ini 'analyzer' murni di kepala LLM
+                "need_manipulator": False,
+                "llm_model_used": chosen_model_id,
+                "provider": provider_in,
+                "plan_explainer": state.get("last_plan_explainer", ""),
+                "attachments_used": list(attachments_text.keys()),
+            })
+
         if not dfs:
             if dataset_filters:
                 available = []
                 domain_dir = os.path.join(DATASETS_ROOT, domain)
                 if os.path.isdir(domain_dir):
                     available.extend(
-                        sorted([f for f in os.listdir(domain_dir) if f.lower().endswith((".csv",".xlsx",".xls"))])
+                        sorted([f for f in os.listdir(domain_dir) if f.lower().endswith((".csv",".xlsx",".xls",".pdf",".docx",".doc"))])
                     )
                 try:
                     if GCS_BUCKET:
@@ -2422,7 +2675,7 @@ def query():
                                 {
                                     os.path.basename(b.name)
                                     for b in list_gcs_tabulars(domain)
-                                    if b.name.lower().endswith((".csv",".xlsx",".xls"))
+                                    if b.name.lower().endswith((".csv",".xlsx",".xls",".pdf",".docx",".doc"))
                                 }
                             )
                         )
@@ -2453,7 +2706,7 @@ def query():
         # Router
         agent_plan = _run_router(
             prompt,
-            data_info,
+            {**data_info, "__attachments__": list(attachments_text.keys())},
             data_describe,
             state,
             llm_model=chosen_model_id,
@@ -2480,7 +2733,7 @@ def query():
             prompt,
             domain,
             data_info,
-            data_describe,
+            {**data_describe, "__attachments_text__": attachments_text},
             visual_hint,
             context_hint,
             llm_model=chosen_model_id,
@@ -2708,6 +2961,7 @@ def query():
                 "llm_model_used": chosen_model_id,
                 "provider": provider_in,
                 "plan_explainer": state.get("last_plan_explainer", ""),
+                "attachments_used": list(attachments_text.keys()),
             }
         )
     except RuntimeError as rexc:

@@ -37,3 +37,5 @@ connectorx>=0.3.3
 # atau via ADBC:
 adbc-driver-postgresql>=1.0.0
 supabase>=2,<3
+pdfplumber==0.11.8
+python-docx==1.2.0

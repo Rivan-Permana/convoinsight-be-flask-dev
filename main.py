@@ -2091,6 +2091,18 @@ def datasets_read(domain, filename):
                     return jsonify({"detail": "File not found"}), 404
                 with open(local_path, "rb") as f:
                     data = f.read()
+            
+            if as_fmt == "text":
+                if ext == ".pdf":
+                    text = _extract_pdf_text(data, max_chars=20000)
+                else:
+                    text = _extract_docx_text(data, max_chars=20000)
+
+                return jsonify({
+                    "domain": slug(domain),
+                    "filename": filename,
+                    "text": text or "",
+                })
 
             if ext == ".pdf":
                 mime = "application/pdf"

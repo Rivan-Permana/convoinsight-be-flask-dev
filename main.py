@@ -14,10 +14,14 @@ import polars as pl
 import pandasai as pai
 from pandasai_litellm.litellm import LiteLLM
 from litellm import completion, model_list as LITELLM_MODEL_LIST
-from pandasai.core.response.dataframe import DataFrameResponse  # noqa: F401
+from pandasai import (
+    SmartDataframe,
+    SmartDatalake,
+)  # kept import for compatibility, not used in new path
+from pandasai.core.response.dataframe import DataFrameResponse
 
 # --- (pandas kept import for minimal surface compatibility, not used in pipeline)
-import pandas as pd  # retained to avoid non-pipeline breakages elsewhere
+import pandas as pd  # not used for pipeline; retained to avoid non-pipeline breakages elsewhere
 import litellm
 from litellm import get_valid_models
 
@@ -47,13 +51,17 @@ from google.oauth2 import service_account
 import requests
 from cryptography.fernet import Fernet
 
-# --- Supabase Storage (untuk simpan chart) ---
-from supabase import create_client  # type: ignore
-from storage3.types import FileOptions  # type: ignore
+from supabase import create_client, Client
+from storage3.types import FileOptions
+
+from datetime import datetime, timedelta
+from flask import request, jsonify
+import threading, time
 
 # -------- optional: load .env --------
 try:
     from dotenv import load_dotenv
+
     load_dotenv()
 except Exception:
     pass
@@ -65,6 +73,7 @@ try:
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
     from reportlab.lib.enums import TA_LEFT
     from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+
     _REPORTLAB_AVAILABLE = True
 except Exception:
     _REPORTLAB_AVAILABLE = False
@@ -82,7 +91,7 @@ except Exception:
     _DOCX_EXTRACT_AVAILABLE = False
 
 # -------- Config --------
-# (GEMINI_API_KEY tidak dipakai sebagai fallback; semua key datang dari BE/Firestore)
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")  # no longer used as a fallback in flow
 GCP_PROJECT_ID = os.getenv("GCP_PROJECT_ID")
 
 FERNET_KEY = os.getenv("FERNET_KEY")
@@ -103,7 +112,9 @@ GCS_BUCKET = os.getenv("GCS_BUCKET")
 GCS_DATASETS_PREFIX = os.getenv("GCS_DATASETS_PREFIX", "datasets")
 GCS_DIAGRAMS_PREFIX = os.getenv("GCS_DIAGRAMS_PREFIX", "diagrams")
 GCS_SIGNED_URL_TTL_SECONDS = int(os.getenv("GCS_SIGNED_URL_TTL_SECONDS", "604800"))  # 7 days
-GOOGLE_SERVICE_ACCOUNT_EMAIL = os.getenv("GOOGLE_SERVICE_ACCOUNT_EMAIL")  # optional
+GOOGLE_SERVICE_ACCOUNT_EMAIL = os.getenv(
+    "GOOGLE_SERVICE_ACCOUNT_EMAIL"
+)  # optional but useful on Cloud Run
 
 # 🔧 FIX: pakai env var koleksi yang berbeda-beda (tidak ketuker)
 FIRESTORE_COLLECTION_SESSIONS = os.getenv("FIRESTORE_SESSIONS_COLLECTION", "convo_sessions")
@@ -112,7 +123,7 @@ FIRESTORE_COLLECTION_PROVIDERS = os.getenv("FIRESTORE_PROVIDERS_COLLECTION", "co
 # NEW: collection for PG/Supabase connections
 FIRESTORE_COLLECTION_PG = os.getenv("FIRESTORE_PG_COLLECTION", "pg_connections")
 
-# Supabase (opsional)
+# --- Supabase Storage (untuk simpan chart) ---
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 SUPABASE_BUCKET_CHARTS = os.getenv("SUPABASE_BUCKET_CHARTS", "charts")
@@ -121,8 +132,10 @@ SUPABASE_SIGNED_TTL_SECONDS = int(os.getenv("SUPABASE_SIGNED_TTL_SECONDS", "6048
 supabase_client = None
 if SUPABASE_URL and SUPABASE_KEY:
     try:
+        from supabase import create_client
+
         supabase_client = create_client(SUPABASE_URL, SUPABASE_KEY)
-    except Exception:
+    except Exception as _e:
         supabase_client = None  # biar aman kalau lib belum terpasang
 
 # --- Init Flask ---
@@ -131,7 +144,9 @@ CORS(app, origins=[o.strip() for o in CORS_ORIGINS if o.strip()], supports_crede
 
 # --- Init GCP clients ---
 _storage_client = storage.Client(project=GCP_PROJECT_ID) if GCP_PROJECT_ID else storage.Client()
-_firestore_client = firestore.Client(project=GCP_PROJECT_ID) if GCP_PROJECT_ID else firestore.Client()
+_firestore_client = (
+    firestore.Client(project=GCP_PROJECT_ID) if GCP_PROJECT_ID else firestore.Client()
+)
 
 # --- Cancel flags ---
 _CANCEL_FLAGS = set()  # holds session_id
@@ -143,9 +158,11 @@ _CANCEL_FLAGS = set()  # holds session_id
 def slug(s: str) -> str:
     return "-".join(s.strip().split()).lower()
 
+
 def ensure_dir(p: str):
     os.makedirs(p, exist_ok=True)
     return p
+
 
 def get_content(r):
     """Extract content from LiteLLM response (robust)."""
@@ -166,6 +183,7 @@ def get_content(r):
     except Exception:
         return str(r)
 
+
 def _safe_json_loads(s: str):
     try:
         return json.loads(s)
@@ -176,8 +194,10 @@ def _safe_json_loads(s: str):
             return json.loads(s[start : end + 1])
         raise
 
+
 def _should_cancel(session_id: str) -> bool:
     return session_id in _CANCEL_FLAGS
+
 
 def _cancel_if_needed(session_id: str):
     if _should_cancel(session_id):
@@ -188,15 +208,23 @@ def _cancel_if_needed(session_id: str):
 # =========================
 # DYNAMIC PROVIDERS / MODELS (no hardcoding)
 # =========================
+
 def _sorted_providers() -> List[str]:
-    """Return provider names sorted alphabetically."""
+    """
+    Return provider names sorted alphabetically, same mechanism as
+    populate_api_provider_and_its_model.py:
+        provider_names_sorted = sorted({p.name for p in litellm.provider_list})
+    """
     try:
         return sorted({p.name for p in litellm.provider_list})
     except Exception:
         return []
 
+
 def _valid_models() -> List[str]:
-    """Return model id list from litellm. Fallback to built-in constant if needed."""
+    """
+    Return model id list from litellm. Fallback to built-in constant if needed.
+    """
     try:
         return get_valid_models()
     except Exception:
@@ -205,14 +233,19 @@ def _valid_models() -> List[str]:
         except Exception:
             return []
 
+
 def _group_models_by_prefix(models: Optional[List[str]] = None) -> Dict[str, List[str]]:
-    """Group models by their first segment (prefix) without hardcoding provider names."""
+    """
+    Group models by their first segment (prefix) without hardcoding provider names.
+    Works for both `provider/model` and `provider.model` forms.
+    """
     if models is None:
         models = _valid_models()
     groups = defaultdict(list)
     for mid in models:
         if not isinstance(mid, str) or not mid:
             continue
+        prov = None
         if "/" in mid:
             prov = mid.split("/", 1)[0]
         elif "." in mid:
@@ -220,23 +253,49 @@ def _group_models_by_prefix(models: Optional[List[str]] = None) -> Dict[str, Lis
         else:
             prov = mid.split(":", 1)[0]
         groups[prov].append(mid)
+    # Sort each model list
     for k in list(groups.keys()):
         groups[k] = sorted(groups[k])
+    # Sort provider keys alphabetically (same as populate script behavior)
     return {k: groups[k] for k in sorted(groups.keys())}
+
+# 🔧 NEW: gabungkan provider dari provider_list + prefix model (agar 'gemini' dll lolos)
+def _all_supported_providers() -> List[str]:
+    names = set()
+    try:
+        names.update({p.name for p in litellm.provider_list})
+    except Exception:
+        pass
+    try:
+        names.update(_group_models_by_prefix().keys())
+    except Exception:
+        pass
+    # bersihkan kosong/None, lalu sort
+    return sorted({n.strip() for n in names if isinstance(n, str) and n.strip()})
+
 
 def _compose_model_id(provider: Optional[str], model: Optional[str]) -> str:
     """
     Compose a litellm model id dynamically WITHOUT hardcoding provider names.
+    Rules:
+      - If `model` already includes '/', return as is.
+      - Else, try to find a valid model in litellm.get_valid_models() that matches:
+          • starts with f"{provider}/" or f"{provider}." and endswith "/<model>" (if provider given)
+          • otherwise endswith "/<model>"
+      - As a last resort, if both provider and model are given, return f"{provider}/{model}"
+      - If only model is given, return it as-is (litellm may still resolve it if valid)
     """
     model = (model or "").strip()
     provider = (provider or "").strip()
 
+    # Already fully qualified
     if model and "/" in model:
         return model
 
     models = _valid_models()
     low_models = [(m, m.lower()) for m in models]
 
+    # Prefer exact match with provider context
     if model and provider:
         pref = provider.lower() + "/"
         pref_dot = provider.lower() + "."
@@ -246,89 +305,28 @@ def _compose_model_id(provider: Optional[str], model: Optional[str]) -> str:
             ):
                 return m
 
+    # Fallback: any endswith match
     if model:
         for m, ml in low_models:
             if ml.endswith("/" + model.lower()) or ml == model.lower():
                 return m
 
+    # Last resort: join with provider if both provided
     if provider and model:
         return f"{provider}/{model}"
 
+    # Return as-is; may still work if user gave a fully valid id (non-slash form)
     return model
 
-def _require_fernet():
-    if not fernet:
-        raise RuntimeError("FERNET_KEY is not configured on server")
 
-def _maybe_decrypt_api_key(api_key_in: Optional[str]) -> Optional[str]:
+def _resolve_llm_credentials(body: dict) -> Tuple[str, Optional[str], Optional[str]]:
     """
-    Accept either plaintext or Fernet-encrypted token (created by this server).
-    If decryption fails and the token *looks* like a Fernet token, raise ValueError
-    so FE can prompt the user to re-validate/save the key.
-    """
-    s = (api_key_in or "").strip()
-    if not s:
-        return None
+    Resolve model id and API key from request body WITHOUT using any server defaults.
+    Priority:
+      - Take plaintext apiKey in body if provided (ephemeral per-request).
+      - Else, if userId+provider provided, try Firestore stored encrypted token.
+      - If still missing, return (model_id, None, provider) to signal missing key.
 
-    looks_fernet = s.startswith("gAAAA")  # typical Fernet prefix
-
-    if fernet:
-        if looks_fernet:
-            try:
-                return fernet.decrypt(s.encode()).decode()
-            except Exception:
-                raise ValueError(
-                    "TOKEN_ENCRYPTED_BUT_CANNOT_DECRYPT: "
-                    "This API key appears encrypted but could not be decrypted. "
-                    "Ensure server FERNET_KEY matches the one used when saving the key, "
-                    "or send a plaintext 'apiKey'."
-                )
-        # treat as plaintext
-        return s
-
-    # server does not have FERNET
-    if looks_fernet:
-        raise ValueError(
-            "SERVER_MISSING_FERNET_KEY: "
-            "Received an encrypted token but the server has no FERNET_KEY. "
-            "Set FERNET_KEY or send a plaintext 'apiKey'."
-        )
-    return s
-
-def _get_user_provider_token(user_id: str, provider: str) -> Optional[str]:
-    """
-    Fetch encrypted token from Firestore and decrypt with Fernet.
-    Returns plaintext token or None if not found/cannot decrypt.
-    (Hardened to try common provider id casings.)
-    """
-    try:
-        base = (provider or "").strip()
-        candidates = [
-            f"{user_id}_{base}",
-            f"{user_id}_{base.lower()}",
-            f"{user_id}_{base.upper()}",
-        ]
-        seen = set()
-        for doc_id in [c for c in candidates if not (c in seen or seen.add(c))]:
-            doc = (
-                _firestore_client.collection(FIRESTORE_COLLECTION_PROVIDERS)
-                .document(doc_id)
-                .get()
-            )
-            if not doc.exists:
-                continue
-            enc = (doc.to_dict() or {}).get("token")
-            if not enc or not fernet:
-                continue
-            return fernet.decrypt(enc.encode()).decode()
-        return None
-    except Exception:
-        return None
-
-def _resolve_llm_credentials(body: dict) -> Tuple[Optional[str], Optional[str], Optional[str]]:
-    """
-    Resolve model id + API key, tanpa fallback env.
-    Priority: apiKey dari body (decrypt jika perlu) → Firestore (userId+provider) → None.
     Returns: (chosen_model_id, chosen_api_key, provider_in)
     """
     provider_in = (body.get("provider") or "").strip() or None
@@ -340,24 +338,27 @@ def _resolve_llm_credentials(body: dict) -> Tuple[Optional[str], Optional[str], 
 
     chosen_api_key = None
     if api_key_in:
-        chosen_api_key = _maybe_decrypt_api_key(api_key_in)
+        chosen_api_key = api_key_in  # use immediate per-request key
     elif user_id_in and provider_in:
+        # try Firestore stored key
         chosen_api_key = _get_user_provider_token(user_id_in, provider_in)
 
-    # guard: jangan sampai token terenkripsi lolos
-    if chosen_api_key and chosen_api_key.startswith("gAAAA"):
-        raise ValueError(
-            "ENCRYPTED_TOKEN_PASSED_THROUGH: server received an encrypted token that was not decrypted."
-        )
-
-    # Tidak ada pengecekan bentuk/jenis key spesifik provider. Validasi generik saja.
     return chosen_model_id, chosen_api_key, provider_in
 
+
 def get_provider_config(provider: str, api_key: str):
-    """Kept for potential FE compatibility."""
+    """
+    NOTE: Kept for potential FE compatibility; not used by core flow.
+    Left unmodified (generic) since URLs may still be helpful for client ping/validation.
+    """
     if not provider:
         raise ValueError("Provider not specified")
-    return {"url": None, "headers": {"Authorization": f"Bearer {api_key}"} if api_key else {}}
+    # Use generic OpenAI-compatible path if possible; else pass-through.
+    return {
+        "url": None,
+        "headers": {"Authorization": f"Bearer {api_key}"} if api_key else {},
+    }
+
 
 def save_provider_key(user_id: str, provider: str, encrypted_key: str, models: list):
     try:
@@ -369,6 +370,7 @@ def save_provider_key(user_id: str, provider: str, encrypted_key: str, models: l
             "token": encrypted_key,
             "models": models,
             "is_active": True,
+            # 🔧 gunakan server timestamp biar konsisten di multi instance
             "updated_at": firestore.SERVER_TIMESTAMP,
             "created_at": firestore.SERVER_TIMESTAMP,
         }
@@ -377,6 +379,24 @@ def save_provider_key(user_id: str, provider: str, encrypted_key: str, models: l
     except Exception as e:
         print("Firestore save error:", e)
         return False
+
+
+def _get_user_provider_token(user_id: str, provider: str) -> Optional[str]:
+    """
+    Fetch encrypted token from Firestore and decrypt with Fernet.
+    Returns plaintext token or None if not found/cannot decrypt.
+    """
+    try:
+        doc_id = f"{user_id}_{provider}"
+        doc = _firestore_client.collection(FIRESTORE_COLLECTION_PROVIDERS).document(doc_id).get()
+        if not doc.exists:
+            return None
+        enc = (doc.to_dict() or {}).get("token")
+        if not enc or not fernet:
+            return None
+        return fernet.decrypt(enc.encode()).decode()
+    except Exception:
+        return None
 
 
 # --- Firestore-backed conversation state -----------
@@ -393,8 +413,10 @@ def _fs_default_state():
         "created_at": firestore.SERVER_TIMESTAMP,
     }
 
+
 def _fs_sess_ref(session_id: str):
     return _firestore_client.collection(FIRESTORE_COLLECTION_SESSIONS).document(session_id)
+
 
 def _get_conv_state(session_id: str) -> dict:
     doc = _fs_sess_ref(session_id).get()
@@ -409,10 +431,12 @@ def _get_conv_state(session_id: str) -> dict:
         _fs_sess_ref(session_id).set(state, merge=True)
         return state
 
+
 def _save_conv_state(session_id: str, state: dict):
     st = dict(state)
     st["updated_at"] = firestore.SERVER_TIMESTAMP
     _fs_sess_ref(session_id).set(st, merge=True)
+
 
 def _append_history(state: dict, role: str, content: str, max_len=10_000, keep_last=100):
     content = str(content)
@@ -429,6 +453,7 @@ def _gcs_bucket():
         raise RuntimeError("GCS_BUCKET is not set")
     return _storage_client.bucket(GCS_BUCKET)
 
+
 def _metadata_sa_email() -> Optional[str]:
     """Fetch the service account email from GCE metadata (Cloud Run)."""
     try:
@@ -443,11 +468,15 @@ def _metadata_sa_email() -> Optional[str]:
         pass
     return None
 
+
 def _signed_url(blob, filename: str, content_type: str, ttl_seconds: int) -> str:
     """
     Generate V4 signed URL that works on Cloud Run (no private key).
-    Try IAM Signer first; fallback to default private-key signing.
+    Priority:
+      1) Use IAM Signer with the running service account.
+      2) Fallback to default private-key signing (local dev with keyfile).
     """
+    # Obtain ADC + refresh to ensure we have a token for IAM
     credentials, _ = google.auth.default(
         scopes=[
             "https://www.googleapis.com/auth/cloud-platform",
@@ -460,10 +489,12 @@ def _signed_url(blob, filename: str, content_type: str, ttl_seconds: int) -> str
     except Exception:
         pass
 
+    # Figure out the service account email
     sa_email = getattr(credentials, "service_account_email", None)
     if not sa_email or sa_email.lower() == "default":
         sa_email = GOOGLE_SERVICE_ACCOUNT_EMAIL or _metadata_sa_email()
 
+    # If IAM Signer available, use it to sign without private key
     if iam is not None and sa_email:
         try:
             signer = iam.Signer(auth_req, credentials, sa_email)
@@ -478,21 +509,27 @@ def _signed_url(blob, filename: str, content_type: str, ttl_seconds: int) -> str
                 method="GET",
                 response_disposition=f'inline; filename="{filename}"',
                 response_type=content_type,
-                credentials=signing_creds,
+                credentials=signing_creds,  # <-- key fix
             )
         except Exception:
+            # If IAM fails (e.g., missing permission or API disabled), continue to fallback
             pass
 
+    # Fallback: dev local with keyfile / creds that already include a private key
     return blob.generate_signed_url(
         version="v4",
         expiration=timedelta(seconds=ttl_seconds),
         method="GET",
-               response_disposition=f'inline; filename="{filename}"',
+        response_disposition=f'inline; filename="{filename}"',
         response_type=content_type,
     )
 
+
 def _use_supabase_for_charts() -> bool:
-    return (os.getenv("CHARTS_STORAGE", "gcs").lower() == "supabase") and (supabase_client is not None)
+    return (os.getenv("CHARTS_STORAGE", "gcs").lower() == "supabase") and (
+        supabase_client is not None
+    )
+
 
 def upload_diagram_to_supabase(
     local_path: str, *, domain: str, session_id: str, run_id: str, kind: str
@@ -521,7 +558,9 @@ def upload_diagram_to_supabase(
     signed_url = supabase_client.storage.from_(SUPABASE_BUCKET_CHARTS).create_signed_url(
         sb_path, expires_in=SUPABASE_SIGNED_TTL_SECONDS
     )["signed_url"]
-    public_url = supabase_client.storage.from_(SUPABASE_BUCKET_CHARTS).get_public_url(sb_path)["public_url"]
+    public_url = supabase_client.storage.from_(SUPABASE_BUCKET_CHARTS).get_public_url(sb_path)[
+        "public_url"
+    ]
 
     return {"sb_path": sb_path, "signed_url": signed_url, "public_url": public_url, "kind": kind}
 
@@ -541,6 +580,7 @@ def _upload_dataset_file_local(file_storage, *, domain: str) -> dict:
         "size_bytes": size,
         "local_path": dest,
     }
+
 
 def _save_bytes_local(domain: str, filename: str, data: bytes) -> dict:
     safe_domain = slug(domain)
@@ -567,6 +607,7 @@ def _normalize_columns_to_str(df: pl.DataFrame) -> pl.DataFrame:
         df = df.set_column_names(new_names)
     return df
 
+
 def _polars_info_string(df: pl.DataFrame) -> str:
     lines = [f"shape: {df.shape[0]} rows x {df.shape[1]} columns", "dtypes/nulls:"]
     try:
@@ -579,49 +620,16 @@ def _polars_info_string(df: pl.DataFrame) -> str:
         lines.append(f"  - {name}: {dtype} (nulls={n})")
     return "\n".join(lines)
 
+
 def _to_polars_dataframe(obj):
-    """
-    Robustly coerce various dataframe-like objects (polars, pandas, PandasAI wrappers,
-    and {"type":"dataframe","value": ...}) into a Polars DataFrame.
-    Returns None if conversion is impossible.
-    """
-    # Already Polars
     if isinstance(obj, pl.DataFrame):
         return _normalize_columns_to_str(obj)
-
-    # Pandas DataFrame
     try:
-        if isinstance(obj, pd.DataFrame):
-            return _normalize_columns_to_str(pl.from_pandas(obj))
-    except Exception:
-        pass
-
-    # Dict payload from agents
-    if isinstance(obj, dict):
-        try:
-            if obj.get("type") == "dataframe" and "value" in obj:
-                return _to_polars_dataframe(obj.get("value"))
-        except Exception:
-            pass
-
-    # PandasAI DataFrame wrapper or any object exposing to_pandas()/dataframe
-    try:
-        if hasattr(obj, "to_pandas") and callable(getattr(obj, "to_pandas")):
-            pdf = obj.to_pandas()
-            return _normalize_columns_to_str(pl.from_pandas(pdf))
-        if hasattr(obj, "dataframe"):
-            base = getattr(obj, "dataframe")
-            if isinstance(base, pd.DataFrame):
-                return _normalize_columns_to_str(pl.from_pandas(base))
-    except Exception:
-        pass
-
-    # Last-ditch: let Polars try to read from pandas-like
-    try:
-        df = pl.from_pandas(obj)  # will raise for non-pandas objects
+        df = pl.from_dataframe(obj)
         return _normalize_columns_to_str(df)
     except Exception:
         return None
+
 
 def _as_pai_df(df):
     """
@@ -642,6 +650,7 @@ def _as_pai_df(df):
             pdf.columns = [str(c) for c in pdf.columns]
         return pai.DataFrame(pdf)
 
+
 def _read_csv_bytes_to_polars(
     data: bytes, sep_candidates: List[str] = (",", "|", ";", "\t")
 ) -> pl.DataFrame:
@@ -659,17 +668,44 @@ def _read_csv_bytes_to_polars(
     except Exception as e:
         raise last_err or e
 
+def _extract_pdf_text(data: bytes, max_chars: int = 20000) -> str:
+    if not _PDF_EXTRACT_AVAILABLE:
+        return ""
+    with pdfplumber.open(io.BytesIO(data)) as pdf:
+        texts = [(page.extract_text() or "") for page in pdf.pages]
+    text = "\n\n".join(texts)
+    return text[:max_chars]
+
+def _extract_docx_text(data: bytes, max_chars: int = 20000) -> str:
+    if not _DOCX_EXTRACT_AVAILABLE:
+        return ""
+    doc = docx.Document(io.BytesIO(data))
+    text = "\n".join(p.text for p in doc.paragraphs)
+    return text[:max_chars]
 
 # ✅ a0.0.8: Excel readers (beside multi-separator CSV)
 def _is_excel_filename(name: str) -> bool:
     n = name.lower()
     return n.endswith(".xlsx") or n.endswith(".xls")
 
+TABULAR_EXTS = (".csv", ".xlsx", ".xls")
+ATTACHMENT_EXTS = (".pdf", ".docx", ".doc")
+
+
+def _is_tabular_filename(name: str) -> bool:
+    return os.path.splitext(name)[1].lower() in TABULAR_EXTS
+
+
+def _is_attachment_filename(name: str) -> bool:
+    return os.path.splitext(name)[1].lower() in ATTACHMENT_EXTS
+
 
 def _read_excel_bytes_to_polars(data: bytes, sheet_name: Optional[str] = None) -> pl.DataFrame:
+    # pandas can read excel from BytesIO; then convert to Polars
     with io.BytesIO(data) as bio:
-        pdf = pd.read_excel(bio, sheet_name=sheet_name)  # requires openpyxl/xlrd
+        pdf = pd.read_excel(bio, sheet_name=sheet_name)  # requires openpyxl/xlrd depending on format
     return _normalize_columns_to_str(pl.from_pandas(pdf))
+
 
 def _read_local_csv_to_polars(
     path: str, sep_candidates: List[str] = (",", "|", ";", "\t")
@@ -681,7 +717,7 @@ def _read_local_csv_to_polars(
 
 # ---- Upload (GCS when possible, safe local fallback otherwise) ----------------
 def upload_dataset_file(file_storage, *, domain: str) -> dict:
-    # detect content type by extension (csv/xlsx/xls)
+    # ✅ a0.0.8: detect content type by extension (csv/xlsx/xls)
     filename = file_storage.filename or "upload"
     ext = os.path.splitext(filename)[1].lower()
     if ext in (".xlsx", ".xls"):
@@ -734,6 +770,7 @@ def upload_dataset_file(file_storage, *, domain: str) -> dict:
         # Only if upload to GCS itself fails, fallback to local
         return _upload_dataset_file_local(file_storage, domain=domain)
 
+
 def list_gcs_csvs(domain: str) -> List[storage.Blob]:
     safe_domain = slug(domain)
     prefix = f"{GCS_DATASETS_PREFIX}/{safe_domain}/"
@@ -748,6 +785,7 @@ def list_gcs_tabulars(domain: str) -> List[storage.Blob]:
         if n.endswith(".csv") or n.endswith(".xlsx") or n.endswith(".xls") or n.endswith(".pdf") or n.endswith(".docx") or n.endswith(".doc"):
             out.append(b)
     return out
+
 
 def read_gcs_csv_to_pl_df(
     gs_uri_or_blobname: str, *, sep_candidates: List[str] = (",", "|", ";", "\t")
@@ -781,6 +819,7 @@ def read_gcs_tabular_to_pl_df(
         return _read_excel_bytes_to_polars(data)
     return _read_csv_bytes_to_polars(data, sep_candidates=sep_candidates)
 
+
 def delete_gcs_object(blob_name_or_gs_uri: str):
     if blob_name_or_gs_uri.startswith("gs://"):
         _, bucket_name, *rest = blob_name_or_gs_uri.replace("gs://", "").split("/")
@@ -804,6 +843,7 @@ def _detect_diagram_kind(local_html_path: str, visual_hint: str) -> str:
     except Exception:
         pass
     return "tables" if str(visual_hint).lower().strip() == "table" else "charts"
+
 
 def upload_diagram_to_gcs(
     local_path: str, *, domain: str, session_id: str, run_id: str, kind: str
@@ -846,13 +886,11 @@ router_system_configuration = """Make sure all of the information below is appli
 12. Rules of thumb: if prompt contains “why/driver/explain/root cause/trend/surprise” then need_analyzer=true.
 13. Rules of thumb: if prompt mentions allocation, optimization, plan, gap-closure, “minimum number of additional takers”, set need_analyzer=true and set visual_hint="table".
 14. If follow-up with no new data ops implied and a processed df exists, set need_manipulator=false to reuse the previous dataframe.
-15. Compiler always runs; default compiler_model="SAME_AS_SELECTED" (use the user's selected provider+model) unless the domain/user requires otherwise.
+15. Compiler always runs; default compiler_model="gemini/gemini-2.5-pro" unless the domain/user requires otherwise.
 16. visual_hint ∈ {"bar","line","table","auto"}; pick the closest fit and prefer "table" for plan/allocation outputs.
 17. Keep the reason short (≤120 chars). No prose beyond the JSON.
 18. In short: choose the most efficient set of agents/LLMs to answer the prompt well while respecting overrides.
-19. By default, Manipulator and Analyzer should always be used in most scenario, because response compiler did not have access to the complete detailed data.
-20. ABSOLUTE RULE: Do NOT write or execute SQL anywhere. Never call execute_sql_query. Always operate on in-memory DataFrames only.
-"""
+19. By default, Manipulator and Analyzer should always be used in most scenario, because response compiler did not have access to the complete detailed data."""
 
 orchestrator_system_configuration = """1. Honor precedence: direct user prompt > USER specific configuration > DOMAIN specific configuration > SYSTEM defaults.
 2. Think step by step.
@@ -868,10 +906,8 @@ orchestrator_system_configuration = """1. Honor precedence: direct user prompt >
 12. Use the Router Context Hint and Visualization hint when applicable.
 13. Respect the user- and domain-level configurations injected below; overrides must not alter core process.
 14. All specialists operate in Python using PandasAI Semantic DataFrames (pai.DataFrame) backed by Polars DataFrames.
-15. ABSOLUTE RULE for all agent prompts you emit: NEVER write or execute SQL, NEVER call execute_sql_query, NEVER import DB libraries. Use DataFrame (Polars/Pandas) operations only.
-16. Return STRICT JSON with keys: manipulator_prompt, visualizer_prompt, analyzer_prompt, compiler_instruction.
-17. Each value must be a single-line string. No extra keys, no prose, no markdown/code fences.
-"""
+15. Return STRICT JSON with keys: manipulator_prompt, visualizer_prompt, analyzer_prompt, compiler_instruction.
+16. Each value must be a single-line string. No extra keys, no prose, no markdown/code fences."""
 
 data_manipulator_system_configuration = """1. Honor precedence: direct user prompt > USER specific configuration > DOMAIN specific configuration > SYSTEM defaults.
 2. Enforce data hygiene before analysis.
@@ -883,9 +919,7 @@ data_manipulator_system_configuration = """1. Honor precedence: direct user prom
 8. Include the percentage version of appropriate raw value columns (share-of-total where relevant).
 9. End by returning only:
     result = {"type":"dataframe","value": <THE_FINAL_DATAFRAME>}
-10. Honor any user-level and domain-level instructions injected below.
-11. ABSOLUTE RULE: Do NOT write or execute SQL and do NOT call execute_sql_query; use only Polars/Pandas DataFrame operations on the provided pai.DataFrame objects.
-"""
+10. Honor any user-level and domain-level instructions injected below."""
 
 data_visualizer_system_configuration = """1. Honor precedence: direct user prompt > USER specific configuration > DOMAIN specific configuration > SYSTEM defaults.
 2. Produce exactly ONE interactive visualization (a Plotly diagram or a table) per request.
@@ -900,17 +934,13 @@ data_visualizer_system_configuration = """1. Honor precedence: direct user promp
 11. Ensure file_path is a plain Python string; do not print/return anything else.
 12. The last line of code MUST be exactly:
     result = {"type": "string", "value": file_path}
-13. DO NOT rely on pandas-specific styling; prefer Plotly Table when a table is needed.
-14. ABSOLUTE RULE: Do NOT write or execute SQL, do NOT call execute_sql_query, do NOT use any DB connectors; only use the already-processed DataFrame in Python.
-"""
+13. DO NOT rely on pandas-specific styling; prefer Plotly Table when a table is needed."""
 
 data_analyzer_system_configuration = """1. Honor precedence: direct user prompt > USER configuration specific > DOMAIN specific configuration > SYSTEM defaults.
 2. Write like you’re speaking to a person; be concise and insight-driven.
 3. Quantify where possible (deltas, % contributions, time windows); reference exact columns/filters used.
 4. Return only:
-    result = {"type":"string","value":"<3–6 crisp bullets or 2 short paragraphs of insights>"}
-5. ABSOLUTE RULE: No SQL. Do not call execute_sql_query. Use only in-memory DataFrame operations already computed by the manipulator.
-"""
+    result = {"type":"string","value":"<3–6 crisp bullets or 2 short paragraphs of insights>"}"""
 
 response_compiler_system_configuration = """1. Honor precedence: direct user prompt > USER specific configuration > DOMAIN specific configuration > SYSTEM defaults.
 2. Brevity: ≤180 words; bullets preferred; no code blocks, no JSON, no screenshots.
@@ -925,7 +955,7 @@ response_compiler_system_configuration = """1. Honor precedence: direct user pro
 11. Show both absolute and % change where sensible (e.g., “+$120k (+8.4%)”).
 12. Round smartly (money to nearest K unless < $10k; rates 1–2 decimals).
 13. If any agent fails or data is incomplete, still produce the best insight; mark gaps in Caveats and adjust Confidence.
-14. The user asks “how much/which/why,” the first sentence must provide the number/entity/reason.
+14. If the user asks “how much/which/why,” the first sentence must provide the number/entity/reason.
 15. Exact compiler_instruction template the orchestrator should emit (single line; steps separated by ';'):
 16. Read the user prompt, data_info, and all three agent responses;
 17. Compute the direct answer including the main number and compare period;
@@ -951,17 +981,28 @@ response_compiler_system_configuration = """1. Honor precedence: direct user pro
 37. `data_analyzer_response` is a PandasAI StringResponse.
 38. Your goal in `compiler_instruction` is to force brevity, decisions, and insights.
 39. Mention the dataset name involved of each statement.
-40. SHOULD BE STRICTLY ONLY respond in HTML format.
-"""
+40. SHOULD BE STRICTLY ONLY respond in HTML format."""
 
-# ---- Defaults to avoid NameError and allow future overrides
-user_specific_configuration = "{}"
-domain_specific_configuration = "{}"
+# --- User/Domain configs (kept) ---
+user_specific_configuration = """1. (no user-specific instructions provided yet)."""
+
+domain_specific_configuration = """1. Use period labels like m0 (current month) and m1 (prior month); apply consistently.
+2. Use IDR as currency, for example: Rp93,000.00 atau Rp354,500.00.
+3. Use blue themed chart and table colors.
+4. target should be in mn (million).
+5. %TUR is take up rate percentage.
+6. % Taker, % Transaction, and % Revenue squad is the percentage of each product of all product Revenue all is in bn which is billion idr.
+7. Revenue Squad is in mn wich is million idr.
+8. rev/subs and rev/trx should be in thousands of idr.
+9. MoM is month after month in percentage
+10. Subs is taker."""
 
 
 # =========================
 # Shared Data Loading (Polars-first)
 # =========================
+
+# ✅ a0.0.8: decrypt+build PG URL, then loaders that register dfs[*] = Polars DF
 def _pg_get_decrypted_conn(user_id: str, name: str = "default") -> Optional[dict]:
     try:
         doc_id = f"{user_id}_{slug(name)}"
@@ -977,17 +1018,22 @@ def _pg_get_decrypted_conn(user_id: str, name: str = "default") -> Optional[dict
     except Exception:
         return None
 
+
 def _pg_build_engine_url(meta: dict) -> str:
     host = meta["host"]
     port = str(meta["port"])
     dbname = meta["dbname"]
     user = meta["user"]
     password = meta["password"]
+    # Prefer psycopg2; PgBouncer-friendly (transaction pooling side)
     return f"postgresql+psycopg2://{user}:{password}@{host}:{port}/{dbname}"
 
+
 def _read_sql_to_polars(conn, query: str) -> pl.DataFrame:
+    # use pandas.read_sql then convert -> Polars
     pdf = pd.read_sql(sa_text(query), conn)
     return _normalize_columns_to_str(pl.from_pandas(pdf))
+
 
 def _load_pg_tables_into_dfs(
     *, user_id: str, name: str = "default", tables: Optional[List[str]] = None,
@@ -998,13 +1044,10 @@ def _load_pg_tables_into_dfs(
     meta = _pg_get_decrypted_conn(user_id, name=name)
     if not meta:
         return {}
-    engine = create_engine(
-        _pg_build_engine_url(meta),
-        poolclass=NullPool,
-        connect_args={"sslmode": meta.get("sslmode", "require")},
-    )
+    engine = create_engine(_pg_build_engine_url(meta), poolclass=NullPool, connect_args={"sslmode": meta.get("sslmode","require")})
     out = {}
     with engine.connect() as conn:
+        # discover tables if none specified
         if not tables:
             rs = conn.exec_driver_sql(
                 "SELECT table_name FROM information_schema.tables WHERE table_schema=%s",
@@ -1017,6 +1060,7 @@ def _load_pg_tables_into_dfs(
             out[f"{key_prefix}:table:{t}"] = df
     return out
 
+
 def _load_pg_sql_into_dfs(
     *, user_id: str, name: str = "default", queries: List[Tuple[str, str]], key_prefix: str = "pg"
 ) -> Dict[str, pl.DataFrame]:
@@ -1025,17 +1069,14 @@ def _load_pg_sql_into_dfs(
     meta = _pg_get_decrypted_conn(user_id, name=name)
     if not meta:
         return {}
-    engine = create_engine(
-        _pg_build_engine_url(meta),
-        poolclass=NullPool,
-        connect_args={"sslmode": meta.get("sslmode", "require")},
-    )
+    engine = create_engine(_pg_build_engine_url(meta), poolclass=NullPool, connect_args={"sslmode": meta.get("sslmode","require")})
     out = {}
     with engine.connect() as conn:
         for qname, query in queries:
             df = _read_sql_to_polars(conn, query)
             out[f"{key_prefix}:query:{qname}"] = df
     return out
+
 
 def _load_domain_dataframes(
     domain: str, dataset_filters: Optional[set]
@@ -1044,6 +1085,9 @@ def _load_domain_dataframes(
     data_info: Dict[str, str] = {}
     data_describe: Dict[str, str] = {}
 
+    # ✅ a0.0.8: PostgreSQL unification — allow dataset filters like:
+    # "pg:*" (all tables), "pg:table:<name>", and "pg:query:<name>|<SQL>"
+    # If body contains {"pg": {...}} it'll be handled in /query before calling this.
     _pg_targets = []
     if dataset_filters:
         for token in list(dataset_filters):
@@ -1053,14 +1097,14 @@ def _load_domain_dataframes(
     # GCS first
     try:
         if GCS_BUCKET:
-            for b in list_gcs_tabulars(domain):  # CSV + Excel
+            for b in list_gcs_tabulars(domain):  # ✅ a0.0.8 (CSV + Excel)
                 name_lower = b.name.lower()
                 if not (name_lower.endswith(".csv") or name_lower.endswith(".xlsx") or name_lower.endswith(".xls")):
                     continue
                 key = os.path.basename(b.name)
                 if dataset_filters and key not in dataset_filters and not key.startswith("pg:"):
                     continue
-                df = read_gcs_tabular_to_pl_df(b.name)
+                df = read_gcs_tabular_to_pl_df(b.name)  # ✅ a0.0.8
                 dfs[key] = df
                 info_str = _polars_info_string(df)
                 data_info[key] = info_str
@@ -1101,30 +1145,34 @@ def _load_domain_dataframes(
         except Exception:
             pass
 
-    # apply any inline Postgres dataset tokens
+    # ✅ a0.0.8: apply any inline Postgres dataset tokens collected above
     if _pg_targets:
+        # requires userId on /query; routed through via global temp set in /query call
         _ctx = globals().get("_PG_QUERY_CONTEXT") or {}
         user_id = _ctx.get("userId")
         name = _ctx.get("name", "default")
         if user_id:
+            # pg:*  -> all tables
             if any(t == "pg:*" for t in _pg_targets):
                 try:
                     pg_dfs = _load_pg_tables_into_dfs(user_id=user_id, name=name)
                     dfs.update(pg_dfs)
                 except Exception:
                     pass
-            table_targets = [t.split("pg:table:", 1)[1] for t in _pg_targets if t.startswith("pg:table:") and len(t.split("pg:table:", 1)[1]) > 0]
+            # pg:table:XYZ
+            table_targets = [t.split("pg:table:",1)[1] for t in _pg_targets if t.startswith("pg:table:") and len(t.split("pg:table:",1)[1])>0]
             if table_targets:
                 try:
                     pg_dfs = _load_pg_tables_into_dfs(user_id=user_id, name=name, tables=table_targets)
                     dfs.update(pg_dfs)
                 except Exception:
                     pass
+            # pg:query:<alias>|<SQL>
             for t in _pg_targets:
                 if t.startswith("pg:query:"):
                     try:
-                        payload = t.split("pg:query:", 1)[1]
-                        alias, sql = payload.split("|", 1)
+                        payload = t.split("pg:query:",1)[1]
+                        alias, sql = payload.split("|",1)
                         pg_dfs = _load_pg_sql_into_dfs(user_id=user_id, name=name, queries=[(alias, sql)])
                         dfs.update(pg_dfs)
                     except Exception:
@@ -1178,6 +1226,20 @@ def _load_domain_attachments_text(domain: str, dataset_filters=None, max_chars=8
 # Router — a0.0.8 (accept llm model & api_key)
 # =========================
 def _run_router(user_prompt: str, data_info, data_describe, state: dict, *, llm_model: str, llm_api_key: Optional[str]) -> dict:
+    """
+    Returns a dict:
+      {
+        "need_manipulator": bool,
+        "need_visualizer": bool,
+        "need_analyzer": bool,
+        "need_plan_explainer": bool,
+        "need_compiler": bool,
+        "compiler_model": "gemini/gemini-2.5-pro" (or other),
+        "plan_explainer_model": "gemini/gemini-2.5-pro" (or other),
+        "visual_hint": "bar|line|table|auto",
+        "reason": "<brief>",
+        "_elapsed": <float seconds>
+      }"""
     router_start = time.time()
     recent_context = json.dumps(state.get("history", [])[-6:], ensure_ascii=False)
 
@@ -1200,18 +1262,12 @@ def _run_router(user_prompt: str, data_info, data_describe, state: dict, *, llm_
     try:
         plan = _safe_json_loads(router_content)
     except Exception:
-        # ---------- Heuristic fallback (hardened) ----------
         p = user_prompt.lower()
         need_visual = bool(re.search(r"\b(chart|plot|graph|visual|bar|line|table)\b", p))
         optimize_terms = bool(re.search(r"\b(allocate|allocation|optimal|optimi[sz]e|plan|planning|min(?:imum)? number|minimum number|close (?:the )?gap|gap closure|takers?)\b", p))
         need_analyze = bool(re.search(r"\b(why|driver|explain|root cause|trend|surprise|reason)\b", p)) or optimize_terms
-
-        # ✅ FIX: treat short prompts as "follow-up" only if we actually have a previous processed output in state
-        has_prev = bool((state.get("last_visual_kind") or "").strip() or (state.get("last_analyzer_text") or "").strip())
-        is_short = len(p.split()) <= 8
-        follow_up = (bool(re.search(r"\b(what about|and|how about|ok but|also)\b", p)) or is_short) and has_prev
-
-        need_manip = not follow_up
+        follow_up = bool(re.search(r"\b(what about|and|how about|ok but|also)\b", p)) or len(p.split()) <= 8
+        need_manip = not follow_up  # reuse if follow-up
         visual_hint = "bar" if "bar" in p else ("line" if "line" in p else ("table" if ("table" in p or optimize_terms) else "auto"))
         plan = {
             "need_manipulator": bool(need_manip),
@@ -1225,6 +1281,7 @@ def _run_router(user_prompt: str, data_info, data_describe, state: dict, *, llm_
             "reason": "heuristic fallback",
         }
 
+    # Hard guard for allocation/gap prompts
     p_low = user_prompt.lower()
     if re.search(r"\b(min(?:imum)? number|minimum number of additional takers|additional takers|close (?:the )?gap|gap closure|optimal allocation|allocate|allocation|optimi[sz]e)\b", p_low):
         plan["need_analyzer"] = True
@@ -1236,7 +1293,6 @@ def _run_router(user_prompt: str, data_info, data_describe, state: dict, *, llm_
     router_end = time.time()
     plan["_elapsed"] = float(router_end - router_start)
     return plan
-
 
 # =========================
 # Orchestrate — a0.0.8 (accept llm model & api_key)
@@ -1320,9 +1376,12 @@ def _run_orchestrator(
 def health():
     return jsonify({"status": "healthy", "ts": datetime.utcnow().isoformat()})
 
+
+# 🔧 Tambah root route biar gak 404 pas akses domain dasar Cloud Run
 @app.get("/")
 def root():
     return jsonify({"ok": True, "service": "ConvoInsight BE", "health": "/health"})
+
 
 @app.route("/charts/<path:relpath>")
 def serve_chart(relpath):
@@ -1335,10 +1394,47 @@ def serve_chart(relpath):
 # =========================
 # Provider key management
 # =========================
+def _require_fernet():
+    if not fernet:
+        raise RuntimeError("FERNET_KEY is not configured on server")
+
+# ---------- NEW: provider-agnostic, lightweight API key plausibility check ----------
+def _plausible_api_key(api_key: str, *, min_len: int = 20, max_len: int = 512) -> bool:
+    """
+    Generic, non-network validation to reject obviously bogus inputs while staying
+    provider-agnostic. We avoid live probes so this works for ALL providers.
+
+    Rules:
+      - Trimmed length between min_len..max_len (default 20..512)
+      - No whitespace or control characters
+      - Allowed characters: letters, digits, _ - . = : / +
+      - Not a trivial placeholder (e.g., 'test', 'key', 'x', all same char)
+      - At least 6 distinct characters for basic entropy
+    """
+    if not isinstance(api_key, str):
+        return False
+    s = api_key.strip()
+    if len(s) < min_len or len(s) > max_len:
+        return False
+    if any(ch.isspace() for ch in s):
+        return False
+    if len(set(s)) < 6:
+        return False
+    low = s.lower()
+    if low in {"x", "test", "apikey", "api_key", "your_api_key", "your-key", "key"}:
+        return False
+    # allow common token chars without being too strict
+    if not re.fullmatch(r"[A-Za-z0-9_\-\.=:/\+]+", s):
+        return False
+    return True
+# ------------------------------------------------------------------------------------
+
 @app.route("/validate-key", methods=["POST"])
 def validate_key():
     """
     Validate & save API key for a given provider.
+    - Dynamic providers/models via LiteLLM (no hardcoded vendor lists).
+    - Uses a provider-agnostic, non-network plausibility check to avoid false negatives.
     """
     try:
         data = request.get_json()
@@ -1349,20 +1445,39 @@ def validate_key():
         if not provider or not api_key or not user_id:
             return jsonify({"valid": False, "error": "Missing provider, apiKey, or userId"}), 400
 
+        # Accept only supported providers (dynamic)
+        providers_all = _all_supported_providers()
+        if provider not in providers_all:
+            return jsonify({"valid": False, "error": f"Provider not supported: {provider}"}), 400
+
+        # Generic key plausibility (reject obvious garbage; avoid live probe)
+        if not _plausible_api_key(api_key):
+            return jsonify(
+                {
+                    "valid": False,
+                    "error": "API key format looks invalid (too short/whitespace/placeholder/invalid chars).",
+                }
+            ), 400
+
+        # Obtain models dynamically (filter by provider prefix if possible)
         valid_models = _valid_models()
         provider_models = sorted(
             [m for m in valid_models if m.lower().startswith(provider.lower() + "/")
              or m.lower().startswith(provider.lower() + ".")]
         )
 
+        # 🔐 Save encrypted key
         _require_fernet()
         encrypted_key = fernet.encrypt(api_key.encode()).decode()
         save_provider_key(user_id, provider, encrypted_key, provider_models)
 
-        return jsonify({"valid": True, "provider": provider, "models": provider_models, "token": encrypted_key})
+        return jsonify(
+            {"valid": True, "provider": provider, "models": provider_models, "token": encrypted_key}
+        )
 
     except Exception as e:
         return jsonify({"valid": False, "error": str(e)}), 500
+
 
 @app.route("/get-provider-keys", methods=["GET"])
 def get_provider_keys():
@@ -1381,28 +1496,42 @@ def get_provider_keys():
         for doc in docs:
             d = doc.to_dict()
             raw_updated = d.get("updated_at")
-            updated_at = raw_updated.isoformat() if hasattr(raw_updated, "isoformat") else (str(raw_updated) if raw_updated else None)
+
+            # Pastikan format tanggal tetap aman jika None atau bukan datetime
+            if hasattr(raw_updated, "isoformat"):
+                updated_at = raw_updated.isoformat()
+            else:
+                updated_at = str(raw_updated) if raw_updated else None
 
             items.append({
                 "id": doc.id,
                 "provider": d.get("provider"),
                 "models": d.get("models", []),
-                "is_active": d.get("is_active", False),
+                "is_active": d.get("is_active", False),  # Default ke False jika tidak ada
                 "updated_at": updated_at,
+
+                # ✅ Tambahan field konfigurasi model (optional, bisa None)
                 "selectedModel": d.get("selectedModel"),
                 "verbosity": d.get("verbosity"),
                 "reasoning": d.get("reasoning"),
                 "seed": d.get("seed"),
             })
 
-        return jsonify({"items": items, "count": len(items), "summary": f"{len(items)} provider keys found"})
+        return jsonify({
+            "items": items,
+            "count": len(items),
+            "summary": f"{len(items)} provider keys found"
+        })
+
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 @app.route("/set-active-config", methods=["POST"])
 def set_active_config():
     """
-    Simpan preferensi konfigurasi & set sebagai aktif untuk provider tertentu.
+    Menyimpan preferensi konfigurasi (selectedModel, verbosity, reasoning, seed)
+    dan menetapkannya sebagai konfigurasi aktif (is_active = True) untuk provider tertentu.
+    Semua konfigurasi provider lain milik user yang sama akan dinonaktifkan.
     """
     try:
         data = request.get_json()
@@ -1410,8 +1539,12 @@ def set_active_config():
         provider = (data.get("provider") or "").strip()
 
         if not user_id or not provider:
-            return jsonify({"saved": False, "error": "Missing userId or provider"}), 400
+            return jsonify({
+                "saved": False,
+                "error": "Missing userId or provider"
+            }), 400
 
+        # 1. Query semua config milik user → nonaktifkan semuanya terlebih dahulu
         docs_query = (
             _firestore_client.collection(FIRESTORE_COLLECTION_PROVIDERS)
             .where("user_id", "==", user_id)
@@ -1420,10 +1553,11 @@ def set_active_config():
         batch = _firestore_client.batch()
 
         for doc in docs_query.stream():
-            doc_provider = doc.id.split(f"{user_id}_")[-1]
+            doc_provider = doc.id.split(f"{user_id}_")[-1]  # Misal: "uid_gemini" -> "gemini"
             if doc_provider != provider:
                 batch.update(doc.reference, {"is_active": False})
 
+        # 2. Aktifkan config untuk provider ini + simpan preferensinya
         doc_ref = _firestore_client.collection(FIRESTORE_COLLECTION_PROVIDERS).document(
             f"{user_id}_{provider}"
         )
@@ -1438,15 +1572,28 @@ def set_active_config():
         }
 
         batch.set(doc_ref, prefs, merge=True)
+
+        # 3. Commit ke Firestore
         batch.commit()
 
-        return jsonify({"saved": True, "provider": provider, "message": f"Active provider set to {provider}"})
+        return jsonify({
+            "saved": True,
+            "provider": provider,
+            "message": f"Active provider set to {provider}"
+        })
+
     except Exception as e:
-        return jsonify({"saved": False, "error": str(e)}), 500
+        return jsonify({
+            "saved": False,
+            "error": str(e)
+        }), 500
 
 @app.route("/update-provider-key", methods=["PUT"])
 def update_provider_key():
-    """Update existing provider key dynamically."""
+    """
+    Update an existing provider key dynamically.
+    Uses the same generic plausibility rules as /validate-key (no live calls).
+    """
     try:
         data = request.get_json()
         user_id = (data.get("userId") or "").strip()
@@ -1456,6 +1603,15 @@ def update_provider_key():
         if not user_id or not provider or not api_key:
             return jsonify({"updated": False, "error": "Missing fields"}), 400
 
+        providers_all = _all_supported_providers()
+        if provider not in providers_all:
+            return jsonify({"updated": False, "error": f"Provider not supported: {provider}"}), 400
+
+        if not _plausible_api_key(api_key):
+            return jsonify(
+                {"updated": False, "error": "API key format looks invalid (too short/whitespace/placeholder/invalid chars)."}
+            ), 400
+
         _require_fernet()
         encrypted_key = fernet.encrypt(api_key.encode()).decode()
         valid_models = _valid_models()
@@ -1464,7 +1620,9 @@ def update_provider_key():
              or m.lower().startswith(provider.lower() + ".")]
         )
 
-        doc_ref = _firestore_client.collection(FIRESTORE_COLLECTION_PROVIDERS).document(f"{user_id}_{provider}")
+        doc_ref = _firestore_client.collection(FIRESTORE_COLLECTION_PROVIDERS).document(
+            f"{user_id}_{provider}"
+        )
         doc_ref.set(
             {
                 "user_id": user_id,
@@ -1481,8 +1639,12 @@ def update_provider_key():
     except Exception as e:
         return jsonify({"updated": False, "error": str(e)}), 500
 
+
 @app.route("/delete-provider-key", methods=["DELETE"])
 def delete_provider_key():
+    """
+    Delete stored provider key.
+    """
     try:
         data = request.get_json()
         user_id = data.get("userId")
@@ -1504,9 +1666,11 @@ def delete_provider_key():
         return jsonify({"error": str(e)}), 500
 
 
-# =============== DYNAMIC REGISTRY ENDPOINTS =================
+# =============== DYNAMIC REGISTRY ENDPOINTS (no hardcoding) =================
+
 @app.get("/litellm/models")
 def litellm_models():
+    """Return full model list (valid_models) grouped by dynamic prefix; no hardcoded names."""
     try:
         valid_models = _valid_models()
         groups = _group_models_by_prefix(valid_models)
@@ -1515,28 +1679,43 @@ def litellm_models():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+
 @app.route("/litellm/providers", methods=["GET"])
 def litellm_providers():
+    import litellm
     version = getattr(litellm, "__version__", "unknown")
     try:
+        # SAME sorting behavior as populate_api_provider_and_its_model.py
         providers = _sorted_providers()
         return jsonify({"count": len(providers), "providers": providers, "version": version})
     except Exception as e:
         return jsonify({"error": str(e), "version": version}), 500
 
+
 @app.get("/llm/registry")
 def llm_registry():
+    """
+    New dynamic Multi-LLM registry (no hardcoding).
+    Returns sorted providers (like populate) and valid models with simple grouping.
+    """
     try:
         providers = _sorted_providers()
         models = _valid_models()
         groups = _group_models_by_prefix(models)
-        return jsonify({"providers": providers, "models": models, "groups": groups, "counts": {"providers": len(providers), "models": len(models)}})
+        return jsonify({
+            "providers": providers,
+            "models": models,
+            "groups": groups,
+            "counts": {"providers": len(providers), "models": len(models)}
+        })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
 
 @app.get("/debug/routes")
 def debug_routes():
     from flask import current_app
+
     return {"routes": sorted([r.rule for r in current_app.url_map.iter_rules()])}
 
 
@@ -1551,7 +1730,7 @@ def list_domains():
         for d in sorted(os.listdir(DATASETS_ROOT)):
             p = os.path.join(DATASETS_ROOT, d)
             if os.path.isdir(p):
-                csvs = [f for f in sorted(os.listdir(p)) if f.lower().endswith((".csv",".xlsx",".xls"))]  # ✅ a0.0.8
+                csvs = [f for f in sorted(os.listdir(p)) if f.lower().endswith((".csv",".xlsx",".xls",".pdf",".docx",".doc"))]  # ✅ a0.0.8
                 if csvs:
                     result[d] = csvs
         # gcs merge
@@ -1571,9 +1750,11 @@ def list_domains():
     except Exception as e:
         return jsonify({"detail": str(e)}), 500
 
+
 def _ds_ref(domain: str, filename: str):
     key = f"{slug(domain)}::{filename}"
     return _firestore_client.collection(FIRESTORE_COLLECTION_DATASETS).document(key)
+
 
 def _save_dataset_meta(domain: str, filename: str, gs_uri: str, size: int):
     meta = {
@@ -1586,8 +1767,10 @@ def _save_dataset_meta(domain: str, filename: str, gs_uri: str, size: int):
     }
     _ds_ref(domain, filename).set(meta, merge=True)
 
+
 def _delete_dataset_meta(domain: str, filename: str):
     _ds_ref(domain, filename).delete()
+
 
 def _list_dataset_meta(domain: Optional[str] = None, limit: int = 200) -> List[dict]:
     col = _firestore_client.collection(FIRESTORE_COLLECTION_DATASETS)
@@ -1596,6 +1779,7 @@ def _list_dataset_meta(domain: Optional[str] = None, limit: int = 200) -> List[d
         q = q.where("domain", "==", slug(domain))
     docs = q.limit(limit).stream()
     return [d.to_dict() for d in docs if d.exists]
+
 
 @app.post("/datasets/upload")
 def datasets_upload():
@@ -1609,6 +1793,7 @@ def datasets_upload():
     except Exception as e:
         return jsonify({"detail": str(e)}), 500
 
+
 @app.get("/datasets")
 def datasets_list():
     try:
@@ -1616,7 +1801,7 @@ def datasets_list():
         add_signed = request.args.get("signed", "false").lower() in ("1", "true", "yes")
         items = []
 
-        # 1) Firestore metadata
+        # 1) Firestore metadata (jika ada)
         try:
             items = _list_dataset_meta(domain=domain)
             if add_signed:
@@ -1629,12 +1814,19 @@ def datasets_list():
                         _, bucket_name, *rest = gs_uri.replace("gs://", "").split("/")
                         blob_name = "/".join(rest)
                         blob = _storage_client.bucket(bucket_name).blob(blob_name)
+                        # determine content type based on extension
                         fname = it["filename"].lower()
                         ctype = "text/csv"
                         if fname.endswith(".xlsx"):
                             ctype = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                         elif fname.endswith(".xls"):
                             ctype = "application/vnd.ms-excel"
+                        elif fl.endswith(".pdf"):
+                            ctype = "application/pdf"
+                        elif fl.endswith(".docx"):
+                            ctype = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                        elif fl.endswith(".doc"):
+                            ctype = "application/msword"
                         it["signed_url"] = _signed_url(
                             blob, it["filename"], ctype, GCS_SIGNED_URL_TTL_SECONDS
                         )
@@ -1643,11 +1835,11 @@ def datasets_list():
         except Exception:
             items = []
 
-        # 2) Fallback: baca langsung dari GCS kalau Firestore miss
+        # 2) Fallback: baca langsung dari GCS kalau Firestore kosong / miss
         try:
             if domain and GCS_BUCKET:
                 known = {(i.get("domain"), i.get("filename")) for i in items}
-                for b in list_gcs_tabulars(domain):
+                for b in list_gcs_tabulars(domain):  # ✅ a0.0.8
                     fname = os.path.basename(b.name)
                     key = (slug(domain), fname)
                     ext = os.path.splitext(fname)[1].lower()
@@ -1677,6 +1869,8 @@ def datasets_list():
                                 ctype = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                             elif fl.endswith(".xls"):
                                 ctype = "application/vnd.ms-excel"
+                            else:
+                                ctype = "text/csv"
                             rec["signed_url"] = _signed_url(
                                 b, fname, ctype, GCS_SIGNED_URL_TTL_SECONDS
                             )
@@ -1692,7 +1886,7 @@ def datasets_list():
             if os.path.isdir(domain_dir):
                 known = {(i.get("domain"), i.get("filename")) for i in items}
                 for name in sorted(os.listdir(domain_dir)):
-                    if name.lower().endswith((".csv",".xlsx",".xls")) and (slug(domain), name) not in known:
+                    if name.lower().endswith((".csv",".xlsx",".xls",".pdf",".docx",".doc")) and (slug(domain), name) not in known:
                         path = os.path.join(domain_dir, name)
                         size = os.path.getsize(path)
                         items.append(
@@ -1709,9 +1903,18 @@ def datasets_list():
     except Exception as e:
         return jsonify({"detail": str(e)}), 500
 
+
 # ✅ NEW: Return all datasets for a given domain (path-based)
 @app.get("/datasets/<domain>/all")
 def datasets_list_all(domain):
+    """
+    List all datasets within a given domain (Firestore + GCS + Local fallback).
+    Returns:
+      {
+        "items": [ { domain, filename, gs_uri, size_bytes, signed_url } ],
+        "datasets": same_as_items
+      }
+    """
     try:
         add_signed = request.args.get("signed", "false").lower() in ("1", "true", "yes")
         items = []
@@ -1735,6 +1938,12 @@ def datasets_list_all(domain):
                             ctype = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                         elif fname.endswith(".xls"):
                             ctype = "application/vnd.ms-excel"
+                        elif fl.endswith(".pfd"):
+                            ctype = "application/pdf"
+                        elif fl.endswith(".docx"):
+                            ctype = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                        elif fl.endswith(".doc"):
+                            ctype = "application/msword"
                         it["signed_url"] = _signed_url(
                             blob, it["filename"], ctype, GCS_SIGNED_URL_TTL_SECONDS
                         )
@@ -1743,11 +1952,11 @@ def datasets_list_all(domain):
         except Exception:
             items = []
 
-        # 2️⃣ Fallback: GCS
+        # 2️⃣ Fallback: read directly from GCS if Firestore miss
         try:
             if GCS_BUCKET:
                 known = {(i.get("domain"), i.get("filename")) for i in items}
-                for b in list_gcs_tabulars(domain):
+                for b in list_gcs_tabulars(domain):  # ✅ a0.0.8
                     fname = os.path.basename(b.name)
                     key = (slug(domain), fname)
                     ext = os.path.splitext(fname)[1].lower()
@@ -1777,6 +1986,9 @@ def datasets_list_all(domain):
                                 ctype = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                             elif fl.endswith(".xls"):
                                 ctype = "application/vnd.ms-excel"
+                            else:
+                                ctype = "text/csv"
+
                             rec["signed_url"] = _signed_url(
                                 b, fname, ctype, GCS_SIGNED_URL_TTL_SECONDS
                             )
@@ -1791,7 +2003,7 @@ def datasets_list_all(domain):
         if os.path.isdir(domain_dir):
             known = {(i.get("domain"), i.get("filename")) for i in items}
             for name in sorted(os.listdir(domain_dir)):
-                if name.lower().endswith((".csv",".xlsx",".xls")) and (slug(domain), name) not in known:
+                if name.lower().endswith((".csv",".xlsx",".xls",".pdf",".docx",".doc")) and (slug(domain), name) not in known:
                     path = os.path.join(domain_dir, name)
                     size = os.path.getsize(path)
                     items.append(
@@ -1808,8 +2020,13 @@ def datasets_list_all(domain):
     except Exception as e:
         return jsonify({"detail": str(e)}), 500
 
+
 @app.delete("/datasets/<domain>/all")
 def datasets_delete_all(domain):
+    """
+    Delete ALL datasets under a given domain (from GCS, Firestore, and local fallback).
+    Returns: { deleted: [filename1, filename2, ...] }
+    """
     deleted = []
     try:
         safe_domain = slug(domain)
@@ -1817,7 +2034,7 @@ def datasets_delete_all(domain):
         # 1️⃣ GCS delete
         try:
             if GCS_BUCKET:
-                blobs = list_gcs_tabulars(safe_domain)
+                blobs = list_gcs_tabulars(safe_domain)  # ✅ a0.0.8
                 for b in blobs:
                     fname = os.path.basename(b.name)
                     ext = os.path.splitext(fname)[1].lower()
@@ -1839,7 +2056,7 @@ def datasets_delete_all(domain):
         local_dir = os.path.join(DATASETS_ROOT, safe_domain)
         if os.path.isdir(local_dir):
             for name in sorted(os.listdir(local_dir)):
-                if not name.lower().endswith((".csv",".xlsx",".xls")):
+                if not name.lower().endswith((".csv",".xlsx",".xls",".pdf",".docx",".doc")):
                     continue
                 path = os.path.join(local_dir, name)
                 try:
@@ -1851,6 +2068,7 @@ def datasets_delete_all(domain):
         return jsonify({"deleted": deleted, "count": len(deleted)})
     except Exception as e:
         return jsonify({"detail": str(e)}), 500
+
 
 @app.get("/datasets/<domain>/<path:filename>")
 def datasets_read(domain, filename):
@@ -1890,18 +2108,17 @@ def datasets_read(domain, filename):
         
         if GCS_BUCKET:
             blob_name = f"{GCS_DATASETS_PREFIX}/{slug(domain)}/{filename}"
-            df = read_gcs_tabular_to_pl_df(blob_name)
+            df = read_gcs_tabular_to_pl_df(blob_name)  # ✅ a0.0.8
         else:
             local_path = os.path.join(DATASETS_ROOT, slug(domain), filename)
-            if os.path.exists(local_path):
-                with open(local_path, "rb") as f:
-                    data = f.read()
-                if _is_excel_filename(filename):
-                    df = _read_excel_bytes_to_polars(data)
-                else:
-                    df = _read_csv_bytes_to_polars(data)
-            else:
+            if not os.path.exists(local_path):
                 return jsonify({"detail": "File not found"}), 404
+            with open(local_path, "rb") as f:
+                data = f.read()
+            if _is_excel_filename(filename):
+                df = _read_excel_bytes_to_polars(data)
+            else:
+                df = _read_csv_bytes_to_polars(data)
         if n > 0:
             df = df.head(n)
         if as_fmt == "csv":
@@ -1912,6 +2129,7 @@ def datasets_read(domain, filename):
         return jsonify({"records": df.to_dicts()})
     except Exception as e:
         return jsonify({"detail": str(e)}), 500
+
 
 @app.delete("/datasets/<domain>/<path:filename>")
 def datasets_delete(domain, filename):
@@ -1932,6 +2150,7 @@ def datasets_delete(domain, filename):
         return jsonify({"deleted": True, "domain": slug(domain), "filename": filename})
     except Exception as e:
         return jsonify({"detail": str(e)}), 500
+
 
 @app.post("/upload_datasets/<domain>")
 def compat_upload_datasets(domain: str):
@@ -1972,6 +2191,7 @@ def compat_upload_datasets(domain: str):
     except Exception as e:
         return jsonify({"detail": str(e)}), 500
 
+
 @app.get("/domains/<domain>/datasets")
 def compat_list_domain_datasets(domain: str):
     try:
@@ -1991,6 +2211,12 @@ def compat_list_domain_datasets(domain: str):
                             ctype = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                         elif fname.endswith(".xls"):
                             ctype = "application/vnd.ms-excel"
+                        elif fname.endswith(".pdf"):
+                            ctype = "application/pdf"
+                        elif fname.endswith(".docx"):
+                            ctype = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                        elif fname.endswith(".doc"):
+                            ctype = "application/msword"
                         it["signed_url"] = _signed_url(
                             blob, it["filename"], ctype, GCS_SIGNED_URL_TTL_SECONDS
                         )
@@ -2005,7 +2231,7 @@ def compat_list_domain_datasets(domain: str):
             if os.path.isdir(domain_dir):
                 known_names = {i.get("filename") for i in items}
                 for name in sorted(os.listdir(domain_dir)):
-                    if name.lower().endswith((".csv",".xlsx",".xls")) and name not in known_names:
+                    if name.lower().endswith((".csv",".xlsx",".xls",".pdf",".docx",".doc")) and name not in known_names:
                         path = os.path.join(domain_dir, name)
                         size = os.path.getsize(path)
                         items.append(
@@ -2024,6 +2250,8 @@ def compat_list_domain_datasets(domain: str):
     except Exception as e:
         return jsonify({"detail": str(e)}), 500
 
+
+# 🔧 trailing-slash variant to avoid duplicate route collision
 @app.get("/domains/<domain>/datasets/")
 def compat_list_domain_datasets_trailing(domain: str):
     return compat_list_domain_datasets(domain)
@@ -2037,7 +2265,9 @@ def sessions_list():
     try:
         limit = int(request.args.get("limit", "20"))
         col = _firestore_client.collection(FIRESTORE_COLLECTION_SESSIONS)
-        docs = col.order_by("updated_at", direction=firestore.Query.DESCENDING).limit(limit).stream()
+        docs = (
+            col.order_by("updated_at", direction=firestore.Query.DESCENDING).limit(limit).stream()
+        )
         items = []
         for d in docs:
             if not d.exists:
@@ -2057,6 +2287,7 @@ def sessions_list():
     except Exception as e:
         return jsonify({"detail": str(e)}), 500
 
+
 @app.get("/sessions/<session_id>/history")
 def sessions_history(session_id):
     try:
@@ -2073,10 +2304,18 @@ def sessions_history(session_id):
     except Exception as e:
         return jsonify({"detail": str(e)}), 500
 
+
 @app.get("/sessions/<session_id>/export/pdf")
 def sessions_export_pdf(session_id: str):
     if not _REPORTLAB_AVAILABLE:
-        return jsonify({"detail": "PDF export requires 'reportlab'. Install first: uv pip install reportlab"}), 501
+        return (
+            jsonify(
+                {
+                    "detail": "PDF export requires 'reportlab'. Install first: uv pip install reportlab"
+                }
+            ),
+            501,
+        )
     try:
         state = _get_conv_state(session_id)
         history: List[dict] = state.get("history", [])
@@ -2085,7 +2324,9 @@ def sessions_export_pdf(session_id: str):
         styles = getSampleStyleSheet()
         title = styles["Heading1"]
         meta = styles["Normal"]
-        body = ParagraphStyle("Body", parent=styles["BodyText"], fontSize=10, leading=14, alignment=TA_LEFT)
+        body = ParagraphStyle(
+            "Body", parent=styles["BodyText"], fontSize=10, leading=14, alignment=TA_LEFT
+        )
         role_style = styles["Heading3"]
 
         story: List = []
@@ -2107,16 +2348,24 @@ def sessions_export_pdf(session_id: str):
                     content = json.dumps(content, ensure_ascii=False, indent=2)
                 safe = html.escape(content).replace("\n", "<br/>")
 
-                story.append(Paragraph(f"{i}. <b>{role}</b> <font size=9 color='#666666'>({ts_str})</font>", role_style))
+                story.append(
+                    Paragraph(
+                        f"{i}. <b>{role}</b> <font size=9 color='#666666'>({ts_str})</font>",
+                        role_style,
+                    )
+                )
                 story.append(Paragraph(safe, body))
                 story.append(Spacer(1, 8))
 
         doc.build(story)
         buf.seek(0)
         filename = f"chat_session_{session_id}.pdf"
-        return send_file(buf, mimetype="application/pdf", as_attachment=True, download_name=filename)
+        return send_file(
+            buf, mimetype="application/pdf", as_attachment=True, download_name=filename
+        )
     except Exception as e:
         return jsonify({"detail": str(e)}), 500
+
 
 @app.post("/query/cancel")
 def query_cancel():
@@ -2132,15 +2381,20 @@ def query_cancel():
 
 
 # =========================
-# NEW: Suggestion Endpoint (a0.0.8)
+# NEW: Suggestion Endpoint (a0.0.8) — dynamic provider+model+apiKey
 # =========================
 @app.post("/suggest")
 def suggest():
     """
-    Body:
+    Body (JSON):
       - domain (str, required)
       - dataset (str | [str], optional)
-      - provider, model, userId, apiKey (optional, but needed for LLM)
+      - provider (str, optional)
+      - model (str, optional; can be fully-qualified or short)
+      - userId (str, optional; to fetch stored provider token)
+      - apiKey (str, optional; per-request override)
+    Returns:
+      { suggestions: [s1,s2,s3,s4], elapsed: <sec>, data_info, data_describe }
     """
     t0 = time.time()
     try:
@@ -2151,12 +2405,8 @@ def suggest():
         if not domain_in:
             return jsonify({"detail": "Missing 'domain'"}), 400
 
-        # resolve creds (may raise ValueError with clear message)
-        try:
-            chosen_model_id, chosen_api_key, provider_in = _resolve_llm_credentials(body)
-        except ValueError as e:
-            return jsonify({"detail": str(e)}), 400
-
+        # Resolve LLM creds & model (NO env fallback)
+        chosen_model_id, chosen_api_key, _ = _resolve_llm_credentials(body)
         if not chosen_model_id:
             return jsonify({"detail": "Missing or invalid model. Provide provider+model or a valid model id."}), 400
         if not chosen_api_key:
@@ -2196,7 +2446,9 @@ def suggest():
                     df.info of each dfs key(file name)-value pair:
                     {data_info}.
                     df.describe of each dfs key(file name)-value pair:
-                    {data_describe}.""",
+                    {data_describe}.
+                    Attachment text (truncated): {json.dumps(attachments_summary, ensure_ascii=False)}
+                    """
                 },
             ],
             seed=1,
@@ -2237,7 +2489,19 @@ def suggest():
 @app.post("/query")
 def query():
     """
-    Body: domain, prompt, dataset, provider, model, userId, apiKey, includeInsight, pg
+    Body (JSON):
+      - domain (str, required)
+      - prompt (str, required)
+      - session_id (str, optional)
+      - dataset (str | [str], optional)            # CSV/XLSX/XLS file names; also supports inline "pg:*" / "pg:table:..." / "pg:query:alias|SQL"
+      - provider (str, optional)                    # e.g., "google"|"openai"|"anthropic"|...
+      - model (str, optional)                       # e.g., "gemini-2.5-pro", "gpt-4o-mini", or "provider/model"
+      - userId (str, optional)                      # used to fetch provider token from Firestore; also PG creds if using "pg:*" etc
+      - apiKey (str, optional)                      # per-request direct API key (preferred if provided)
+      - includeInsight (bool, optional)
+      - pg (dict, optional, ✅ a0.0.8)               # {"name":"default", "tables":["t1","t2"], "schema":"public", "limit":500} or {"name":"default","queries":[{"name":"q1","sql":"SELECT ..."}]}
+    Returns:
+      - session_id, response (HTML), diagram_* fields, timing & flags
     """
     t0 = time.time()
     try:
@@ -2246,11 +2510,8 @@ def query():
         prompt = body.get("prompt")
         session_id = body.get("session_id") or str(uuid.uuid4())
 
-        # resolve creds with explicit errors
-        try:
-            chosen_model_id, chosen_api_key, provider_in = _resolve_llm_credentials(body)
-        except ValueError as e:
-            return jsonify({"detail": str(e)}), 400
+        # Resolve model + key dynamically (no env fallback)
+        chosen_model_id, chosen_api_key, provider_in = _resolve_llm_credentials(body)
 
         dataset_field = body.get("dataset")
         if isinstance(dataset_field, list):
@@ -2268,17 +2529,25 @@ def query():
         if not chosen_model_id:
             return jsonify({"detail": "Missing or invalid model. Provide provider+model or a valid model id."}), 400
         if not chosen_api_key:
-            return jsonify({"detail": "No API key available for the selected provider. Provide 'apiKey' or save one via /validate-key."}), 400
+            return (
+                jsonify(
+                    {
+                        "detail": "No API key available for the selected provider. Provide 'apiKey' or save one via /validate-key."
+                    }
+                ),
+                400,
+            )
 
         domain = slug(domain_in)
 
-        # capture optional PG context
+        # ✅ a0.0.8: capture optional PG context for dfs unification
         _pg_ctx = {}
         if isinstance(body.get("pg"), dict):
             _pg_ctx["userId"] = (body.get("userId") or "").strip() or None
             _pg_ctx["name"] = (body["pg"].get("name") or "default").strip()
             globals()["_PG_QUERY_CONTEXT"] = _pg_ctx
         else:
+            # still allow dataset tokens "pg:*" etc by passing userId
             if any(isinstance(x, str) and x.startswith("pg:") for x in (datasets or [])):
                 globals()["_PG_QUERY_CONTEXT"] = {"userId": (body.get("userId") or "").strip() or None, "name": "default"}
 
@@ -2289,23 +2558,17 @@ def query():
 
         _cancel_if_needed(session_id)
 
-        # load data
+        # load data (Polars)
         dfs, data_info, data_describe = _load_domain_dataframes(domain, dataset_filters)
         attachments_text = _load_domain_attachments_text(domain, dataset_filters)
 
-        # merge PG sources if provided via /query.pg
+        # ✅ a0.0.8: if /query.pg provided, merge those PG sources too
         if isinstance(body.get("pg"), dict) and (body.get("userId")):
             pg_name = (body["pg"].get("name") or "default").strip()
             if body["pg"].get("tables"):
                 tbls = [t for t in body["pg"]["tables"] if isinstance(t, str) and t.strip()]
                 try:
-                    pg_dfs = _load_pg_tables_into_dfs(
-                        user_id=body["userId"],
-                        name=pg_name,
-                        tables=tbls,
-                        schema=body["pg"].get("schema", "public"),
-                        limit=body["pg"].get("limit"),
-                    )
+                    pg_dfs = _load_pg_tables_into_dfs(user_id=body["userId"], name=pg_name, tables=tbls, schema=body["pg"].get("schema","public"), limit=body["pg"].get("limit"))
                     dfs.update(pg_dfs)
                 except Exception:
                     pass
@@ -2453,12 +2716,7 @@ def query():
         need_visual = bool(agent_plan.get("need_visualizer", True))
         include_insight = body.get("includeInsight", True)
         need_analyze = include_insight and bool(agent_plan.get("need_analyzer", True))
-
-        # compiler model
         compiler_model = agent_plan.get("compiler_model") or chosen_model_id
-        if isinstance(compiler_model, str) and compiler_model.strip().upper() in {"SAME_AS_SELECTED", "AUTO", "DEFAULT"}:
-            compiler_model = chosen_model_id
-
         visual_hint = agent_plan.get("visual_hint", "auto")
 
         context_hint = {
@@ -2486,23 +2744,14 @@ def query():
         analyzer_prompt = spec.get("analyzer_prompt", "")
         compiler_instruction = spec.get("compiler_instruction", "")
 
-        # ✅ FIX (NO-SQL guardrail): append a hard rule to every agent prompt to prevent any SQL usage.
-        SQL_GUARD = (
-            "Hard rule: NEVER write or execute SQL and NEVER call execute_sql_query. "
-            "Operate strictly on the provided pai.DataFrame objects with Polars/Pandas "
-            "(use groupby/agg/sort/filter/join as needed)."
-        )
-        manipulator_prompt = f"{(manipulator_prompt or '').strip()}\n\n{SQL_GUARD}".strip()
-        visualizer_prompt = f"{(visualizer_prompt or '').strip()}\n\n{SQL_GUARD}".strip()
-        analyzer_prompt = f"{(analyzer_prompt or '').strip()}\n\n{SQL_GUARD}".strip()
-
-        # ✅ a0.0.8: Explainer
-        need_plan_explainer = True  # keep enabled
+        # ✅ a0.0.8: Explainer (thinking) connected to router
+        need_plan_explainer = True  # keep enabled as in pipeline a0.0.8
         plan_explainer_model = agent_plan.get("plan_explainer_model") or chosen_model_id
 
         if need_plan_explainer:
             plan_explainer_start_time = time.time()
 
+            # isi detail instruksi untuk ketiga agen
             initial_content = json.dumps({
                 "manipulator_prompt": manipulator_prompt,
                 "visualizer_prompt": visualizer_prompt,
@@ -2547,19 +2796,15 @@ def query():
             plan_explainer_elapsed_time = plan_explainer_end_time - plan_explainer_start_time
             print(f"Elapsed time: {plan_explainer_elapsed_time:.2f} seconds")
 
+            # optionally simpan ke state agar bisa dikirim ke FE
             state["last_plan_explainer"] = plan_explainer_content
             _save_conv_state(session_id, state)
         else:
             print("Plan Explainer skipped (router decision).")
 
         # Shared LLM (PandasAI via LiteLLM) - use chosen model & user key
-        try:
-            llm = LiteLLM(model=chosen_model_id, api_token=chosen_api_key)
-        except TypeError:
-            llm = LiteLLM(model=chosen_model_id, api_key=chosen_api_key)
+        llm = LiteLLM(model=chosen_model_id, api_key=chosen_api_key)
         pai.config.set({"llm": llm})
-        # (Optional future) If PandasAI introduces a flag to disable SQL explicitly, set it here.
-        # pai.config.set({"enable_sql": False})  # left commented for compatibility across versions.
 
         # Manipulator (Polars-first via pai.DataFrame wrappers)
         _cancel_if_needed(session_id)
@@ -2577,13 +2822,6 @@ def query():
             val = getattr(dm_resp, "value", dm_resp)
             df_processed = _to_polars_dataframe(val)
 
-            # ✅ Robust fallback: if the manipulator didn't yield a dataframe, use the first available df
-            if df_processed is None:
-                for _k, _d in dfs.items():
-                    df_processed = _to_polars_dataframe(_d)
-                    if df_processed is not None:
-                        break
-
         # Visualizer
         _cancel_if_needed(session_id)
         dv_resp = SimpleNamespace(value="")
@@ -2596,11 +2834,16 @@ def query():
 
         if need_visual:
             if df_processed is None:
-                return jsonify({"detail": "Visualization requested but no processed dataframe available."}), 500
+                return (
+                    jsonify(
+                        {"detail": "Visualization requested but no processed dataframe available."}
+                    ),
+                    500,
+                )
             data_visualizer = _as_pai_df(df_processed)
             dv_resp = data_visualizer.chat(visualizer_prompt)
 
-            # Move produced HTML to CHARTS_ROOT (local dev) + upload to GCS/Supabase
+            # Move produced HTML to CHARTS_ROOT (local dev) + upload to GCS
             chart_path = getattr(dv_resp, "value", None)
             if isinstance(chart_path, str) and os.path.exists(chart_path):
                 out_dir = ensure_dir(os.path.join(CHARTS_ROOT, domain))
@@ -2610,6 +2853,7 @@ def query():
                     os.replace(chart_path, dest)
                 except Exception:
                     import shutil
+
                     shutil.copyfile(chart_path, dest)
                 chart_url = f"/charts/{domain}/{filename}"
 
@@ -2645,7 +2889,10 @@ def query():
         da_resp = ""
         if need_analyze:
             if df_processed is None:
-                return jsonify({"detail": "Analyzer requested but no processed dataframe available."}), 500
+                return (
+                    jsonify({"detail": "Analyzer requested but no processed dataframe available."}),
+                    500,
+                )
             data_analyzer = _as_pai_df(df_processed)
             da_obj = data_analyzer.chat(analyzer_prompt)
             da_resp = get_content(da_obj)
@@ -2653,7 +2900,11 @@ def query():
 
         # Compiler (use chosen model & key)
         _cancel_if_needed(session_id)
-        data_info_runtime = _polars_info_string(df_processed) if isinstance(df_processed, pl.DataFrame) else data_info
+        data_info_runtime = (
+            _polars_info_string(df_processed)
+            if isinstance(df_processed, pl.DataFrame)
+            else data_info
+        )
         final_response = completion(
             model=compiler_model or chosen_model_id,
             messages=[
@@ -2765,6 +3016,7 @@ def pg_save():
     except Exception as e:
         return jsonify({"saved": False, "error": str(e)}), 500
 
+
 @app.get("/pg/get")
 def pg_get():
     """
@@ -2799,6 +3051,7 @@ def pg_get():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+
 @app.post("/pg/test")
 def pg_test():
     """
@@ -2830,6 +3083,7 @@ def pg_test():
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
+
 @app.get("/charts/sb/list")
 def charts_sb_list():
     """
@@ -2846,6 +3100,7 @@ def charts_sb_list():
         items = supabase_client.storage.from_(SUPABASE_BUCKET_CHARTS).list(
             path=prefix or "", limit=limit
         )
+        # normalisasi output
         out = [
             {
                 "name": it.get("name"),
@@ -2860,6 +3115,7 @@ def charts_sb_list():
         return jsonify({"items": out, "prefix": prefix})
     except Exception as e:
         return jsonify({"detail": str(e)}), 500
+
 
 @app.get("/charts/sb/signed")
 def charts_sb_signed():
@@ -2885,6 +3141,7 @@ def charts_sb_signed():
         return jsonify({"path": path, "signed_url": signed, "public_url": public_url})
     except Exception as e:
         return jsonify({"detail": str(e)}), 500
+
 
 @app.delete("/charts/sb")
 def charts_sb_delete():

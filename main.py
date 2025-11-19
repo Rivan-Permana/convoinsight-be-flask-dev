@@ -1821,11 +1821,11 @@ def datasets_list():
                             ctype = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                         elif fname.endswith(".xls"):
                             ctype = "application/vnd.ms-excel"
-                        elif fl.endswith(".pdf"):
+                        elif fname.endswith(".pdf"):
                             ctype = "application/pdf"
-                        elif fl.endswith(".docx"):
+                        elif fname.endswith(".docx"):
                             ctype = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-                        elif fl.endswith(".doc"):
+                        elif fname.endswith(".doc"):
                             ctype = "application/msword"
                         it["signed_url"] = _signed_url(
                             blob, it["filename"], ctype, GCS_SIGNED_URL_TTL_SECONDS
@@ -1938,11 +1938,11 @@ def datasets_list_all(domain):
                             ctype = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                         elif fname.endswith(".xls"):
                             ctype = "application/vnd.ms-excel"
-                        elif fl.endswith(".pfd"):
+                        elif fname.endswith(".pfd"):
                             ctype = "application/pdf"
-                        elif fl.endswith(".docx"):
+                        elif fname.endswith(".docx"):
                             ctype = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-                        elif fl.endswith(".doc"):
+                        elif fname.endswith(".doc"):
                             ctype = "application/msword"
                         it["signed_url"] = _signed_url(
                             blob, it["filename"], ctype, GCS_SIGNED_URL_TTL_SECONDS

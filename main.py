@@ -2605,13 +2605,6 @@ def query():
                 for name, text in attachments_text.items()
             )
 
-            plan_explainer_content = (
-                "First I will read all of the uploaded report files, extract the key KPIs, "
-                "trends, and important findings, then answer your question with a concise, "
-                "business-focused summary and 2–3 recommended next actions."
-            )
-            state["last_plan_explainer"] = plan_explainer_content
-
             # Simpan history dulu
             _append_history(state, "assistant", {
                 "mode": "text_only",
@@ -2671,11 +2664,11 @@ def query():
                 "diagram_public_url": "",
                 "execution_time": exec_time,
                 "need_visualizer": False,
-                "need_analyzer": True,   
+                "need_analyzer": True,   # ini 'analyzer' murni di kepala LLM
                 "need_manipulator": False,
                 "llm_model_used": chosen_model_id,
                 "provider": provider_in,
-                "plan_explainer": plan_explainer_content,
+                "plan_explainer": state.get("last_plan_explainer", ""),
                 "attachments_used": list(attachments_text.keys()),
             })
 
@@ -2766,7 +2759,6 @@ def query():
         # ✅ a0.0.8: Explainer (thinking) connected to router
         need_plan_explainer = True  # keep enabled as in pipeline a0.0.8
         plan_explainer_model = agent_plan.get("plan_explainer_model") or chosen_model_id
-        plan_explainer_content = state.get("last_plan_explainer", "")
 
         if need_plan_explainer:
             plan_explainer_start_time = time.time()
@@ -2980,7 +2972,7 @@ def query():
                 "need_manipulator": need_manip,
                 "llm_model_used": chosen_model_id,
                 "provider": provider_in,
-                "plan_explainer": plan_explainer_content,
+                "plan_explainer": state.get("last_plan_explainer", ""),
             }
         )
     except RuntimeError as rexc:

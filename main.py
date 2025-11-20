@@ -2395,31 +2395,46 @@ def query_cancel():
 
 @app.post("/speech-to-text")
 def speech_to_text():
+    """
+    Speech-to-text endpoint menggunakan litellm.transcription (Groq Whisper).
+    """
     try:
+        # 1. Validasi file audio
         if "file" not in request.files:
-            return jsonify({"detail": "Missing audio file"}), 400
+            return jsonify({"detail": "Missing audio file field 'file' (multipart/form-data)."}), 400
 
         audio_file = request.files["file"]
-        if not audio_file:
-            return jsonify({"detail": "Empty audio file"}), 400
+        if not audio_file or audio_file.filename == "":
+            return jsonify({"detail": "Empty audio file."}), 400
 
-        # Read audio into NamedTemporaryFile so it has a proper filename
-        tmp = NamedTemporaryFile(delete=False, suffix=".webm")
-        tmp.write(audio_file.read())
-        tmp.flush()
-        tmp.seek(0)
+        # 2. Baca semua bytes dari FileStorage
+        raw_bytes = audio_file.read()
+        if not raw_bytes:
+            return jsonify({"detail": "Uploaded audio file is empty."}), 400
 
-        language = request.form.get("language", "id")
-        prompt = request.form.get("prompt") or None
+        # 3. Bungkus ke BytesIO dan beri nama dengan ekstensi valid
+        bio = io.BytesIO(raw_bytes)
+        bio.name = audio_file.filename or "voice.webm"  # <- ini sekarang boleh
+        bio.seek(0)
 
+        # 4. Param tambahan
+        language = (
+            request.form.get("language")
+            or request.form.get("languageCode")
+            or "id"
+        ).strip()
+        prompt = (request.form.get("prompt") or "").strip() or None
+
+        # 5. Panggil litellm.transcription ke Groq Whisper
         stt_resp = litellm.transcription(
-            model=STT_MODEL_ID,
-            file=tmp,
+            model=STT_MODEL_ID,     # "groq/whisper-large-v3"
+            file=bio,
             prompt=prompt,
-            language=language,
+            language=language or None,
             api_key=STT_API_KEY,
         )
 
+        # 6. Ambil teks hasil transkrip
         transcript = None
         if isinstance(stt_resp, dict):
             transcript = (
@@ -2428,17 +2443,27 @@ def speech_to_text():
                 or stt_resp.get("transcript")
             )
         else:
-            transcript = getattr(stt_resp, "text", None)
+            transcript = getattr(stt_resp, "text", None) or str(stt_resp)
 
         if not transcript:
-            return jsonify({"detail": "No text returned", "raw": stt_resp}), 500
+            return (
+                jsonify(
+                    {
+                        "detail": "Speech-to-text was successfully invoked but no text was returned.",
+                        "raw": stt_resp,
+                    }
+                ),
+                500,
+            )
 
-        return jsonify({
-            "transcript": transcript,
-            "language": language,
-            "provider": "groq",
-            "model": STT_MODEL_ID,
-        })
+        return jsonify(
+            {
+                "transcript": transcript,
+                "language": language,
+                "provider": "groq",
+                "model": STT_MODEL_ID,
+            }
+        )
 
     except Exception as e:
         return jsonify({"detail": f"Speech-to-text error: {str(e)}"}), 500

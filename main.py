@@ -2395,7 +2395,12 @@ def query_cancel():
 
 @app.post("/speech-to-text")
 def speech_to_text():
+    """
+    Speech-to-text endpoint menggunakan litellm.transcription (Groq Whisper).
+    """
+
     try:
+        # 1. Validasi file audio
         if "file" not in request.files:
             return jsonify({"detail": "Missing audio file field 'file' (multipart/form-data)."}), 400
 
@@ -2403,25 +2408,38 @@ def speech_to_text():
         if not audio_file or audio_file.filename == "":
             return jsonify({"detail": "Empty audio file."}), 400
 
-        # optional
+        # 2. Param tambahan
         language = (
             request.form.get("language")
             or request.form.get("languageCode")
             or "id"
         ).strip()
+
         prompt = (request.form.get("prompt") or "").strip() or None
 
-        audio_file.stream.seek(0)
+        # 3. Ambil file-like object dan PASTIKAN ada nama + ekstensi
+        file_obj = audio_file.stream  # atau langsung audio_file juga bisa
+        try:
+            file_obj.seek(0)
+        except Exception:
+            pass
 
+        # KUNCI FIX: set nama file dengan ekstensi yang valid (.webm)
+        if not getattr(file_obj, "name", None):
+            file_obj.name = audio_file.filename or "voice.webm"
+
+        # 4. Panggil litellm.transcription
         stt_resp = litellm.transcription(
-            model=STT_MODEL_ID,          # <- SELALU pakai model STT khusus
-            file=audio_file.stream,
+            model=STT_MODEL_ID,           # "groq/whisper-large-v3"
+            file=file_obj,
             prompt=prompt,
             language=language if language else None,
             api_key=STT_API_KEY,
         )
 
+        # 5. Normalisasi respons: ambil teks transkrip
         transcript = None
+
         if isinstance(stt_resp, dict):
             transcript = (
                 stt_resp.get("text")
@@ -2432,17 +2450,24 @@ def speech_to_text():
             transcript = getattr(stt_resp, "text", None) or str(stt_resp)
 
         if not transcript:
-            return jsonify({
-                "detail": "Speech-to-text was successfully invoked but no text was returned.",
-                "raw": stt_resp,
-            }), 500
+            return (
+                jsonify(
+                    {
+                        "detail": "Speech-to-text was successfully invoked but no text was returned.",
+                        "raw": stt_resp,
+                    }
+                ),
+                500,
+            )
 
-        return jsonify({
-            "transcript": transcript,
-            "language": language,
-            "provider": STT_MODEL_ID.split("/")[0],
-            "model": STT_MODEL_ID,
-        })
+        return jsonify(
+            {
+                "transcript": transcript,
+                "language": language,
+                "provider": "groq",
+                "model": STT_MODEL_ID,
+            }
+        )
 
     except Exception as e:
         return jsonify({"detail": f"Speech-to-text error: {str(e)}"}), 500

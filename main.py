@@ -1782,6 +1782,78 @@ def _list_dataset_meta(domain: Optional[str] = None, limit: int = 200) -> List[d
     docs = q.limit(limit).stream()
     return [d.to_dict() for d in docs if d.exists]
 
+def _classify_prompt_scope(
+    prompt: str,
+    domain: str,
+    data_info: dict,
+    data_describe: dict,
+    attachments_text: dict,
+    model: str,
+    api_key: str,
+) -> str:
+    """
+    Return one of:
+      - "in_scope"   : clear questions about data / metrics / reports in this domain
+      - "smalltalk"  : greeting / thanks / casual chat
+      - "out_of_scope": Other topics that cannot be answered from the data in this domain
+        If classification fails → default to "in_scope" (to make it less obstructive).
+    """
+    try:
+        attachments_names = ", ".join(list(attachments_text.keys())) if attachments_text else "None"
+
+        system_msg = (
+            "You are a STRICT classifier for a business-intelligence data assistant.\n"
+            "You receive the user's question and a description of the available "
+            "datasets/reports for a business domain.\n\n"
+            "You MUST answer with ONLY ONE of these labels (no explanation):\n"
+            "- IN_SCOPE_DATA_QUESTION  -> if the user is clearly asking about metrics, "
+            "tables, reports, charts, KPIs, SQL-like questions, or anything that can "
+            "reasonably be answered from the data.\n"
+            "- SMALL_TALK              -> if the user is just greeting, saying thanks, "
+            "apologizing, or chatting casually (e.g. 'halo', 'apa kabar', 'makasih').\n"
+            "- OUT_OF_SCOPE            -> if the user asks about something unrelated to the "
+            "business/data domain (e.g. random coding question, general philosophy, etc).\n\n"
+            "Do NOT give any explanation. Return exactly one label."
+        )
+
+        user_msg = (
+            f"Domain name: {domain}\n\n"
+            f"User question:\n{prompt}\n\n"
+            f"Available tabular datasets (info / describe):\n{data_info}\n\n"
+            f"Describe:\n{data_describe}\n\n"
+            f"Attachment names (PDF/DOCX): {attachments_names}\n\n"
+            "Remember: respond with EXACTLY one of: "
+            "IN_SCOPE_DATA_QUESTION, SMALL_TALK, OUT_OF_SCOPE."
+        )
+
+        resp = completion(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_msg},
+            ],
+            seed=1,
+            stream=False,
+            verbosity="low",
+            drop_params=True,
+            reasoning_effort="low",
+            api_key=api_key,
+        )
+        label = get_content(resp).strip().upper()
+
+        if "IN_SCOPE" in label:
+            return "in_scope"
+        if "SMALL" in label:
+            return "smalltalk"
+        if "OUT_OF_SCOPE" in label:
+            return "out_of_scope"
+
+        # fallback aman
+        return "in_scope"
+
+    except Exception:
+        # kalau classifier error, jangan matiin pipeline utama
+        return "in_scope"
 
 @app.post("/datasets/upload")
 def datasets_upload():
@@ -2789,6 +2861,61 @@ def query():
                     }
                 ),
                 409,
+            )
+
+        try:
+            scope = _classify_prompt_scope(
+                prompt=prompt,
+                domain=domain,
+                data_info=data_info,
+                data_describe=data_describe,
+                attachments_text=attachments_text,
+                model=chosen_model_id,
+                api_key=chosen_api_key,
+            )
+        except Exception:
+            scope = "in_scope"
+
+        if scope != "in_scope":
+            # simpan sedikit jejak ke history (optional)
+            _append_history(
+                state,
+                "assistant",
+                {
+                    "mode": "out_of_scope",
+                    "scope_label": scope,
+                    "final_preview": "Questions outside the context of the data/domain.",
+                },
+            )
+            _save_conv_state(session_id, state)
+
+            # respon ringan tanpa jalanin router & agent pipeline
+            final_content = (
+                "<p><strong>Sorry, your question is not in the context of the data in this domain.</strong></p>"
+                "<p>Try asking questions related to reports, business metrics, "
+                "or datasets that have been uploaded (e.g. sales performance, growth, "
+                "customer segmentation, revenue per product, and so on).</p>"
+            )
+
+            exec_time = time.time() - t0
+            return jsonify(
+                {
+                    "session_id": session_id,
+                    "response": final_content,
+                    "chart_url": None,
+                    "diagram_kind": "",
+                    "diagram_gs_uri": None,
+                    "diagram_signed_url": None,
+                    "diagram_public_url": "",
+                    "execution_time": exec_time,
+                    "need_visualizer": False,
+                    "need_analyzer": False,
+                    "need_manipulator": False,
+                    "llm_model_used": chosen_model_id,
+                    "provider": provider_in,
+                    "plan_explainer": state.get("last_plan_explainer", ""),
+                    "scope": scope,  # biar FE kalau mau, bisa baca
+                }
             )
 
         # Router

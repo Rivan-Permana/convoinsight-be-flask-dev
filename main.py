@@ -151,6 +151,8 @@ _firestore_client = (
 # --- Cancel flags ---
 _CANCEL_FLAGS = set()  # holds session_id
 
+STT_MODEL_ID = os.environ.get("STT_MODEL_ID", "groq/whisper-large-v3")
+STT_API_KEY = os.environ.get("GROQ_API_KEY")
 
 # =========================
 # Utilities & Helpers
@@ -2393,31 +2395,7 @@ def query_cancel():
 
 @app.post("/speech-to-text")
 def speech_to_text():
-    """
-    Speech-to-text endpoint menggunakan litellm.transcription.
-
-    Request:
-      Content-Type: multipart/form-data
-
-      Field wajib:
-        - file        : audio file (Blob rekaman) -> misal .webm / .mp3 / .wav
-
-      Field opsional (semua di form-data juga):
-        - provider    : misal "openai", "groq"
-        - model       : misal "whisper-1", "whisper-large-v3"
-        - apiKey      : kalau mau kirim langsung dari FE (override Firestore)
-        - userId      : untuk ambil API key yang sudah disimpan di Firestore
-        - language    : kode bahasa, default "id" (ISO-639-1, misal "en", "id")
-        - prompt      : context/hint untuk model (optional)
-
-    Contoh:
-      provider=openai
-      model=whisper-1
-    -> akan jadi model_id "openai/whisper-1" lewat _resolve_llm_credentials
-    """
-
     try:
-        # 1. Validasi file audio
         if "file" not in request.files:
             return jsonify({"detail": "Missing audio file field 'file' (multipart/form-data)."}), 400
 
@@ -2425,101 +2403,49 @@ def speech_to_text():
         if not audio_file or audio_file.filename == "":
             return jsonify({"detail": "Empty audio file."}), 400
 
-        # 2. Bangun 'body' pseudo-JSON untuk pakai ulang _resolve_llm_credentials
-        body_creds = {
-            "provider": (request.form.get("provider") or "").strip(),
-            "model": (request.form.get("model") or "").strip(),
-            "apiKey": (request.form.get("apiKey") or "").strip(),
-            "userId": (request.form.get("userId") or "").strip(),
-        }
-
-        chosen_model_id, chosen_api_key, provider_in = _resolve_llm_credentials(body_creds)
-
-        if not chosen_model_id:
-            return (
-                jsonify(
-                    {
-                        "detail": (
-                            "Missing or invalid speech-to-text model. "
-                            "Send 'provider' + 'model' (eg provider=openai, model=whisper-1)"
-                            "or full models that are already registered in LITELLM_MODEL_LIST."
-                        )
-                    }
-                ),
-                400,
-            )
-
-        if not chosen_api_key:
-            return (
-                jsonify(
-                    {
-                        "detail": (
-                            "There is no API key available."
-                            "Send 'apiKey' in form-data or save API key via /validate-key endpoint."
-                        )
-                    }
-                ),
-                400,
-            )
-
-        # 3. Parameter tambahan
+        # optional
         language = (
             request.form.get("language")
             or request.form.get("languageCode")
             or "id"
         ).strip()
-
         prompt = (request.form.get("prompt") or "").strip() or None
 
-        # 4. Panggil litellm.transcription
-        #    - audio_file.stream adalah file-like object (binary) dari werkzeug
         audio_file.stream.seek(0)
 
         stt_resp = litellm.transcription(
-            model=chosen_model_id,
+            model=STT_MODEL_ID,          # <- SELALU pakai model STT khusus
             file=audio_file.stream,
             prompt=prompt,
             language=language if language else None,
-            api_key=chosen_api_key,  # kalau versi litellm-mu tidak support arg ini, hapus dan pakai env var
+            api_key=STT_API_KEY,
         )
 
-        # 5. Normalisasi respons: ambil teks transkrip
         transcript = None
-
         if isinstance(stt_resp, dict):
-            # pola umum Whisper dkk: {"text": "..."}
             transcript = (
                 stt_resp.get("text")
                 or stt_resp.get("translated_text")
                 or stt_resp.get("transcript")
             )
         else:
-            # fallback kalau litellm balikin object lain
             transcript = getattr(stt_resp, "text", None) or str(stt_resp)
 
         if not transcript:
-            return (
-                jsonify(
-                    {
-                        "detail": "Speech-to-text was successfully invoked but no text was returned.",
-                        "raw": stt_resp,
-                    }
-                ),
-                500,
-            )
+            return jsonify({
+                "detail": "Speech-to-text was successfully invoked but no text was returned.",
+                "raw": stt_resp,
+            }), 500
 
-        return jsonify(
-            {
-                "transcript": transcript,
-                "language": language,
-                "provider": provider_in,
-                "model": chosen_model_id,
-            }
-        )
+        return jsonify({
+            "transcript": transcript,
+            "language": language,
+            "provider": STT_MODEL_ID.split("/")[0],
+            "model": STT_MODEL_ID,
+        })
 
     except Exception as e:
         return jsonify({"detail": f"Speech-to-text error: {str(e)}"}), 500
-
 
 # =========================
 # NEW: Suggestion Endpoint (a0.0.8) — dynamic provider+model+apiKey
